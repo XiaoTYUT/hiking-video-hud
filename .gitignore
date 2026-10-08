@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE / 工具
+.vscode/
+.idea/
+.trae/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 日志 / 崩溃报告
+*.log
+crash.log
+
+# 生成的视频 / 二进制产物
+*.mov
+*.mp4
+*.webm
+*.avi
+
+# 用户私有数据：KML 轨迹、工程文件、背景图、地图瓦片缓存
+# 这些文件含个人行走轨迹/坐标/时间戳，不应进公开仓库
+*.kml
+*.kmlproj
+back.png
+back_*.png
+tiles/
+
+# AppData 运行时配置（路径含个人用户名）
+settings.json
+
+# 临时 / 一次性脚本（含硬编码本地路径，仅本机调试用）
+_render_once.py
