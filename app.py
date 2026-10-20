@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from PyQt5.QtCore import Qt, QPointF, QRectF, QThread, pyqtSignal, QStandardPaths, QTimer
 from PyQt5.QtGui import (QPen, QColor, QBrush, QPainterPath, QPainter, QFont,
-                         QFontMetrics, QPixmap)
+                         QFontMetrics, QPixmap, QPolygonF)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGraphicsView, QGraphicsScene,
     QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem, QGraphicsEllipseItem,
@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QGridLayout, QColorDialog, QDialog, QDialogButtonBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QMenu, QToolButton,
     QRadioButton, QButtonGroup, QComboBox, QGraphicsPixmapItem,
+    QInputDialog, QScrollArea, QTabWidget,
 )
 
 from renderer import (Renderer, format_duration, format_pace,
@@ -247,7 +248,6 @@ class DraggablePathItem(QGraphicsPathItem):
 
     def _sync(self):
         """把当前布局写回 renderer。
-
         GUI 映射: x -> anchor + s*(x - anchor) + pos
         renderer: x -> center + s*(x - center) + offset
         两者对齐: center = 固定 anchor, offset = pos
@@ -274,6 +274,23 @@ class DraggablePathItem(QGraphicsPathItem):
 
 
 # ─────────────────────── 可拖拽数据面板 Item ───────────────────────
+
+def _panel_span_w(r) -> float:
+    """数据面板在画布上占用的实际宽度（取「数据矩形」与「背景条」的较宽者）。"""
+    s = r.panel_scale
+    pad = r.panel_bg_pad * s
+    text_w = DataPanelItem.BASE_W * s
+    bg_w = r.panel_bg_w * s + 2 * pad
+    return max(text_w, bg_w, 1.0)
+
+
+def _panel_span_h(r) -> float:
+    """数据面板在画布上占用的实际高度（数据矩形或背景条取高者）。"""
+    s = r.panel_scale
+    pad = r.panel_bg_pad * s
+    text_h = DataPanelItem._base_h(r) * s
+    return max(text_h, text_h + 2 * pad, 1.0)
+
 
 class DataPanelItem(QGraphicsRectItem):
     BASE_W = 320
@@ -317,6 +334,19 @@ class DataPanelItem(QGraphicsRectItem):
         self.setRect(0, 0, self.BASE_W * self._s, self._base_h(self.renderer) * self._s)
         self.update()
 
+    def boundingRect(self):
+        """背景条宽度/外扩边距可独立设置，可能超出数据矩形；
+        包围矩形取两者并集，避免绘制被裁剪。"""
+        rect = self.rect()
+        s = self._s
+        pad = self.renderer.panel_bg_pad * s
+        bg_w = self.renderer.panel_bg_w * s
+        x0 = min(0.0, -pad)
+        y0 = min(0.0, -pad)
+        x1 = max(rect.width(), bg_w + pad)
+        y1 = max(rect.height(), rect.height() + pad)
+        return QRectF(x0, y0, x1 - x0, y1 - y0)
+
     def _sync(self):
         pos = self.pos()
         self.renderer.panel_pos = (pos.x(), pos.y())
@@ -328,14 +358,14 @@ class DataPanelItem(QGraphicsRectItem):
         # 布局与 renderer._draw_panel 完全同构：背景/字号/间距全部 = 基准值 * s，
         # 缩放时等比例变化，标签与数值永不互相遮挡
         s = self._s
-        w = self.BASE_W * s
 
-        # 无边框无背景，仅绘制数据文本（rect 保留用于拖拽命中区域）
+        # 半透明圆角背景（宽度/边距/颜色/不透明度独立可调）+ 数据文本
+        # rect 本身仍作拖拽命中区域
 
         ascent = self.renderer.cum_ascent[-1]
         dist_km = self.renderer.cum_dist[-1] / 1000.0
         elev = self.renderer.points_smoothed[-1][2]
-        slope = self.renderer.slope_pct[-1]
+        slope = self.renderer.slope_deg[-1]
         pace = self.renderer.pace_s[-1]
 
         # setPixelSize 与视频端 PIL 像素字号一致，保证所见即所得
@@ -348,7 +378,7 @@ class DataPanelItem(QGraphicsRectItem):
         # 预览显示终值：运动耗时/总耗时按元数据口径（与视频末帧一致）
         rows_all = [
             ("当前海拔", f"{elev:.0f} m",          QColor(200, 160, 255)),
-            ("当前坡度", f"{slope:+.0f}%",         QColor(255, 170, 200)),
+            ("当前坡度", f"{slope:+.1f}°",         QColor(255, 170, 200)),
             ("累计爬升", f"{ascent:.1f} m",         QColor(80, 220, 120)),
             ("已行里程", f"{dist_km:.2f} km",        QColor(255, 210, 90)),
             ("当前配速", format_pace(pace),          QColor(140, 255, 220)),
@@ -363,6 +393,22 @@ class DataPanelItem(QGraphicsRectItem):
         fm_small = QFontMetrics(small_font)
         fm_big = QFontMetrics(big_font)
         ow = max(1, int(round(s)))   # 黑边宽度（与视频端 stroke 一致）
+
+        # 面板背景：宽度 / 外扩边距 / 颜色 / 不透明度 四项互相独立（与视频端一致）
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        pad = self.renderer.panel_bg_pad * s
+        bg_w = self.renderer.panel_bg_w * s
+        c = self.renderer.panel_bg_color
+        a = int(round(max(0.0, min(100.0, self.renderer.panel_bg_alpha_pct)) * 255 / 100))
+        painter.setBrush(QColor(int(c[0]), int(c[1]), int(c[2]), a))
+        painter.drawRoundedRect(
+            QRectF(-pad, -pad,
+                   bg_w + 2 * pad,
+                   self.rect().height() + 2 * pad),
+            12 * s, 12 * s)
+        painter.setBrush(Qt.NoBrush)
+
         for i, (label, value, color) in enumerate(rows):
             y = 18 * s + i * row_h
             # 数据标题：粗体黑边白字（8 方向偏移近似 PIL stroke）
@@ -445,6 +491,118 @@ class MapPanelItem(QGraphicsRectItem):
         super().hoverLeaveEvent(event)
 
 
+# ─────────────────────── 动态坡度仪 Item ───────────────────────
+
+class SlopeGaugeItem(QGraphicsRectItem):
+    """动态坡度仪的 GUI 预览：直角三角形（斜边倾角 = 当前坡度）+ 标签/数值。
+    可拖拽定位 + 滚轮调大小（与视频输出 WYSIWYG，布局同 renderer._draw_slope_gauge）。"""
+
+    def __init__(self, renderer: Renderer):
+        size = renderer.slope_gauge_size
+        super().__init__(0, 0, size, size)
+        self.renderer = renderer
+        self._hover = False
+        self.setPos(renderer.slope_gauge_pos[0], renderer.slope_gauge_pos[1])
+        # rect 只作拖拽命中区，paint 完全自绘（不画默认矩形）
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setAcceptHoverEvents(True)
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.delta() > 0 else 1 / 1.15
+        size = max(60.0, min(600.0, self.renderer.slope_gauge_size * factor))
+        self.renderer.slope_gauge_size = size
+        self.prepareGeometryChange()
+        self.setRect(0, 0, size, size)
+        self.scene().update()
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self._sync()
+
+    def _sync(self):
+        pos = self.pos()
+        self.renderer.slope_gauge_pos = (pos.x(), pos.y())
+        self.scene().update()
+        _notify_main_dirty(self)
+
+    def hoverEnterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().hoverLeaveEvent(event)
+
+    def paint(self, painter, option, widget=None):
+        # 透明底：直角三角形（斜边倾角=坡度）+ 标签/数值，与视频端布局一致
+        size = self.rect().width()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        n = len(self.renderer.points)
+        angle = (max(-32.0, min(32.0, self.renderer.gauge_angle(n - 1)))
+                 if n else 0.0)
+
+        # 选中/悬停时用虚线框标出命中区范围（不参与视频输出）
+        if self.isSelected() or self._hover:
+            painter.setPen(QPen(QColor(120, 200, 255, 160), 1, Qt.DashLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self.rect())
+
+        # 直角三角形：下边（水平基线）+ 右端竖直闭合边 + 斜边（倾角 = 坡度）
+        vx, vy = 0.10 * size, 0.40 * size
+        arm = 0.55 * size
+        h = arm * math.tan(math.radians(angle))
+        h_min = 0.02 * size
+        if abs(h) < h_min:
+            h = h_min if angle >= 0 else -h_min
+        x2, y2 = vx + arm, vy - h   # y 向下：正坡度 y2 在基线上方
+
+        # 内部填充（颜色/透明度与视频端一致）
+        r = self.renderer
+        fa = int(round(max(0.0, min(100.0, r.gauge_fill_alpha_pct)) * 255 / 100))
+        fc = r.gauge_fill_color
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(fc[0], fc[1], fc[2], fa))
+        painter.drawPolygon(QPolygonF([QPointF(vx, vy), QPointF(x2, vy),
+                                       QPointF(x2, y2)]))
+
+        # 边线：下边 = 下边颜色；竖直闭合边 + 上边（斜边）= 上边颜色
+        tc, bc = r.gauge_edge_top_color, r.gauge_edge_bottom_color
+        painter.setPen(QPen(QColor(bc[0], bc[1], bc[2], 255), 2))
+        painter.drawLine(QPointF(vx, vy), QPointF(x2, vy))
+        painter.setPen(QPen(QColor(tc[0], tc[1], tc[2], 255), 2))
+        painter.drawLine(QPointF(x2, vy), QPointF(x2, y2))
+        painter.drawLine(QPointF(vx, vy), QPointF(x2, y2))
+
+        # 文字：「坡度」标签 + 数值（各自字号/颜色，黑边描边，垂直居中对齐）
+        label, value = "坡度", f"{angle:+.1f}°"
+        lf = QFont("Microsoft YaHei")
+        lf.setPixelSize(max(8, int(round(r.gauge_label_size))))
+        vf = QFont("Microsoft YaHei")
+        vf.setPixelSize(max(8, int(round(r.gauge_value_size))))
+        fm_l, fm_v = QFontMetrics(lf), QFontMetrics(vf)
+        lwd, vwd = fm_l.horizontalAdvance(label), fm_v.horizontalAdvance(value)
+        gap = 0.05 * size
+        x0 = size / 2 - (lwd + gap + vwd) / 2
+        cy = size * 0.84
+        lc, vc = r.gauge_label_color, r.gauge_value_color
+        lrect = QRectF(x0, cy - fm_l.height() / 2, lwd + 8, fm_l.height() + 2)
+        vrect = QRectF(x0 + lwd + gap, cy - fm_v.height() / 2, vwd + 8,
+                       fm_v.height() + 2)
+        for rect, txt, col, fnt in [(lrect, label, lc, lf), (vrect, value, vc, vf)]:
+            painter.setFont(fnt)
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                painter.setPen(QColor(0, 0, 0, 255))
+                painter.drawText(rect.translated(dx, dy),
+                                 Qt.AlignLeft | Qt.AlignVCenter, txt)
+            painter.setPen(QColor(col[0], col[1], col[2], 255))
+            painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, txt)
+
+
 # ─────────────────────── CanvasView ───────────────────────
 
 class CanvasView(QGraphicsView):
@@ -463,26 +621,32 @@ class CanvasView(QGraphicsView):
         self._bg_size = None
 
     def _scaled_bg(self, w: int, h: int):
-        """按画布尺寸缓存缩放后的背景图（保持比例，避免拖拽时反复缩放开销）。"""
+        """按目标尺寸缓存缩放后的背景图（铺满：保持比例、超出部分裁掉）。
+
+        避免拖拽时反复缩放开销。
+        """
         if self._bg.isNull():
             return None
         if self._bg_scaled is None or self._bg_size != (w, h):
             self._bg_scaled = self._bg.scaled(
-                w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             self._bg_size = (w, h)
         return self._bg_scaled
 
     def drawBackground(self, painter, rect):
-        # 边框外深色区 = 不可输出区域；边框内 = 输出画布（背景图 + 白色留边，视频按此范围硬裁剪）
-        painter.fillRect(rect, QColor("#0c0c12"))
-        sr = self.scene().sceneRect()
-        painter.fillRect(sr, QColor("#ffffff"))
-        bg = self._scaled_bg(int(sr.width()), int(sr.height()))
+        # 背景图铺满整个预览窗口（含画布以外的留白区）；
+        # 画布（输出区域）仍用蓝色边框标出，避免背景铺满后分不清输出范围。
+        vis = self.mapToScene(self.viewport().rect()).boundingRect()
+        bg = self._scaled_bg(int(vis.width()), int(vis.height()))
         if bg is not None:
-            # 居中绘制（KeepAspectRatio 的留边露出白底）
             painter.drawPixmap(
-                QPointF(sr.center().x() - bg.width() / 2,
-                        sr.center().y() - bg.height() / 2), bg)
+                QPointF(vis.center().x() - bg.width() / 2,
+                        vis.center().y() - bg.height() / 2), bg)
+        else:
+            # back.png 缺失/改名：回退深色窗口底 + 画布白底
+            painter.fillRect(rect, QColor("#0c0c12"))
+            painter.fillRect(self.scene().sceneRect(), QColor("#ffffff"))
+        sr = self.scene().sceneRect()
         painter.setPen(QPen(QColor(90, 130, 255, 230), 0))
         painter.drawRect(sr)
 
@@ -505,12 +669,14 @@ class RenderWorker(QThread):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, renderer: Renderer, out_path: Path, fps: int, duration_s: int):
+    def __init__(self, renderer: Renderer, out_path: Path, fps: int, duration_s: int,
+                 render_scale: int = 1):
         super().__init__()
         self.renderer = renderer
         self.out_path = out_path
         self.fps = fps
         self.duration_s = duration_s
+        self.render_scale = max(1, int(render_scale or 1))
         self._cancel = False            # 终止标志：progress_cb 检测后抛 _RenderCancelled
 
     def cancel(self):
@@ -526,6 +692,7 @@ class RenderWorker(QThread):
             self.renderer.render_video(
                 self.out_path, self.fps, self.duration_s,
                 progress_cb=_cb,
+                render_scale=self.render_scale,
             )
             self.finished_ok.emit(str(self.out_path))
         except _RenderCancelled:
@@ -622,7 +789,10 @@ class CutPointItem(QGraphicsEllipseItem):
 
 
 class _DurSpin(QSpinBox):
-    """段时长输入框：禁用键盘上下键调整（方向键留给轨迹预览平移用）。"""
+    """段时长输入框：禁用滚轮与键盘上下键调整（方向键留给轨迹预览平移用）。"""
+
+    def wheelEvent(self, e):
+        e.ignore()   # 吞掉滚轮：不调整数值，避免误改分段截止时间
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Up, Qt.Key_Down,
@@ -984,7 +1154,8 @@ class SegmentDialog(QDialog):
         c = best / (n - 1)
         if not (0.005 < c < 0.995):
             return False
-        if any(abs(c - e) < 0.004 for e in self.cuts):
+        # 只要求不落在同一个整数轨迹点上（相邻点也可各设一个分割点）
+        if any(round(e * (n - 1)) == best for e in self.cuts):
             return False
         # 插入新 cut：原段时间范围拆为两半（新段截止 = 原区间中点），总长不变
         import bisect
@@ -1115,6 +1286,432 @@ class SegmentDialog(QDialog):
         return (list(self.cuts), durations)
 
 
+# ─────────────────────── 关键节点编辑对话框 ───────────────────────
+
+class NodeView(QGraphicsView):
+    """关键节点编辑器视图：滚轮缩放、方向键平移、右键添加节点、左键删除节点。"""
+
+    def __init__(self, scene, dlg):
+        super().__init__(scene)
+        self.dlg = dlg
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setBackgroundBrush(QBrush(QColor(0x10, 0x10, 0x18)))
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+
+    def wheelEvent(self, ev):
+        f = 1.15 if ev.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(f, f)
+        self.dlg._update_marker_scale()
+        self.dlg._tile_timer.start(150)
+        ev.accept()
+
+    def keyPressEvent(self, ev):
+        step = max(40, int(self.viewport().width() * 0.08))
+        vstep = max(40, int(self.viewport().height() * 0.08))
+        hb, vb = self.horizontalScrollBar(), self.verticalScrollBar()
+        key = ev.key()
+        if key == Qt.Key_Left:
+            hb.setValue(hb.value() - step)
+        elif key == Qt.Key_Right:
+            hb.setValue(hb.value() + step)
+        elif key == Qt.Key_Up:
+            vb.setValue(vb.value() - vstep)
+        elif key == Qt.Key_Down:
+            vb.setValue(vb.value() + vstep)
+        else:
+            super().keyPressEvent(ev)
+            return
+        self.dlg._tile_timer.start(150)
+        ev.accept()
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        self.dlg._tile_timer.start(150)
+
+    def mousePressEvent(self, ev):
+        sp = self.mapToScene(ev.pos())
+        if ev.button() == Qt.RightButton:
+            self.dlg.try_add_node_at(sp)
+            ev.accept()
+        elif ev.button() == Qt.LeftButton:
+            self.dlg.try_remove_node_at(sp)
+            ev.accept()
+        else:
+            super().mousePressEvent(ev)
+
+
+class NodeMarkItem(QGraphicsEllipseItem):
+    """关键节点标记（带名称标签），右键添加/左键删除。"""
+
+    def __init__(self, name: str, x: float, y: float, dlg):
+        r = 10
+        super().__init__(x - r, y - r, 2 * r, 2 * r)
+        self._name = name
+        self._cx, self._cy = x, y
+        self.dlg = dlg
+        self.setTransformOriginPoint(x, y)
+        c = dlg._node_color
+        self.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), 235)))
+        self.setPen(QPen(QColor(255, 255, 255, 235), 2))
+        self.setZValue(10)
+        # 名称标签：半透明黑底胶囊 + 白字
+        f = QFont("Microsoft YaHei")
+        f.setPixelSize(14)
+        label = QGraphicsTextItem(name, self)
+        label.setDefaultTextColor(QColor(255, 255, 255))
+        label.setFont(f)
+        fm = QFontMetrics(f)
+        adv = fm.horizontalAdvance(name)
+        bx = x + 12 - 6
+        by = y - 22 - 4
+        # 黑底胶囊
+        bg_path = QPainterPath()
+        bg_path.addRoundedRect(QRectF(bx, by, adv + 12, fm.height() + 8),
+                               (fm.height() + 8) / 2, (fm.height() + 8) / 2)
+        bg = QGraphicsPathItem(bg_path, self)
+        bg.setPen(QPen(Qt.NoPen))
+        bg.setBrush(QBrush(QColor(0, 0, 0, 180)))
+        bg.setAcceptedMouseButtons(Qt.NoButton)
+        # 白字
+        tp = QPainterPath()
+        tp.addText(0, 0, f, name)
+        tp_item = QGraphicsPathItem(tp, self)
+        tp_item.setPen(QPen(Qt.NoPen))
+        tp_item.setBrush(QBrush(QColor(255, 255, 255, 255)))
+        tp_item.setPos(bx + 6, by + 4 + fm.ascent())
+        tp_item.setAcceptedMouseButtons(Qt.NoButton)
+        self.setToolTip(f"节点「{name}」——左键删除")
+
+
+class NodeEditorDialog(QDialog):
+    """关键节点编辑器：JSON 输入 + 右键点击轨迹添加 + 地图背景。
+
+    - 数据模型：nodes = [(name, lon, lat), ...]
+    - 右键点击轨迹附近 → 吸附最近轨迹点 → 弹窗命名 → 添加
+    - 左键点击已有节点 → 删除
+    - JSON 输入框：实时解析并刷新预览
+    - 确定：写回 renderer.key_nodes
+    """
+
+    def __init__(self, renderer: Renderer, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("关键节点编辑器")
+        self.resize(1100, 780)
+        self.renderer = renderer
+        # 节点数据（编辑副本，确定时写回）
+        self.nodes = list(renderer.key_nodes) if renderer.key_nodes else []
+        # 节点颜色（与主窗口一致）
+        nc = getattr(renderer, "node_color", (255, 200, 60))
+        self._node_color = QColor(int(nc[0]), int(nc[1]), int(nc[2]))
+
+        # 动态瓦片地图状态（复用 SegmentDialog 逻辑）
+        self._map_tiles = {}
+        self._map_base_z = None
+        self._map_zoom_current = None
+        self._map_gcj_offset = (0.0, 0.0)
+        self._tile_timer = QTimer(self)
+        self._tile_timer.setSingleShot(True)
+        self._tile_timer.timeout.connect(self._refresh_map_tiles)
+
+        lay = QVBoxLayout(self)
+        tip = QLabel("滚轮缩放 · 方向键平移 · **右键点击轨迹添加节点** · 左键点击节点删除\n"
+                     "下方 JSON 框可直接编辑（修改后点「应用 JSON」刷新预览）")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        # 轨迹预览（带地图）
+        self.scene = QGraphicsScene()
+        self.view = NodeView(self.scene, self)
+        lay.addWidget(self.view, 1)
+
+        # JSON 编辑
+        jg = QGroupBox("节点 JSON")
+        jl = QVBoxLayout(jg)
+        self.txt_json = QTextEdit()
+        self.txt_json.setPlaceholderText(
+            '[{"name": "山脚", "lon": 113.05, "lat": 22.55},\n'
+            ' {"name": "垭口", "lon": 113.08, "lat": 22.58}]')
+        self.txt_json.setFixedHeight(120)
+        jl.addWidget(self.txt_json)
+        row_j = QHBoxLayout()
+        btn_apply_json = QPushButton("应用 JSON → 刷新预览")
+        btn_apply_json.clicked.connect(self._apply_json_to_preview)
+        row_j.addWidget(btn_apply_json)
+        row_j.addStretch()
+        self.lbl_count = QLabel()
+        row_j.addWidget(self.lbl_count)
+        jl.addLayout(row_j)
+        lay.addWidget(jg)
+
+        # 底部
+        row2 = QHBoxLayout()
+        row2.addStretch()
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        row2.addWidget(bb)
+        lay.addLayout(row2)
+
+        self._node_items = []
+        self._build_scene()
+        self._sync_json_from_nodes()
+
+    # ── 预览场景 ──
+
+    def _build_scene(self):
+        r = self.renderer
+        self.scene.setSceneRect(0, 0, r.width, r.height)
+        # 轨迹
+        path = QPainterPath()
+        for i, (x, y) in enumerate(r.base_projected):
+            if i == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        pi = QGraphicsPathItem(path)
+        pen = QPen(QColor(180, 100, 255, 220), 3)
+        pen.setCosmetic(True)
+        pi.setPen(pen)
+        self.scene.addItem(pi)
+        # 起终点
+        self._end_items = []
+        if len(r.base_projected) >= 2:
+            for (px, py), color in [(r.base_projected[0], (100, 240, 120)),
+                                     (r.base_projected[-1], (240, 80, 80))]:
+                it = QGraphicsEllipseItem(px - 10, py - 10, 20, 20)
+                it.setTransformOriginPoint(px, py)
+                it.setBrush(QBrush(QColor(*color)))
+                it.setPen(QPen(QColor(255, 255, 255, 220), 2))
+                self.scene.addItem(it)
+                self._end_items.append(it)
+        # 节点
+        self._node_items = []
+        self._rebuild_node_items()
+        # fitInView 必须先于地图瓦片初始化
+        self.view.fitInView(self.scene.sceneRect().adjusted(-40, -40, 40, 40),
+                            Qt.KeepAspectRatio)
+        self._update_marker_scale()
+        self._build_map_layer()
+
+    def _update_marker_scale(self):
+        """视图缩放时反向补偿标记（节点/起终点），保持屏幕尺寸不变。"""
+        m = self.view.transform().m11()
+        inv = 1.0 / m if m > 0 else 1.0
+        for it in self._node_items + getattr(self, "_end_items", []):
+            it.setScale(inv)
+
+    # ── 地图层（复用 SegmentDialog 逻辑）──
+
+    def _build_map_layer(self):
+        r = self.renderer
+        pts = r.points
+        if not pts:
+            return
+        lons = [p[0] for p in pts]
+        lats = [p[1] for p in pts]
+        lon_min, lon_max = min(lons), max(lons)
+        lat_min, lat_max = min(lats), max(lats)
+        glons, glats = [], []
+        for lo, la in ((lon_min, lat_min), (lon_min, lat_max),
+                       (lon_max, lat_min), (lon_max, lat_max)):
+            glo, gla = _wgs84_to_gcj02(lo, la)
+            glons.append(glo)
+            glats.append(gla)
+        glon0, glon1 = min(glons), max(glons)
+        span_lon = max(1e-6, glon1 - glon0)
+        z = int(math.log2(2048.0 * 360.0 / (256.0 * span_lon)))
+        self._map_base_z = max(3, min(17, z))
+        c_lon = (lon_min + lon_max) / 2
+        c_lat = (lat_min + lat_max) / 2
+        g_lon, g_lat = _wgs84_to_gcj02(c_lon, c_lat)
+        self._map_gcj_offset = (g_lon - c_lon, g_lat - c_lat)
+        self._refresh_map_tiles()
+
+    def _refresh_map_tiles(self):
+        if self._map_base_z is None or self.renderer is None:
+            return
+        m = self.view.transform().m11()
+        if m <= 0:
+            return
+        z_target = self._map_base_z + max(0, int(math.floor(math.log2(max(m, 1e-6)))))
+        z_target = max(self._map_base_z, min(18, z_target))
+        vis_poly = self.view.mapToScene(self.view.viewport().rect())
+        vis = vis_poly.boundingRect()
+        inv = getattr(self.renderer._project, "inverse", None)
+        if inv is None:
+            return
+        corners = [(vis.left(), vis.top()), (vis.right(), vis.top()),
+                   (vis.left(), vis.bottom()), (vis.right(), vis.bottom())]
+        wgs_pts = [inv(x, y) for x, y in corners]
+        w_lons = [p[0] for p in wgs_pts]
+        w_lats = [p[1] for p in wgs_pts]
+        glons, glats = [], []
+        for lo, la in ((min(w_lons), min(w_lats)), (min(w_lons), max(w_lats)),
+                       (max(w_lons), min(w_lats)), (max(w_lons), max(w_lats))):
+            glo, gla = _wgs84_to_gcj02(lo, la)
+            glons.append(glo)
+            glats.append(gla)
+        glon0, glon1 = min(glons), max(glons)
+        glat0, glat1 = min(glats), max(glats)
+        px0, py_top = _lonlat_to_webmerc_px(glon0, glat1, z_target)
+        px1, py_bot = _lonlat_to_webmerc_px(glon1, glat0, z_target)
+        tx0, tx1 = int(px0 // 256), int(px1 // 256)
+        ty0, ty1 = int(py_top // 256), int(py_bot // 256)
+        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 64:
+            return
+        for key, it in list(self._map_tiles.items()):
+            if key[0] != z_target:
+                self.scene.removeItem(it)
+                del self._map_tiles[key]
+        self._map_zoom_current = z_target
+        off_lon, off_lat = self._map_gcj_offset
+        r = self.renderer
+        for tx in range(tx0, tx1 + 1):
+            for ty in range(ty0, ty1 + 1):
+                key = (z_target, tx, ty)
+                if key in self._map_tiles:
+                    continue
+                t = _fetch_tile(z_target, tx, ty)
+                if t is None:
+                    continue
+                pix = QPixmap()
+                buf = BytesIO()
+                t.save(buf, format="PNG")
+                pix.loadFromData(buf.getvalue(), "PNG")
+                gcj_lon_l, gcj_lat_t = _webmerc_px_to_lonlat(tx * 256, ty * 256, z_target)
+                gcj_lon_r, gcj_lat_b = _webmerc_px_to_lonlat((tx + 1) * 256, (ty + 1) * 256, z_target)
+                w_lon_l = gcj_lon_l - off_lon
+                w_lon_r = gcj_lon_r - off_lon
+                w_lat_t = gcj_lat_t - off_lat
+                w_lat_b = gcj_lat_b - off_lat
+                sx0, sy0 = r._project(w_lon_l, w_lat_t)
+                sx1, sy1 = r._project(w_lon_r, w_lat_b)
+                item = QGraphicsPixmapItem(pix)
+                item.setPos(sx0, sy0)
+                item.setScale(max(sx1 - sx0, 1e-6) / 256.0)
+                item.setZValue(-1)
+                self.scene.addItem(item)
+                self._map_tiles[key] = item
+
+    # ── 节点编辑 ──
+
+    def _rebuild_node_items(self):
+        """重建节点图形标记。"""
+        for it in self._node_items:
+            self.scene.removeItem(it)
+        self._node_items = []
+        r = self.renderer
+        for name, lon, lat in self.nodes:
+            x, y = r._project(lon, lat)
+            item = NodeMarkItem(name, x, y, self)
+            self.scene.addItem(item)
+            self._node_items.append(item)
+        self._update_marker_scale()
+        if hasattr(self, "lbl_count"):
+            self.lbl_count.setText(f"共 {len(self.nodes)} 个节点")
+
+    def try_add_node_at(self, scene_pos) -> bool:
+        """右键：吸附最近轨迹点 → 弹窗命名 → 添加节点。"""
+        r = self.renderer
+        projected = r.base_projected
+        if not projected:
+            return False
+        m = self.view.transform().m11()
+        thr2 = (60.0 / m if m > 0 else 60.0) ** 2
+        best, bd = -1, float("inf")
+        for i, (x, y) in enumerate(projected):
+            d2 = (x - scene_pos.x()) ** 2 + (y - scene_pos.y()) ** 2
+            if d2 < bd:
+                bd, best = d2, i
+        if best < 0 or bd > thr2:
+            return False
+        sx, sy = projected[best]
+        inv = getattr(r._project, "inverse", None)
+        if inv is None:
+            return False
+        lon, lat = inv(sx, sy)
+        default_name = f"节点{len(self.nodes) + 1}"
+        name, ok = QInputDialog.getText(
+            self, "新增关键节点", "节点名称：", text=default_name)
+        if not ok:
+            return False
+        name = name.strip() or default_name
+        self.nodes.append((name, lon, lat))
+        self._rebuild_node_items()
+        self._sync_json_from_nodes()
+        return True
+
+    def try_remove_node_at(self, scene_pos) -> bool:
+        """左键：删除点击位置附近的节点。"""
+        m = self.view.transform().m11()
+        thr2 = (25.0 / m if m > 0 else 25.0) ** 2
+        for i, it in enumerate(self._node_items):
+            d2 = (it._cx - scene_pos.x()) ** 2 + (it._cy - scene_pos.y()) ** 2
+            if d2 <= thr2:
+                if i < len(self.nodes):
+                    del self.nodes[i]
+                self._rebuild_node_items()
+                self._sync_json_from_nodes()
+                return True
+        return False
+
+    # ── JSON 同步 ──
+
+    def _sync_json_from_nodes(self):
+        """nodes → JSON 文本框。"""
+        self.txt_json.setPlainText(json.dumps(
+            [{"name": a, "lon": b, "lat": c} for a, b, c in self.nodes],
+            ensure_ascii=False, indent=1))
+
+    def _apply_json_to_preview(self):
+        """JSON 文本框 → nodes → 刷新预览。"""
+        text = self.txt_json.toPlainText().strip()
+        if not text:
+            self.nodes = []
+            self._rebuild_node_items()
+            return
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "JSON 解析失败", str(e))
+            return
+        if not isinstance(data, list):
+            QMessageBox.warning(self, "格式错误", "请输入 JSON 数组")
+            return
+        def _pick(d, keys):
+            for k in keys:
+                if k in d and d[k] is not None:
+                    return d[k]
+            return None
+        nodes = []
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                QMessageBox.warning(self, "格式错误", f"第 {i+1} 项不是 JSON 对象")
+                return
+            lon_v = _pick(item, ["lon", "lng", "longitude", "经度"])
+            lat_v = _pick(item, ["lat", "latitude", "纬度"])
+            name_v = _pick(item, ["name", "名称"])
+            if lon_v is None or lat_v is None:
+                QMessageBox.warning(self, "格式错误",
+                                    f"第 {i+1} 项缺少有效的 lon/lat")
+                return
+            try:
+                lon, lat = float(lon_v), float(lat_v)
+            except (TypeError, ValueError):
+                QMessageBox.warning(self, "格式错误",
+                                    f"第 {i+1} 项 lon/lat 不是数字")
+                return
+            name = str(name_v) if name_v is not None else f"节点{i+1}"
+            nodes.append((name, lon, lat))
+        self.nodes = nodes
+        self._rebuild_node_items()
+
+    def result_nodes(self):
+        """确定时调用：返回编辑后的节点列表。"""
+        return list(self.nodes)
+
+
 # ─────────────────────── 主窗口 ───────────────────────
 
 class MainWindow(QMainWindow):
@@ -1134,6 +1731,7 @@ class MainWindow(QMainWindow):
         self.trajectory_item: DraggablePathItem | None = None
         self.panel_item: DataPanelItem | None = None
         self.map_item: MapPanelItem | None = None
+        self.gauge_item: SlopeGaugeItem | None = None
         self.worker: RenderWorker | None = None
 
         # 全局设置（仅窗口级状态：最近工程列表 / 视频输出目录 / 默认画布 / 上次工程路径）
@@ -1171,6 +1769,8 @@ class MainWindow(QMainWindow):
         act_open.triggered.connect(self.on_open_project)
 
         act_save = tb.addAction("💾 保存")
+        act_save.setShortcut("Ctrl+S")          # Ctrl+S 快速保存当前工程
+        act_save.setToolTip("保存当前工程（Ctrl+S）")
         act_save.triggered.connect(self.on_save_project)
 
         act_save_as = tb.addAction("💾 另存为…")
@@ -1235,15 +1835,69 @@ class MainWindow(QMainWindow):
 
     # ── 右侧 Dock ──
 
+    def _build_appearance_dialog(self):
+        """外观与标注设置（非模态）：数据面板 / 地图导航 / 轨迹与标注 三页。
+
+        非模态才能边调边看主画布实时预览；各页排版容器存到
+        self._page_*，由 _build_dock 在创建分组时按页挂载。
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("外观与标注设置")
+        dlg.setModal(False)
+        dlg.setMinimumSize(460, 430)
+
+        tabs = QTabWidget()
+
+        p1 = QWidget()
+        l1 = QVBoxLayout(p1)
+        l1.setAlignment(Qt.AlignTop)       # 控件始终靠上，不随窗口高度拉伸
+        p2 = QWidget()
+        l2 = QVBoxLayout(p2)
+        l2.setAlignment(Qt.AlignTop)
+        p3 = QWidget()
+        l3 = QVBoxLayout(p3)
+        l3.setAlignment(Qt.AlignTop)
+
+        tabs.addTab(p1, "数据面板")
+        tabs.addTab(p2, "地图导航")
+        tabs.addTab(p3, "轨迹与标注")
+
+        v = QVBoxLayout(dlg)
+        v.addWidget(tabs)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(dlg.hide)
+        v.addWidget(bb)
+
+        self._page_panel, self._page_map, self._page_track = l1, l2, l3
+        self.appearance_dlg = dlg
+
+    def _open_appearance_dialog(self):
+        """打开（或前置）外观设置窗口。"""
+        self.appearance_dlg.show()
+        self.appearance_dlg.raise_()
+        self.appearance_dlg.activateWindow()
+
     def _build_dock(self):
         dock = QDockWidget("视频参数", self)
         dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
 
         w = QWidget()
-        w.setFixedWidth(270)
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(8, 8, 8, 8)
+        w.setFixedWidth(272)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(8)
+
+        # 内容区套滚动条：屏幕矮时内容可滚动，不会被裁掉
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(10)
+
+        # 外观设置窗口先建好各页的排版容器，下面的分组按页分别挂载
+        self._build_appearance_dialog()
 
         # 输出规格（spin 初值从上次会话恢复，首次运行为默认值）
         sg = QGroupBox("输出规格")
@@ -1254,13 +1908,6 @@ class MainWindow(QMainWindow):
         self.spin_height.valueChanged.connect(lambda v: self._on_size_changed())
         sf.addRow("宽度", self.spin_width)
         sf.addRow("高度", self.spin_height)
-        self.spin_line_width = QSpinBox()
-        self.spin_line_width.setRange(2, 30)
-        self.spin_line_width.setValue(_num(self.settings, "line_width", 16))
-        self.spin_line_width.setSuffix(" px")
-        self.spin_line_width.setToolTip("轨迹基础线宽（紫色），已走过的红色会粗 1px")
-        self.spin_line_width.valueChanged.connect(self._on_line_width_changed)
-        sf.addRow("轨迹粗细", self.spin_line_width)
         layout.addWidget(sg)
 
         # 数据项显示（勾选 = 面板中显示该行数据）
@@ -1278,17 +1925,118 @@ class MainWindow(QMainWindow):
             chk.toggled.connect(lambda *_: self._on_panel_fields_changed())
             self.panel_checks[name] = chk
             fgrid.addWidget(chk, i // 2, i % 2)
-        layout.addWidget(fg)
+        self._page_panel.addWidget(fg)
 
-        # 关键节点 JSON
-        kg = QGroupBox("关键节点 (JSON)")
+        # 面板背景（半透明圆角条：宽度 / 外扩边距 / 不透明度 / 颜色）
+        bg = QGroupBox("面板背景")
+        bf = QFormLayout(bg)
+        self.spin_panel_bg_w = QSpinBox()
+        self.spin_panel_bg_w.setRange(60, 1200)
+        self.spin_panel_bg_w.setValue(320)
+        self.spin_panel_bg_w.setSuffix(" px")
+        self.spin_panel_bg_w.setToolTip(
+            "背景条宽度（基准 px，随面板缩放等比变化）\n"
+            "与字号无关，可单独收窄/拉宽：调小 = 右边缘往里收")
+        self.spin_panel_bg_w.valueChanged.connect(
+            lambda *_: self._on_panel_bg_changed())
+        bf.addRow("背景宽度", self.spin_panel_bg_w)
+        self.spin_panel_bg_pad = QSpinBox()
+        self.spin_panel_bg_pad.setRange(-50, 200)
+        self.spin_panel_bg_pad.setValue(0)
+        self.spin_panel_bg_pad.setSuffix(" px")
+        self.spin_panel_bg_pad.setToolTip(
+            "背景相对数据四周的外扩边距（随面板缩放等比变化），负值 = 向内收")
+        self.spin_panel_bg_pad.valueChanged.connect(
+            lambda *_: self._on_panel_bg_changed())
+        bf.addRow("外扩边距", self.spin_panel_bg_pad)
+        self.spin_panel_bg_alpha = QSpinBox()
+        self.spin_panel_bg_alpha.setRange(0, 100)
+        self.spin_panel_bg_alpha.setValue(45)
+        self.spin_panel_bg_alpha.setSuffix(" %")
+        self.spin_panel_bg_alpha.setToolTip("背景不透明度：0 = 全透明，100 = 不透明")
+        self.spin_panel_bg_alpha.valueChanged.connect(
+            lambda *_: self._on_panel_bg_changed())
+        bf.addRow("不透明度", self.spin_panel_bg_alpha)
+        self._panel_bg_color = QColor(128, 128, 128)
+        self.btn_panel_bg_color = QPushButton("背景颜色…")
+        self.btn_panel_bg_color.setToolTip("面板背景条的颜色")
+        self.btn_panel_bg_color.clicked.connect(self._on_pick_panel_bg_color)
+        self._refresh_panel_bg_btn()
+        bf.addRow("背景颜色", self.btn_panel_bg_color)
+        self._page_panel.addWidget(bg)
+
+        # 动态坡度仪（独立于数据面板的直角三角形，斜边倾角随坡度变化，可单独拖动/调大小）
+        gg = QGroupBox("动态坡度仪")
+        gf = QFormLayout(gg)
+        self.chk_slope_gauge = QCheckBox("显示动态坡度仪")
+        self.chk_slope_gauge.setChecked(bool(self.settings.get("show_slope_gauge", True)))
+        self.chk_slope_gauge.setToolTip("直角三角形坡度示意（斜边倾角 = 当前坡度，独立于数据面板，可单独拖动位置）")
+        self.chk_slope_gauge.toggled.connect(self._on_slope_gauge_toggled)
+        gf.addRow(self.chk_slope_gauge)
+        self.spin_gauge_size = QSpinBox()
+        self.spin_gauge_size.setRange(60, 600)
+        self.spin_gauge_size.setValue(_num(self.settings, "slope_gauge_size", 140))
+        self.spin_gauge_size.setSuffix(" px")
+        self.spin_gauge_size.setToolTip("坡度仪的边长（基准 px，也可在画布上滚轮调整）")
+        self.spin_gauge_size.valueChanged.connect(self._on_gauge_style_changed)
+        gf.addRow("仪表大小", self.spin_gauge_size)
+        self.spin_gauge_label_size = QSpinBox()
+        self.spin_gauge_label_size.setRange(8, 60)
+        self.spin_gauge_label_size.setValue(20)
+        self.spin_gauge_label_size.setSuffix(" px")
+        self.spin_gauge_label_size.setToolTip("「坡度」标签文字的字号（基准 px）")
+        self.spin_gauge_label_size.valueChanged.connect(self._on_gauge_style_changed)
+        gf.addRow("标签字号", self.spin_gauge_label_size)
+        self.spin_gauge_value_size = QSpinBox()
+        self.spin_gauge_value_size.setRange(8, 72)
+        self.spin_gauge_value_size.setValue(24)
+        self.spin_gauge_value_size.setSuffix(" px")
+        self.spin_gauge_value_size.setToolTip("坡度数值文字的字号（基准 px）")
+        self.spin_gauge_value_size.valueChanged.connect(self._on_gauge_style_changed)
+        gf.addRow("数值字号", self.spin_gauge_value_size)
+        self.spin_gauge_alpha = QSpinBox()
+        self.spin_gauge_alpha.setRange(0, 100)
+        self.spin_gauge_alpha.setValue(30)
+        self.spin_gauge_alpha.setSuffix(" %")
+        self.spin_gauge_alpha.setToolTip("三角形内部填充不透明度：0 = 全透明，100 = 不透明")
+        self.spin_gauge_alpha.valueChanged.connect(self._on_gauge_style_changed)
+        gf.addRow("填充透明度", self.spin_gauge_alpha)
+        # 五个颜色配置：上边（斜边）/ 下边（基线）/ 内部填充 / 标签 / 数值
+        self._gauge_colors = {
+            "edge_top": QColor(255, 170, 40),
+            "edge_bottom": QColor(255, 255, 255),
+            "fill": QColor(255, 170, 40),
+            "label": QColor(255, 255, 255),
+            "value": QColor(255, 255, 255),
+        }
+        self.btn_gauge_color = {}
+        for key, text in [("edge_top", "上边颜色"),
+                          ("edge_bottom", "下边颜色"),
+                          ("fill", "填充颜色"),
+                          ("label", "标签颜色"),
+                          ("value", "数值颜色")]:
+            btn = QPushButton(f"{text}…")
+            btn.clicked.connect(lambda _, k=key: self._on_pick_gauge_color(k))
+            self.btn_gauge_color[key] = btn
+            gf.addRow(text, btn)
+        self._refresh_gauge_color_btns()
+        self._page_panel.addWidget(gg)
+
+        # 轨迹（设置窗口「轨迹与标注」页）
+        tg = QGroupBox("轨迹")
+        tf = QFormLayout(tg)
+        self.spin_line_width = QSpinBox()
+        self.spin_line_width.setRange(2, 30)
+        self.spin_line_width.setValue(_num(self.settings, "line_width", 16))
+        self.spin_line_width.setSuffix(" px")
+        self.spin_line_width.setToolTip("轨迹基础线宽（紫色），已走过的红色会粗 1px")
+        self.spin_line_width.valueChanged.connect(self._on_line_width_changed)
+        tf.addRow("轨迹粗细", self.spin_line_width)
+        self._page_track.addWidget(tg)
+
+        # 关键节点（设置窗口「轨迹与标注」页）
+        kg = QGroupBox("关键节点")
         kv = QVBoxLayout(kg)
-        self.txt_nodes = QTextEdit()
-        self.txt_nodes.setPlaceholderText(
-            '[{"name": "山脚", "lon": 113.05, "lat": 22.55},\n'
-            ' {"name": "垭口", "lon": 113.08, "lat": 22.58}]')
-        self.txt_nodes.setFixedHeight(96)
-        kv.addWidget(self.txt_nodes)
         nk_form = QFormLayout()
         self.spin_node_font = QSpinBox()
         self.spin_node_font.setRange(10, 60)
@@ -1309,10 +2057,11 @@ class MainWindow(QMainWindow):
         self._refresh_node_color_btn()
         nk_form.addRow("标注颜色", self.btn_node_color)
         kv.addLayout(nk_form)
-        btn_apply_nodes = QPushButton("应用到轨迹")
-        btn_apply_nodes.clicked.connect(self.on_apply_nodes)
-        kv.addWidget(btn_apply_nodes)
-        layout.addWidget(kg)
+        btn_edit_nodes = QPushButton("📍 添加关键节点…")
+        btn_edit_nodes.setToolTip("打开节点编辑器：右键点击轨迹添加 / JSON 编辑 / 地图背景")
+        btn_edit_nodes.clicked.connect(self._open_node_editor)
+        kv.addWidget(btn_edit_nodes)
+        self._page_track.addWidget(kg)
 
         # 地图导航
         mg = QGroupBox("地图导航")
@@ -1368,11 +2117,9 @@ class MainWindow(QMainWindow):
         self.spin_map_arrow.setToolTip("地图上当前位置方向箭头的大小")
         self.spin_map_arrow.valueChanged.connect(self._on_map_arrow_changed)
         mf.addRow("箭头大小", self.spin_map_arrow)
-        layout.addWidget(mg)
+        self._page_map.addWidget(mg)
 
-        layout.addStretch()
-
-        # 时长 & FPS
+        # 时长 & 帧率（常用，留在外侧）
         pg = QGroupBox("时长 & 帧率")
         pf = QFormLayout(pg)
         self.spin_duration = QSpinBox()
@@ -1381,10 +2128,31 @@ class MainWindow(QMainWindow):
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(1, 60); self.spin_fps.setValue(_num(self.settings, "fps", 2))
         self.spin_fps.setSuffix(" fps")
+        # 输出倍率（超采样）：画布像素 × 倍率，构图比例不变但文字/线条更清晰
+        self.combo_render_scale = QComboBox()
+        self.combo_render_scale.addItem("1×（原始尺寸）", 1)
+        self.combo_render_scale.addItem("2×（更清晰）", 2)
+        self.combo_render_scale.addItem("3×（更清晰）", 3)
+        self.combo_render_scale.addItem("4×（最清晰）", 4)
+        _rs = int(_num(self.settings, "render_scale", 1) or 1)
+        _rsi = self.combo_render_scale.findData(_rs)
+        self.combo_render_scale.setCurrentIndex(_rsi if _rsi >= 0 else 0)
+        self.combo_render_scale.setToolTip(
+            "输出视频的像素密度倍率（超采样）\n"
+            "构图与 1× 完全一致，但像素数 ×N²\n"
+            "窄画布视频在播放器里被放大时不再发虚，文字/线条更清晰\n"
+            "倍率越高渲染越慢、文件越大")
+        self.combo_render_scale.currentIndexChanged.connect(self._update_frames_label)
+        # 输出实际像素尺寸（画布 × 倍率）：让「清晰度」可见，避免忘记设倍率
+        self.lbl_out_size = QLabel()
+        self.lbl_out_size.setStyleSheet("color:#8fd0ff; font-weight:bold;")
         self.lbl_frames = QLabel()
         self._update_frames_label()
         self.spin_duration.valueChanged.connect(self._update_frames_label)
         self.spin_fps.valueChanged.connect(self._update_frames_label)
+        # 画布尺寸变化时同步刷新「输出尺寸」
+        self.spin_width.valueChanged.connect(self._update_frames_label)
+        self.spin_height.valueChanged.connect(self._update_frames_label)
         # 生成方式：整段 vs 分段（分段数据始终保留，切换不丢失）
         self.rb_uniform = QRadioButton("整段")
         self.rb_segments = QRadioButton("分段")
@@ -1412,14 +2180,28 @@ class MainWindow(QMainWindow):
         pf.addRow("生成方式", _seg_w)
         pf.addRow("时长", self.spin_duration)
         pf.addRow("帧率", self.spin_fps)
+        pf.addRow("输出倍率", self.combo_render_scale)
+        pf.addRow("输出尺寸", self.lbl_out_size)
         pf.addRow("", self.lbl_frames)
         layout.addWidget(pg)
 
-        # 进度 + 终止按钮
+        # 外观与标注设置入口（数据面板 / 地图导航 / 轨迹与标注 三页，非模态）
+        self.btn_appearance = QPushButton("🎨 外观与标注设置…")
+        self.btn_appearance.setToolTip(
+            "数据项与面板背景、地图导航、轨迹与标注等配置项\n"
+            "（非模态窗口，可边调边看画布预览）")
+        self.btn_appearance.clicked.connect(self._open_appearance_dialog)
+        layout.addWidget(self.btn_appearance)
+
+        layout.addStretch()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+
+        # 进度 + 终止按钮（固定在底部，不随内容滚动）
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        layout.addWidget(self.progress, 1)
+        outer.addWidget(self.progress)
         self.btn_abort = QPushButton("⛔ 终止")
         self.btn_abort.setEnabled(False)
         self.btn_abort.setStyleSheet(
@@ -1427,9 +2209,8 @@ class MainWindow(QMainWindow):
             "QPushButton:hover{background:#5a2020;}"
             "QPushButton:disabled{color:#666; background:#222;}")
         self.btn_abort.clicked.connect(self._on_abort_render)
-        layout.addWidget(self.btn_abort)
+        outer.addWidget(self.btn_abort)
 
-        layout.addStretch()
         dock.setWidget(w)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
@@ -1440,6 +2221,16 @@ class MainWindow(QMainWindow):
         else:
             total = self.spin_duration.value() * self.spin_fps.value()
             self.lbl_frames.setText(f"总帧数: {total}")
+        # 输出实际像素尺寸 = 画布 × 倍率；窄画布倍率=1 时给出提示
+        rs = int(self.combo_render_scale.currentData() or 1)
+        ow, oh = self._cw * rs, self._ch * rs
+        self.lbl_out_size.setText(f"{ow} × {oh} px（{ow * oh / 1e6:.2f} MP）")
+        if rs == 1 and self._cw < 1280:
+            self.lbl_out_size.setToolTip(
+                "画布较窄且倍率为 1×，输出像素偏少；\n"
+                "导入剪辑软件放大后容易发虚/发淡，建议把「输出倍率」调到 ≥2×")
+        else:
+            self.lbl_out_size.setToolTip("")
 
     def _on_seg_mode_changed(self):
         """生成方式切换：整段/分段；分段数据始终保留，不删除。"""
@@ -1487,6 +2278,43 @@ class MainWindow(QMainWindow):
         if self.renderer is not None:
             self.renderer.trajectory_width = self.spin_line_width.value()
             self.trajectory_item._apply_pen()
+            self.scene.update()
+        self._mark_dirty()
+
+    # ── 面板背景 ──
+
+    def _on_panel_bg_changed(self):
+        """面板背景宽度/外扩边距/不透明度：同步 renderer 并刷新预览。"""
+        if self.renderer is not None:
+            self.renderer.panel_bg_w = float(self.spin_panel_bg_w.value())
+            self.renderer.panel_bg_pad = float(self.spin_panel_bg_pad.value())
+            self.renderer.panel_bg_alpha_pct = float(
+                self.spin_panel_bg_alpha.value())
+            if self.panel_item is not None:
+                self.panel_item.prepareGeometryChange()
+                self.panel_item.update()
+            self.scene.update()
+        self._mark_dirty()
+
+    def _refresh_panel_bg_btn(self):
+        """颜色按钮背景 = 当前背景色（按钮即色块预览）。"""
+        c = self._panel_bg_color
+        txt = "#000" if (c.red() + c.green() + c.blue()) > 420 else "#fff"
+        self.btn_panel_bg_color.setStyleSheet(
+            f"background-color: {c.name()}; color: {txt};"
+            "border: 1px solid #666; padding: 3px 8px;")
+
+    def _on_pick_panel_bg_color(self):
+        """调色板选面板背景色：同步 renderer 并刷新预览。"""
+        c = QColorDialog.getColor(self._panel_bg_color, self, "选择面板背景颜色")
+        if not c.isValid():
+            return
+        self._panel_bg_color = c
+        self._refresh_panel_bg_btn()
+        if self.renderer is not None:
+            self.renderer.panel_bg_color = (c.red(), c.green(), c.blue())
+            if self.panel_item is not None:
+                self.panel_item.update()
             self.scene.update()
         self._mark_dirty()
 
@@ -1548,6 +2376,61 @@ class MainWindow(QMainWindow):
         self.scene.update()
         self._mark_dirty()
 
+    def _on_slope_gauge_toggled(self, on: bool):
+        """动态坡度仪开关：同步 renderer + 创建/移除 GUI 仪表。"""
+        if self.renderer is None:
+            return
+        self.renderer.show_slope_gauge = on
+        if on and self.gauge_item is None:
+            self.gauge_item = SlopeGaugeItem(self.renderer)
+            self.scene.addItem(self.gauge_item)
+        elif not on and self.gauge_item is not None:
+            self.scene.removeItem(self.gauge_item)
+            self.gauge_item = None
+        self.scene.update()
+        self._mark_dirty()
+
+    def _on_gauge_style_changed(self, *_):
+        """坡度仪大小/字号/透明度变化 → 同步 renderer + 刷新 GUI。"""
+        if self.renderer is None:
+            return
+        r = self.renderer
+        r.slope_gauge_size = float(self.spin_gauge_size.value())
+        r.gauge_label_size = float(self.spin_gauge_label_size.value())
+        r.gauge_value_size = float(self.spin_gauge_value_size.value())
+        r.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
+        mapping = {"edge_top": "gauge_edge_top_color",
+                   "edge_bottom": "gauge_edge_bottom_color",
+                   "fill": "gauge_fill_color",
+                   "label": "gauge_label_color",
+                   "value": "gauge_value_color"}
+        for key, attr in mapping.items():
+            c = self._gauge_colors[key]
+            setattr(r, attr, (c.red(), c.green(), c.blue()))
+        if self.gauge_item is not None:
+            self.gauge_item.prepareGeometryChange()
+            self.gauge_item.setRect(0, 0, r.slope_gauge_size, r.slope_gauge_size)
+            self.gauge_item.update()
+        self.scene.update()
+        self._mark_dirty()
+
+    def _on_pick_gauge_color(self, key: str):
+        """坡度仪颜色按钮：调色板选择 → 写回 renderer。"""
+        c = QColorDialog.getColor(self._gauge_colors[key], self, "选择颜色")
+        if c.isValid():
+            self._gauge_colors[key] = c
+            self._refresh_gauge_color_btns()
+            self._on_gauge_style_changed()
+
+    def _refresh_gauge_color_btns(self):
+        """颜色按钮背景 = 当前色（按钮即色块预览）。"""
+        for key, btn in self.btn_gauge_color.items():
+            c = self._gauge_colors[key]
+            txt = "#000" if (c.red() + c.green() + c.blue()) > 420 else "#fff"
+            btn.setStyleSheet(
+                f"background-color: {c.name()}; color: {txt};"
+                "border: 1px solid #666; padding: 3px 8px;")
+
     def _on_map_zoom_changed(self):
         """地图缩放级别变化 → 同步 renderer。"""
         if self.renderer is not None:
@@ -1584,60 +2467,18 @@ class MainWindow(QMainWindow):
             self.renderer.map_arrow_size = self.spin_map_arrow.value()
         self._mark_dirty()
 
-    def on_apply_nodes(self):
-        """解析 JSON 输入框中的关键节点并应用到轨迹。"""
+    def _open_node_editor(self):
+        """打开关键节点编辑器对话框。"""
         if self.renderer is None:
             QMessageBox.warning(self, "提示", "请先加载 KML 文件")
             return
-        text = self.txt_nodes.toPlainText().strip()
-        if not text:
-            self.renderer.key_nodes = []   # 空输入 = 清空节点
+        dlg = NodeEditorDialog(self.renderer, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.renderer.key_nodes = dlg.result_nodes()
             self._rebuild_node_items()
-            self.statusBar().showMessage("已清空关键节点", 5000)
+            self.statusBar().showMessage(
+                f"已更新关键节点（共 {len(self.renderer.key_nodes)} 个）", 5000)
             self._mark_dirty()
-            return
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as e:
-            QMessageBox.warning(self, "JSON 解析失败", str(e))
-            return
-        if not isinstance(data, list):
-            QMessageBox.warning(
-                self, "格式错误",
-                "请输入 JSON 数组，例如:\n"
-                '[{"name": "山脚", "lon": 113.05, "lat": 22.55}]')
-            return
-
-        def _pick(d, keys):
-            for k in keys:
-                if k in d and d[k] is not None:
-                    return d[k]
-            return None
-
-        nodes = []
-        for i, item in enumerate(data):
-            if not isinstance(item, dict):
-                QMessageBox.warning(self, "格式错误", f"第 {i+1} 项不是 JSON 对象")
-                return
-            lon_v = _pick(item, ["lon", "lng", "longitude", "经度"])
-            lat_v = _pick(item, ["lat", "latitude", "纬度"])
-            name_v = _pick(item, ["name", "名称"])
-            if lon_v is None or lat_v is None:
-                QMessageBox.warning(
-                    self, "格式错误", f"第 {i+1} 项缺少有效的经度(lon)/纬度(lat)")
-                return
-            try:
-                lon, lat = float(lon_v), float(lat_v)
-            except (TypeError, ValueError):
-                QMessageBox.warning(self, "格式错误", f"第 {i+1} 项 lon/lat 不是数字")
-                return
-            name = str(name_v) if name_v is not None else f"节点{i+1}"
-            nodes.append((name, lon, lat))
-
-        self.renderer.key_nodes = nodes
-        self._rebuild_node_items()
-        self.statusBar().showMessage(f"已应用 {len(nodes)} 个关键节点", 5000)
-        self._mark_dirty()
 
     def _rebuild_node_items(self):
         """重建关键节点图形：彩色标记 + 名称标签，作为轨迹子项跟随拖拽缩放。"""
@@ -1853,6 +2694,10 @@ class MainWindow(QMainWindow):
         self.spin_fps.setValue(_num(s, "fps", 2))
         self.spin_duration.blockSignals(False)
         self.spin_fps.blockSignals(False)
+        # 输出倍率（超采样）
+        _rsi = self.combo_render_scale.findData(int(_num(s, "render_scale", 1) or 1))
+        if _rsi >= 0:
+            self.combo_render_scale.setCurrentIndex(_rsi)
         # 数据项勾选
         saved_fields = s.get("panel_fields")
         if saved_fields is not None:
@@ -1861,16 +2706,67 @@ class MainWindow(QMainWindow):
                 chk.blockSignals(True)
                 chk.setChecked(name in saved_set)
                 chk.blockSignals(False)
-        # 关键节点 JSON 文本框
-        nodes = s.get("key_nodes")
-        if nodes is not None:
+        # 面板背景（宽度 / 外扩边距 / 不透明度 / 颜色）
+        self.spin_panel_bg_w.blockSignals(True)
+        self.spin_panel_bg_w.setValue(int(_num(s, "panel_bg_w", 320)))
+        self.spin_panel_bg_w.blockSignals(False)
+        self.spin_panel_bg_pad.blockSignals(True)
+        self.spin_panel_bg_pad.setValue(int(_num(s, "panel_bg_pad", 0)))
+        self.spin_panel_bg_pad.blockSignals(False)
+        self.spin_panel_bg_alpha.blockSignals(True)
+        self.spin_panel_bg_alpha.setValue(
+            int(_num(s, "panel_bg_alpha_pct", 45)))
+        self.spin_panel_bg_alpha.blockSignals(False)
+        bc = s.get("panel_bg_color")
+        if bc and len(bc) >= 3:
             try:
-                self.txt_nodes.setPlainText(json.dumps(
-                    [{"name": a, "lon": b, "lat": c}
-                     for a, b, c in nodes],
-                    ensure_ascii=False, indent=1))
+                self._panel_bg_color = QColor(int(bc[0]), int(bc[1]),
+                                              int(bc[2]))
+                self._refresh_panel_bg_btn()
+            except (TypeError, ValueError, IndexError):
+                pass
+        if self.renderer is not None:
+            self.renderer.panel_bg_w = float(_num(s, "panel_bg_w", 320))
+            self.renderer.panel_bg_pad = float(_num(s, "panel_bg_pad", 0))
+            self.renderer.panel_bg_alpha_pct = float(
+                _num(s, "panel_bg_alpha_pct", 45))
+            if bc and len(bc) >= 3:
+                self.renderer.panel_bg_color = (
+                    self._panel_bg_color.red(), self._panel_bg_color.green(),
+                    self._panel_bg_color.blue())
+        # 动态坡度仪控件
+        self.chk_slope_gauge.blockSignals(True)
+        self.chk_slope_gauge.setChecked(bool(s.get("show_slope_gauge", True)))
+        self.chk_slope_gauge.blockSignals(False)
+        self.spin_gauge_size.blockSignals(True)
+        self.spin_gauge_size.setValue(_num(s, "slope_gauge_size", 140))
+        self.spin_gauge_size.blockSignals(False)
+        self.spin_gauge_label_size.blockSignals(True)
+        self.spin_gauge_label_size.setValue(_num(s, "gauge_label_size", 20))
+        self.spin_gauge_label_size.blockSignals(False)
+        self.spin_gauge_value_size.blockSignals(True)
+        self.spin_gauge_value_size.setValue(_num(s, "gauge_value_size", 24))
+        self.spin_gauge_value_size.blockSignals(False)
+        self.spin_gauge_alpha.blockSignals(True)
+        self.spin_gauge_alpha.setValue(_num(s, "gauge_fill_alpha_pct", 30))
+        self.spin_gauge_alpha.blockSignals(False)
+        for _gk in ("edge_top", "edge_bottom", "fill", "label", "value"):
+            _gv = s.get(f"gauge_{_gk}_color")
+            if _gv and len(_gv) >= 3:
+                try:
+                    self._gauge_colors[_gk] = QColor(int(_gv[0]), int(_gv[1]),
+                                                     int(_gv[2]))
+                except (TypeError, ValueError):
+                    pass
+        self._refresh_gauge_color_btns()
+        # 关键节点（无文本框，仅写回 renderer）
+        nodes = s.get("key_nodes")
+        if nodes is not None and self.renderer is not None:
+            try:
+                self.renderer.key_nodes = [
+                    (str(a), float(b), float(c)) for a, b, c in nodes]
             except (TypeError, ValueError):
-                self.txt_nodes.setPlainText("")
+                self.renderer.key_nodes = []
         # 地图导航控件
         self.chk_map.blockSignals(True)
         self.chk_map.setChecked(bool(s.get("show_map", False)))
@@ -1930,6 +2826,19 @@ class MainWindow(QMainWindow):
             size = self.renderer.map_size * self.map_item._s
             self.map_item.setRect(0, 0, size, size)
             self.map_item._sync()
+        # 动态坡度仪位置/大小恢复
+        gp = s.get("slope_gauge_pos")
+        if gp:
+            try:
+                self.renderer.slope_gauge_pos = (float(gp[0]), float(gp[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        if self.gauge_item is not None:
+            gsz = float(self.renderer.slope_gauge_size)
+            self.gauge_item.prepareGeometryChange()
+            self.gauge_item.setRect(0, 0, gsz, gsz)
+            self.gauge_item.setPos(*self.renderer.slope_gauge_pos)
+            self.gauge_item._sync()
         nodes = s.get("key_nodes") or []
         if nodes:
             try:
@@ -2066,6 +2975,20 @@ class MainWindow(QMainWindow):
             self.combo_map_text.currentIndex()]
         self.renderer.map_arrow_size = self.spin_map_arrow.value()
         self.renderer.map_heading_up = (self.combo_map_orient.currentIndex() == 1)
+        # 动态坡度仪设置（从 GUI 控件同步）
+        self.renderer.show_slope_gauge = self.chk_slope_gauge.isChecked()
+        self.renderer.slope_gauge_size = float(self.spin_gauge_size.value())
+        self.renderer.gauge_label_size = float(self.spin_gauge_label_size.value())
+        self.renderer.gauge_value_size = float(self.spin_gauge_value_size.value())
+        self.renderer.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
+        _gmap = {"edge_top": "gauge_edge_top_color",
+                 "edge_bottom": "gauge_edge_bottom_color",
+                 "fill": "gauge_fill_color",
+                 "label": "gauge_label_color",
+                 "value": "gauge_value_color"}
+        for _gk, _ga in _gmap.items():
+            _gc = self._gauge_colors[_gk]
+            setattr(self.renderer, _ga, (_gc.red(), _gc.green(), _gc.blue()))
         # 分段生成模式（从 GUI 单选按钮同步）
         self.renderer.use_segments = self.rb_segments.isChecked()
 
@@ -2096,6 +3019,12 @@ class MainWindow(QMainWindow):
         if self.renderer.show_map:
             self.map_item = MapPanelItem(self.renderer)
             self.scene.addItem(self.map_item)
+
+        # 动态坡度仪（仅当用户勾选时显示）
+        self.gauge_item = None
+        if self.renderer.show_slope_gauge:
+            self.gauge_item = SlopeGaugeItem(self.renderer)
+            self.scene.addItem(self.gauge_item)
 
         # 起/终点：作为轨迹的子项，拖拽/缩放自动跟随（放大到半径14）
         sx, sy = projected[0]
@@ -2149,10 +3078,14 @@ class MainWindow(QMainWindow):
         x0, y0, x1, y1 = r.get_bounds()
         traj_bad = x0 < -pad or y0 < -pad or x1 > w + pad or y1 > h + pad
 
-        pw = DataPanelItem.BASE_W * r.panel_scale
-        ph = DataPanelItem._base_h(r) * r.panel_scale
+        pw = _panel_span_w(r)
+        ph = _panel_span_h(r)
         px, py = r.panel_pos
-        panel_bad = px < -2 or py < -2 or px + pw > w + 2 or py + ph > h + 2
+        # 背景条向外扩的部分也占画布空间，故起点按边距左/上偏移后判定
+        panel_pad = r.panel_bg_pad * r.panel_scale
+        panel_bad = (px - panel_pad < -2 or py - panel_pad < -2
+                     or px - panel_pad + pw > w + 2
+                     or py - panel_pad + ph > h + 2)
 
         if not (traj_bad or panel_bad):
             return True
@@ -2209,8 +3142,8 @@ class MainWindow(QMainWindow):
     def _auto_fit_panel(self):
         """把数据面板平移回画布内（左上优先）。"""
         r = self.renderer
-        pw = DataPanelItem.BASE_W * r.panel_scale
-        ph = DataPanelItem._base_h(r) * r.panel_scale
+        pw = _panel_span_w(r)
+        ph = _panel_span_h(r)
         px = min(max(r.panel_pos[0], 8), max(8, r.width - pw - 8))
         py = min(max(r.panel_pos[1], 8), max(8, r.height - ph - 8))
         r.panel_pos = (px, py)
@@ -2249,7 +3182,8 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         fps = self.spin_fps.value()
         dur = self.spin_duration.value()
-        self.worker = RenderWorker(self.renderer, out_path, fps, dur)
+        rscale = self.combo_render_scale.currentData() or 1
+        self.worker = RenderWorker(self.renderer, out_path, fps, dur, rscale)
         self.worker.progress.connect(
             lambda done, t: self.progress.setValue(int(done / t * 100)))
         self.worker.finished_ok.connect(self._on_render_done)
@@ -2307,7 +3241,16 @@ class MainWindow(QMainWindow):
                            self._node_color.blue()],
             "duration": self.spin_duration.value(),
             "fps": self.spin_fps.value(),
+            "render_scale": (self.combo_render_scale.currentData() or 1),
             "panel_fields": self._checked_fields(),
+            "panel_bg_w": (self.renderer.panel_bg_w
+                           if self.renderer else 320.0),
+            "panel_bg_pad": (self.renderer.panel_bg_pad
+                             if self.renderer else 0.0),
+            "panel_bg_color": (list(self.renderer.panel_bg_color)
+                               if self.renderer else [128, 128, 128]),
+            "panel_bg_alpha_pct": (self.renderer.panel_bg_alpha_pct
+                                   if self.renderer else 45.0),
             "key_nodes": (list(self.renderer.key_nodes)
                           if self.renderer else []),
             # segments 用新 dict 格式（cuts / durations）
@@ -2323,6 +3266,28 @@ class MainWindow(QMainWindow):
                                if self.renderer else 14),
             "map_heading_up": (self.renderer.map_heading_up
                                if self.renderer else False),
+            "show_slope_gauge": (self.renderer.show_slope_gauge
+                                 if self.renderer else False),
+            "slope_gauge_size": (self.renderer.slope_gauge_size
+                                 if self.renderer else 140.0),
+            "slope_gauge_pos": (list(self.renderer.slope_gauge_pos)
+                                if self.renderer else [40.0, 880.0]),
+            "gauge_label_size": (self.renderer.gauge_label_size
+                                 if self.renderer else 20.0),
+            "gauge_value_size": (self.renderer.gauge_value_size
+                                 if self.renderer else 24.0),
+            "gauge_fill_alpha_pct": (self.renderer.gauge_fill_alpha_pct
+                                     if self.renderer else 30.0),
+            "gauge_edge_top_color": (list(self.renderer.gauge_edge_top_color)
+                                     if self.renderer else [255, 170, 40]),
+            "gauge_edge_bottom_color": (list(self.renderer.gauge_edge_bottom_color)
+                                        if self.renderer else [255, 255, 255]),
+            "gauge_fill_color": (list(self.renderer.gauge_fill_color)
+                                 if self.renderer else [255, 170, 40]),
+            "gauge_label_color": (list(self.renderer.gauge_label_color)
+                                  if self.renderer else [255, 255, 255]),
+            "gauge_value_color": (list(self.renderer.gauge_value_color)
+                                  if self.renderer else [255, 255, 255]),
             "use_segments": (self.renderer.use_segments if self.renderer else False),
         }
         if self.trajectory_item is not None:
