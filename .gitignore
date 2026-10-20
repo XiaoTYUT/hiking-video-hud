@@ -42,3 +42,8 @@ settings.json
 
 # 临时 / 一次性脚本（含硬编码本地路径，仅本机调试用）
 _render_once.py
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec

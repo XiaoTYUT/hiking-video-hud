@@ -3338,7 +3338,11 @@ class MainWindow(QMainWindow):
 def _setup_crash_log():
     """未捕获异常 / 原生崩溃写入 crash.log，便于事后定位。"""
     import faulthandler
-    log_path = Path(__file__).with_name("crash.log")
+    # 打包版 __file__ 指向临时解压目录，crash.log 写到 exe 旁边才留得住
+    if getattr(sys, "frozen", False):
+        log_path = Path(sys.executable).with_name("crash.log")
+    else:
+        log_path = Path(__file__).with_name("crash.log")
     f = open(log_path, "w", encoding="utf-8")
     faulthandler.enable(f)
     sys.excepthook = lambda t, v, tb: (
@@ -3350,6 +3354,8 @@ def _setup_crash_log():
 
 
 def main():
+    import multiprocessing
+    multiprocessing.freeze_support()   # 打包后多进程渲染子进程必需
     _setup_crash_log()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

@@ -23,6 +23,15 @@ from PIL import Image, ImageDraw, ImageFont
 Point = Tuple[float, float, float, float]  # lon, lat, elev, rel_time
 
 
+def _ffmpeg_exe() -> str:
+    """ffmpeg 可执行文件：打包版优先用内置 ffmpeg，否则回退 PATH 查找。"""
+    if getattr(sys, "frozen", False):
+        bundled = Path(getattr(sys, "_MEIPASS", "")) / "ffmpeg.exe"
+        if bundled.exists():
+            return str(bundled)
+    return "ffmpeg"
+
+
 # ─────────────────────── 瓦片地图工具 ───────────────────────
 
 TILE_CACHE_DIR = (Path(os.environ.get("APPDATA", Path.home())) / "KmlPath" / "tiles")
@@ -1291,7 +1300,7 @@ class Renderer:
                     idx_list, frames_dir, total_frames, workers, progress_cb)
 
             cmd = [
-                "ffmpeg", "-y",
+                _ffmpeg_exe(), "-y",
                 "-framerate", str(fps),
                 "-i", str(frames_dir / "frame_%05d.png"),
                 "-r", str(fps),          # 强制输出帧率，避免剪映/Pr 用默认 24fps 重读
