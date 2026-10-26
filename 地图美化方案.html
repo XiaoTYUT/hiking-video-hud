@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>轨迹视频 · 美化方案</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #12151c; color: #dde3ec;
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    padding: 32px 24px 64px; max-width: 1180px; margin: 0 auto;
+  }
+  h1 { font-size: 26px; margin-bottom: 8px; }
+  .sub { color: #93a0b4; font-size: 14px; line-height: 1.7; margin-bottom: 28px; }
+  .sub b { color: #cdd6e4; }
+  .card {
+    background: #1a1f2a; border: 1px solid #2a3242; border-radius: 14px;
+    padding: 20px 22px; margin-bottom: 22px;
+  }
+  .card h2 { font-size: 18px; display: flex; align-items: center; gap: 10px; }
+  .pill {
+    font-size: 11px; font-weight: 700; letter-spacing: .5px;
+    padding: 3px 11px; border-radius: 20px; flex: none;
+  }
+  .pill.s1 { background: #1f4a3d; color: #8ee6c3; }
+  .pill.s2 { background: #55361f; color: #ffc38e; }
+  .pill.s3 { background: #4a2f63; color: #d3b0ff; }
+  .pill.s4 { background: #274067; color: #9cc4ff; }
+  .pill.rec { background: #5a2f2f; color: #ffb3b3; }
+  .desc { color: #98a4b8; font-size: 13.5px; line-height: 1.75; margin: 8px 0 14px; }
+  .desc b { color: #ccd5e2; }
+  .tile {
+    position: relative; border-radius: 10px; overflow: hidden;
+    background: #263042 url('assets/gauge_preview_bg.jpg') center/cover;
+    box-shadow: inset 0 0 0 1px #ffffff22;
+  }
+  .tile.dark { background: #0c1017; }
+  .tile svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .tile .cap {
+    position: absolute; right: 10px; top: 7px; font-size: 11px; font-weight: 700;
+    color: #fff; text-shadow: 0 1px 3px #000; letter-spacing: .5px; z-index: 2;
+  }
+  .tile .tag {
+    position: absolute; left: 10px; top: 7px; font-size: 11px; font-weight: 700;
+    color: #ffd; text-shadow: 0 1px 3px #000; z-index: 2; opacity: .85;
+  }
+  .duo { display: flex; gap: 14px; flex-wrap: wrap; }
+  .duo .tile { flex: 1 1 380px; aspect-ratio: 16/9; }
+  .diag { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+  .diag img { width: 460px; max-width: 100%; border-radius: 10px; box-shadow: 0 4px 18px #0008; }
+  .diag ul { margin: 2px 0 0 18px; color: #a8b3c4; font-size: 13.5px; line-height: 2.0; }
+  .diag ul b { color: #e6ecf5; }
+  .playground .stage {
+    position: relative; border-radius: 12px; overflow: hidden;
+    background: #263042 url('assets/gauge_preview_bg.jpg') center/cover;
+    aspect-ratio: 16/9; box-shadow: inset 0 0 0 1px #ffffff22;
+  }
+  .playground .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .controls { display: flex; align-items: center; gap: 14px; margin-top: 16px; flex-wrap: wrap; }
+  .controls label {
+    display: flex; align-items: center; gap: 6px; font-size: 13px; color: #c6d0de;
+    background: #232b3a; border: 1px solid #333e52; border-radius: 8px; padding: 6px 10px;
+    cursor: pointer; user-select: none;
+  }
+  .controls label:hover { background: #2a3446; }
+  .controls input[type=checkbox] { accent-color: #ffb347; }
+  .controls select {
+    background: #232b3a; color: #c6d0de; border: 1px solid #333e52; border-radius: 8px;
+    padding: 6px 8px; font-family: inherit; font-size: 13px;
+  }
+  input[type=range] { flex: 1; min-width: 140px; accent-color: #ffb347; height: 4px; }
+  button {
+    background: #2c3648; color: #dfe6f0; border: 1px solid #3d4a60;
+    border-radius: 8px; padding: 7px 18px; font-size: 13px; cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { background: #36425a; }
+  button.on { background: #4a5d2c; border-color: #6d8a3f; }
+  .note { color: #7d8a9e; font-size: 12.5px; margin-top: 14px; line-height: 1.8; }
+  .note b { color: #aeb9c9; }
+  .impl { color: #7d8a9e; font-size: 12.5px; margin-top: 10px; line-height: 1.7; }
+  .impl code { background: #10151d; padding: 1px 6px; border-radius: 5px; color: #9fc3ff; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>轨迹视频 · 美化方案</h1>
+<div class="sub">
+  以下所有实例均使用 <b>test.kml 真实轨迹</b>（9.95 km，海拔 18–348 m，进度固定在 55%）
+  叠加在真实徒步画面上渲染。<b>计算逻辑、布局参数、透明 MOV 输出全部不变</b>，只改绘制外观。
+  页面底部为可交互组合演示，勾选特性实时预览。
+</div>
+
+<!-- ───────── 现状诊断 ───────── -->
+<div class="card">
+  <h2><span class="pill rec">现状</span>当前效果诊断</h2>
+  <div class="diag">
+    <img src="elev_preview_mid_bg.png" alt="当前渲染帧">
+    <ul>
+      <li><b>线条扁平</b>：纯色描边、无轮廓无光晕，杂乱背景上辨识度一般</li>
+      <li><b>配色孤立</b>：紫 + 红与画面、地形没有关联，略显生硬</li>
+      <li><b>面板无层级</b>：7 行同字号等宽排列，且数值溢出灰色背景条（见左图）</li>
+      <li><b>风格不统一</b>：灰面板 / 深色海拔卡 / 彩色坡度尺，三套视觉语言并存</li>
+      <li><b>起终点无文字</b>：裸圆点观众认不出含义</li>
+      <li><b>当前位置标记</b>：三层同心圆偏"仪器感"，缺乏活力</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ───────── 方案一 ───────── -->
+<div class="card">
+  <h2><span class="pill s1">方案一</span>描边 + 柔光轨迹 <span style="font-size:12px;color:#8ee6c3;font-weight:400">性价比最高，改动最小</span></h2>
+  <div class="desc">
+    轨迹下方垫一层<b>深色半透明粗描边</b>（任何背景上都清晰分离），已走部分再叠两层<b>同色递减光晕</b>。
+    线条转角改用圆角连接消除毛刺。颜色体系完全沿用现有可配置色。
+  </div>
+  <div class="duo">
+    <div class="tile"><span class="tag">现在</span><svg id="t1a" viewBox="0 0 960 540"></svg></div>
+    <div class="tile"><span class="tag">描边 + 柔光</span><svg id="t1b" viewBox="0 0 960 540"></svg></div>
+  </div>
+  <div class="impl">PIL 实现：<code>d.line(宽度+6, 黑40%)</code> 打底 → 主线 → <code>宽度×2.2, alpha 25%</code> 光晕两层；逐帧 O(n)，多进程渲染无额外状态。</div>
+</div>
+
+<!-- ───────── 方案二 ───────── -->
+<div class="card">
+  <h2><span class="pill s2">方案二</span>海拔渐变轨迹 <span style="font-size:12px;color:#ffc38e;font-weight:400">路线地形一眼读懂</span></h2>
+  <div class="desc">
+    整条轨迹按<b>海拔连续着色</b>（低海拔青绿 → 高海拔橙红），未走部分降低饱和度保持克制，
+    已走部分全饱和 + 柔光。观众不看数据面板也能感知「哪里在爬坡、哪里是山顶」。
+    同一管线也可切换为<b>配速渐变</b>（快冷色 / 慢暖色）。
+  </div>
+  <div class="duo">
+    <div class="tile"><span class="tag">海拔渐变</span><svg id="t2a" viewBox="0 0 960 540"></svg></div>
+    <div class="tile"><span class="tag">海拔渐变 · 未走灰化</span><svg id="t2b" viewBox="0 0 960 540"></svg></div>
+  </div>
+  <div class="impl">PIL 实现：逐小段 <code>d.line</code> 单色绘制（海拔色表预计算 256 级），已走/未走两段循环；点数 ~4k 时单帧增加约 2-3ms。</div>
+</div>
+
+<!-- ───────── 方案三 ───────── -->
+<div class="card">
+  <h2><span class="pill s3">方案三</span>主题配色预设 <span style="font-size:12px;color:#d3b0ff;font-weight:400">一键换整套气质</span></h2>
+  <div class="desc">
+    在描边+柔光基础上提供 3 套预设：<b>山野橙</b>（暖橙已走/米白未走，户外杂志感）、
+    <b>荧光青</b>（青蓝已走/浅灰未走，科技感）、<b>经典红紫</b>（现有配色 + 描边柔光）。
+    预设只是默认色组合，仍可在 GUI 取色器里逐项微调。
+  </div>
+  <div class="duo">
+    <div class="tile"><span class="tag">山野橙</span><svg id="t3a" viewBox="0 0 960 540"></svg></div>
+    <div class="tile"><span class="tag">荧光青</span><svg id="t3b" viewBox="0 0 960 540"></svg></div>
+    <div class="tile dark"><span class="tag">荧光青 · 深色底演示</span><svg id="t3c" viewBox="0 0 960 540"></svg></div>
+  </div>
+  <div class="impl">实现：一组 <code>THEMES</code> 字典 + 「外观与标注设置」里的预设下拉，写入现有 4 个颜色键，零新增持久化字段。</div>
+</div>
+
+<!-- ───────── 方案四 ───────── -->
+<div class="card">
+  <h2><span class="pill s4">方案四</span>当前位置标记升级 <span style="font-size:12px;color:#9cc4ff;font-weight:400">画面焦点</span></h2>
+  <div class="desc">
+    白芯 + 彩色环 + <b>径向柔光球</b>，外侧一圈<b>呼吸脉冲环</b>（随视频帧缩放扩散），
+    行进方向加一个淡淡的<b>扇形光锥</b>。让观众视线始终锁定当前位置。
+    右图可看到脉冲动画；静止（暂停段）时脉冲自动停、只保留柔光球。
+  </div>
+  <div class="duo">
+    <div class="tile"><span class="tag">现在：三层同心圆</span><svg id="t4a" viewBox="0 0 960 540"></svg></div>
+    <div class="tile"><span class="tag">柔光球 + 脉冲环 + 方向光锥</span><svg id="t4b" viewBox="0 0 960 540"></svg></div>
+  </div>
+  <div class="impl">PIL 实现：柔光 = 径向渐变贴图（预生成一次，随缩放缓存）；脉冲相位 = <code>frame_idx / fps</code> 的纯函数，多进程安全；光锥 = 相邻点求切向画扇形。</div>
+</div>
+
+<!-- ───────── 方案五 ───────── -->
+<div class="card">
+  <h2><span class="pill s1">方案五</span>起点 / 终点文字标签</h2>
+  <div class="desc">
+    裸圆点升级为<b>圆点 + 胶囊文字标签</b>（绿「起点」/ 红「终点」，黑底白字胶囊——
+    与关键节点标签同一语言）。结束帧观众也能立刻读懂画面。
+  </div>
+  <div class="duo">
+    <div class="tile"><span class="tag">现在</span><svg id="t5a" viewBox="0 0 960 540"></svg></div>
+    <div class="tile"><span class="tag">胶囊标签</span><svg id="t5b" viewBox="0 0 960 540"></svg></div>
+  </div>
+  <div class="impl">实现：复用关键节点胶囊标签绘制代码，仅两处调用 + 「显示起终点标签」开关。</div>
+</div>
+
+<!-- ───────── 方案六 ───────── -->
+<div class="card">
+  <h2><span class="pill s2">方案六</span>数据面板排版升级 <span style="font-size:12px;color:#ffc38e;font-weight:400">与海拔一览图统一风格</span></h2>
+  <div class="desc">
+    现状 7 行同字号平铺、数值溢出背景条。改为<b>深色玻璃卡片</b>（与海拔一览图同款圆角深色底）：
+    主数据「当前海拔」大字号置顶，其余数据 <b>2 列网格小字号</b>排布，顶部一条<b>细进度发丝线</b>显示完成度。
+    信息密度不变，层级清晰，占地面积反而更小。
+  </div>
+  <div class="duo">
+    <div class="tile" style="aspect-ratio:auto;height:300px"><span class="tag">新版面板（示意 · 真实数据）</span><svg id="t6a" viewBox="0 0 960 540" preserveAspectRatio="xMinYMid meet"></svg></div>
+  </div>
+  <div class="impl">实现：新增 <code>panel_style="card"</code> 分支；7 个数据项的 checkbox 开关逐套沿用，仅在卡片布局里重排。</div>
+</div>
+
+<!-- ───────── 组合演示 ───────── -->
+<div class="card playground">
+  <h2>组合演示 · 实时交互</h2>
+  <div class="desc" style="margin-top:4px">拖动进度条或点「播放」查看动态效果；勾选框自由组合各方案。</div>
+  <div class="stage"><svg id="stage" viewBox="0 0 960 540"></svg></div>
+  <div class="controls">
+    <button id="playBtn">▶ 播放</button>
+    <input type="range" id="prog" min="0" max="100" step="0.2" value="55">
+    <select id="theme">
+      <option value="classic">经典红紫</option>
+      <option value="orange" selected>山野橙</option>
+      <option value="cyan">荧光青</option>
+    </select>
+  </div>
+  <div class="controls">
+    <label><input type="checkbox" id="ckGlow" checked> 描边+柔光</label>
+    <label><input type="checkbox" id="ckGrad"> 海拔渐变</label>
+    <label><input type="checkbox" id="ckPulse" checked> 脉冲光点</label>
+    <label><input type="checkbox" id="ckSE" checked> 起终点标签</label>
+    <label><input type="checkbox" id="ckFlow"> 流动光点尾迹</label>
+    <label><input type="checkbox" id="ckPanel" checked> 新版数据面板</label>
+  </div>
+  <div class="note">
+    提示：<b>流动光点尾迹</b>是在已走轨迹末尾缀一串渐隐光点（彗星尾），增强运动感，实现为 ~12 个渐隐圆点，O(1) 每帧。
+    所有方案互相兼容，确认喜好后我再按选定组合实现到 <code>renderer.py</code> 与 GUI 预览。
+  </div>
+</div>
+
+<script>
+/* ════════ 真实轨迹数据（test.kml 投影到 960×540） ════════ */
+const TRAIL = {"w":960,"h":540,"path":[[620.5,80],[621.1,81.4],[621.5,83.5],[621.3,85.1],[620.5,86.4],[618.8,87.4],[616.6,89],[614.6,90.9],[614.3,92.5],[615.9,92.7],[616.6,93.5],[618.1,94.5],[618.5,95.9],[620.7,97.6],[622.4,97.4],[624.1,96.9],[624.6,97.8],[623.2,99],[621.9,100.2],[621.1,101.9],[620.4,103.4],[619.3,105.1],[617.9,106.1],[616.4,107],[613.6,107.8],[611.8,108],[610,109.7],[609.1,112.2],[608.5,114],[608.1,115.5],[607.7,117.3],[605.2,118.5],[603.7,119.6],[602.4,120.9],[600.8,121.9],[600,122.2],[600.2,122.4],[598.9,124.1],[597.6,125.5],[595.6,127],[594.5,128.4],[591.9,129.8],[590.3,130.7],[588.2,132.1],[586.2,132.9],[584.7,133.8],[582.3,134.7],[580.2,135.1],[578.5,135.6],[576.6,136],[574.9,137.5],[573.5,139.8],[572.3,141.9],[571.7,143.5],[571.4,145.2],[570.8,146.9],[570,148.4],[568.4,149.8],[566.8,150.6],[565.2,151.6],[563.9,153.1],[562.7,154.4],[561.8,155.9],[561,157.4],[559.4,159.5],[557.6,161.2],[556.2,162.3],[554.8,163.5],[553.3,165.8],[552.2,167.2],[551.3,168.7],[551.6,170.3],[551.5,172.2],[551.7,173.8],[550.4,176.2],[549,178],[547.2,178.3],[544.3,179.1],[543,180.5],[541.7,182],[540.5,184.6],[539.7,187.4],[539.3,190.3],[539.9,192.2],[540.2,194],[540.9,195.9],[541.5,198],[541.5,201.1],[538.7,202.1],[535.8,203.2],[534.3,204.5],[532.7,206.4],[531.6,207.8],[530.9,209.6],[531,211.3],[531.4,213],[532,214.7],[532.8,216.1],[532.7,217.7],[533.1,219.4],[534,220.8],[535.1,222.2],[535.2,223.8],[536.5,225.1],[537.6,226.6],[537.6,228.3],[537.5,229.9],[536.9,231.5],[535.8,232.9],[534.6,234.1],[532.8,234.7],[531.1,235.1],[529.3,236.1],[528.1,237.3],[525.5,238.7],[524.1,241.6],[522.8,242.8],[522.1,244.2],[521.2,245.5],[522,247],[521.5,247.6],[520,248.8],[518.2,250.9],[516.7,251.7],[514.3,253.8],[512.2,255.6],[510.8,257.5],[509.6,258.7],[507.7,258.4],[506,258.5],[504.2,258.9],[502.5,259.3],[500.8,259.2],[498.8,258.9],[497.1,258.9],[495.4,258.5],[493.6,258.9],[491.9,259.9],[490.2,260.9],[488.1,261.7],[486.4,262.5],[484.7,263.4],[483.3,264.6],[481.3,265.6],[479.6,266.4],[477.4,267.4],[475.8,268.1],[474.4,269.3],[473.1,270.4],[470.9,271.5],[468.9,272],[467.3,273],[465.6,273.7],[463.8,274.3],[462,275.2],[460.1,275.5],[456,274.6],[453.8,274],[451.8,273.5],[449.9,273.3],[447.9,272.9],[445.9,272.8],[444,272.6],[441.9,272.8],[439.7,273.4],[437.8,275.6],[436.8,277.2],[436.2,278.8],[435.4,280.2],[435.6,281.9],[435.4,283.5],[433.4,284.5],[432,285.7],[432.5,287.5],[433.8,288.7],[435.1,290.4],[436.8,291.9],[438.2,292.5],[437.9,292.4],[437.7,292.7],[439,295.9],[438,292.8],[437.8,293.3],[436,292.6],[434.2,291.9],[432.3,291.5],[430.5,291],[429.3,291.9],[428.8,293.5],[427.7,295],[426.1,296.1],[424.4,296.9],[423,298.2],[421.9,299.6],[420.4,300.9],[418.5,301.4],[416.7,302],[415,302.6],[413.1,302.8],[410.9,303],[410.2,303.2],[409.8,304.8],[410,306.4],[409.8,308.2],[408.7,309.6],[408,311.3],[407.1,312.7],[407,314.3],[406.7,315.8],[405.8,317.8],[404.2,318.5],[402.8,319.5],[401.7,320.6],[400.1,321.2],[398.4,321.6],[396.7,322.2],[394.9,322.5],[395,322.6],[394.2,324.1],[393,325.3],[391.9,326.7],[390.7,328.1],[389.9,329.7],[389.4,331.3],[389.3,333],[389.2,334.7],[388.1,336],[386.5,337],[384.9,338],[383.4,339.3],[382.1,340.6],[381.1,341.7],[379.9,343],[378.9,344.5],[378.2,346],[378,347.7],[377,348.9],[375.3,349.9],[374.2,351.4],[372.7,352.5],[371,353.4],[369.9,354.9],[368.8,356.2],[367,356.8],[365.1,357.2],[357.8,357.8],[362.3,359.1],[361,360.3],[359.6,360.6],[357.9,361.2],[356.3,362.6],[355.5,364.2],[354.7,365.5],[354.2,367.1],[352.4,367.1],[351.1,368.5],[349.3,368.7],[347.7,369.7],[346.4,370.8],[345.4,371.6],[344.6,372.8],[345,374.4],[345,376],[345.4,377.6],[345.1,379.3],[345.7,381.1],[344.2,382],[343.2,383.6],[342.6,385.1],[341.8,386.5],[341.4,387.9],[342,389.3],[341.3,389.6],[341.3,391],[341.1,392.8],[340.7,394.8],[340.4,394.9],[340.5,396.6],[340.3,398.1],[339.3,399.4],[338,400.8],[337.1,402.3],[336.6,403.7],[335.9,405],[335.2,406.7],[335.6,408.1],[335.2,409.8],[335.6,411.4],[336.5,412.7],[337.8,413.9],[339.2,414.8],[340.4,415.8],[339.9,415.5],[341.4,415.5],[343.7,415],[344.7,414.7],[345.2,413.7],[345.7,413.5],[346.5,412.5],[346.1,410.9],[348.4,410.6],[350.2,410.2],[351.8,411],[353.7,410.8],[355.2,411.3],[356.6,412.1],[358.2,411.6],[360.1,412.4],[361.8,412.2],[363.6,412],[365.5,411.7],[367.8,412.3],[370.9,413.9],[374.7,413.8],[376.3,414.4],[378.2,414.8],[380.1,415],[382.1,415.1],[384.2,414.9],[386.2,414.5],[388.1,414.1],[390.3,413.8],[392.1,413.1],[393.9,412.8],[395.4,413.7],[397.4,414.1],[398.4,415.5],[400.4,415.6],[402.3,415.1],[403.9,415.8],[405.6,416.3],[407.7,416],[409.6,416.2],[410.7,417.3],[411.6,418.6],[411.6,420.4],[410.6,421.9],[410.8,423.6],[410.2,425.2],[409.2,426.3],[408.5,427.8],[408.4,429.4],[408.8,431],[409.3,432.5],[409.6,434.2],[410.4,435.6],[410.5,437.1],[412,438.2],[413.2,439.5],[414.5,440.5],[416.3,441.2],[417.5,442.3],[418.4,443.1],[419.6,443.9],[421.4,444.7],[423.2,445],[425.1,445.4],[426.2,446.5],[425.4,448.1],[424.9,449.6],[424.3,451.1],[425.2,452],[427.1,452.1],[428.9,452.2],[430.8,451.6],[432.3,450.7],[433.8,449.3],[432.5,450.6],[431,451.6],[429.9,452.6],[430.6,454.1],[430,454.9],[428.3,455.5],[426.9,456.2],[426.6,457.8],[425.3,458.7],[423.4,458.7],[422.5,460],[423,458.5],[425,458.4],[426.3,458.2],[426.5,456.3],[426.9,454.7],[427.4,453],[428.4,451.9],[430.3,451.6],[432,450.7],[433.3,450.7],[434.4,452.2],[435.9,453.1],[437.8,453.1],[439.7,453.3],[441.4,453],[442.7,451.8],[443.8,450.5],[444.7,448.9],[445,448.1]]};
+/* 修正一处录入乱序点 */
+TRAIL.path = TRAIL.path.filter(p=>!(p[0]===357.8&&p[1]===357.8));
+const ELEV = [0,.016,.037,.058,.072,.08,.088,.1,.115,.134,.155,.179,.214,.247,.273,.292,.304,.316,.332,.347,.36,.37,.379,.388,.395,.399,.399,.394,.389,.388,.395,.407,.424,.439,.447,.45,.447,.44,.428,.417,.407,.402,.402,.401,.401,.404,.412,.428,.446,.456,.457,.451,.441,.429,.421,.418,.42,.425,.431,.433,.432,.426,.415,.408,.407,.413,.424,.433,.438,.438,.434,.428,.423,.424,.428,.433,.435,.432,.426,.414,.401,.393,.389,.392,.395,.39,.381,.368,.352,.34,.329,.319,.311,.306,.303,.306,.312,.319,.323,.324,.324,.325,.327,.329,.33,.332,.336,.341,.345,.349,.353,.357,.366,.379,.397,.416,.436,.453,.464,.472,.476,.476,.476,.479,.485,.498,.516,.537,.557,.572,.581,.588,.598,.614,.631,.647,.659,.67,.68,.685,.684,.675,.664,.653,.649,.648,.65,.651,.65,.649,.648,.65,.656,.666,.675,.683,.686,.686,.688,.692,.702,.717,.731,.743,.75,.755,.765,.777,.789,.799,.805,.808,.814,.821,.83,.842,.848,.853,.85,.843,.846,.849,.859,.864,.865,.86,.852,.845,.84,.84,.844,.849,.853,.856,.856,.855,.854,.852,.846,.837,.825,.81,.796,.784,.776,.778,.787,.803,.823,.844,.868,.889,.908,.93,.954,.977,.994,1,.996,.987,.974,.959,.948,.939,.928,.922,.917,.914,.915,.914,.909,.901,.89,.879,.872,.871,.869,.867,.859,.848,.838,.83,.826,.828,.831,.837,.846,.859,.872,.877,.876,.868,.867,.87,.876,.886,.898,.91,.922,.93,.931,.933,.936,.943,.949,.956,.961,.962,.963,.958,.946,.932,.919,.886,.861,.83,.796,.775,.751,.729,.711,.695,.682,.676,.672,.67,.664,.653,.643,.634,.629,.626,.622,.612,.596,.578,.56,.541,.524,.509,.491,.477,.462,.447,.432,.417,.404,.392,.382,.373,.361,.346,.331,.317,.308,.301,.295,.29,.287,.282,.276,.269,.26,.251,.243,.238,.237,.237,.238,.237,.236,.238,.242,.25,.26,.27,.277,.284,.291,.297,.304,.313,.327,.345,.362,.373,.381,.388,.392,.393,.383,.366,.344,.322,.303,.288,.28,.276,.274,.274,.274,.273,.272,.269,.266,.261,.259,.26,.266,.27,.272,.274,.275,.276,.278,.281,.284,.285,.285,.283,.28,.276,.273,.271,.269,.267,.266,.266,.268,.27,.271,.269,.266,.263,.262,.264,.265];
+const P = TRAIL.path, N = P.length;
+const START = P[0], END = P[N-1];
+const STATS = {dist:"9.95", gain:"597", elevMin:18, elevMax:348};
+
+/* ════════ 工具 ════════ */
+const FONT = `"Microsoft YaHei","PingFang SC",sans-serif`;
+function pathD(pts){ return 'M'+pts.map(p=>p[0].toFixed(1)+' '+p[1].toFixed(1)).join('L'); }
+const FULL_D = pathD(P);
+function subD(i0,i1){ return pathD(P.slice(i0,i1+1)); }
+/* 海拔色：低→高 青绿(160°)→黄绿→黄→橙→红(8°) */
+function elevColor(t, sat=88, lit=55){
+  const h = 160 - 152*Math.max(0,Math.min(1,t));
+  return `hsl(${h.toFixed(0)},${sat}%,${lit}%)`;
+}
+function grayMix(t){ /* 未走段灰化：低饱和 */ return elevColor(t, 22, 58); }
+function txt(x,y,s,size,fill,weight,anchor='middle',extra=''){
+  return `<text x="${x}" y="${y}" font-family='${FONT}' font-size="${size}" font-weight="${weight}" fill="${fill}" text-anchor="${anchor}" dominant-baseline="central" paint-order="stroke" stroke="rgba(0,0,0,.85)" stroke-width="${(size/8).toFixed(1)}" stroke-linejoin="round" ${extra}>${s}</text>`;
+}
+/* 渐变分段（i0..i1 左闭右开） */
+function gradSegs(i0,i1,w,desat,op){
+  let s='';
+  for(let i=i0;i<i1-1;i++){
+    const c = desat?grayMix(ELEV[i]):elevColor(ELEV[i]);
+    s+=`<path d="M${P[i][0].toFixed(1)} ${P[i][1].toFixed(1)}L${P[i+1][0].toFixed(1)} ${P[i+1][1].toFixed(1)}" stroke="${c}" stroke-width="${w}" stroke-opacity="${op}" fill="none" stroke-linecap="round"/>`;
+  }
+  return s;
+}
+function flatTrail(k, unvis, vis, wU, wV){
+  const i1=Math.max(2,Math.round(k*(N-1))+1);
+  return `<path d="${FULL_D}" stroke="${unvis}" stroke-width="${wU}" stroke-opacity=".8" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`+
+    (k>0.001?`<path d="${subD(0,i1-1)}" stroke="${vis}" stroke-width="${wV}" stroke-opacity=".92" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`:'');
+}
+function glowTrail(k, unvis, vis, wU, wV){
+  const i1=Math.max(2,Math.round(k*(N-1))+1);
+  let s=`<path d="${FULL_D}" stroke="rgba(8,10,16,.55)" stroke-width="${wU+7}" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+  s+=`<path d="${FULL_D}" stroke="${unvis}" stroke-width="${wU}" stroke-opacity=".85" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+  if(k>0.001){
+    const vd=subD(0,i1-1);
+    s+=`<path d="${vd}" stroke="${vis}" stroke-width="${wV*2.3}" stroke-opacity=".16" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+    s+=`<path d="${vd}" stroke="${vis}" stroke-width="${wV*1.55}" stroke-opacity=".28" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+    s+=`<path d="${vd}" stroke="${vis}" stroke-width="${wV}" stroke-opacity=".96" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+  }
+  return s;
+}
+function gradTrail(k, wU, wV, desatUnvis){
+  const i1=Math.max(2,Math.round(k*(N-1))+1);
+  let s=`<path d="${FULL_D}" stroke="rgba(8,10,16,.5)" stroke-width="${wU+7}" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+  s+=gradSegs(i1-1,N,wU,desatUnvis,.8);
+  if(k>0.001){
+    s+=`<path d="${subD(0,i1-1)}" stroke="#ffb060" stroke-width="${wV*2.1}" stroke-opacity=".13" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+    s+=gradSegs(0,i1,wV,false,.96);
+  }
+  return s;
+}
+/* 起终点：裸圆点 / 胶囊标签 */
+function seDots(){
+  return [START,END].map((pt,i)=>{
+    const c=i===0?'#64f078':'#f05050';
+    return `<circle cx="${pt[0]}" cy="${pt[1]}" r="11" fill="${c}" stroke="#fff" stroke-width="2.5" stroke-opacity=".9"/>`;
+  }).join('');
+}
+function seLabels(){
+  return [[START,'起点','#2fae4e'],[END,'终点','#e04848']].map(([pt,label,c])=>{
+    const lx=pt[0]+20, ly=pt[1]-24, w=label.length*17+22;
+    return `<circle cx="${pt[0]}" cy="${pt[1]}" r="10" fill="${c}" stroke="#fff" stroke-width="2.5"/>
+      <rect x="${lx-8}" y="${ly-13}" rx="13" width="${w}" height="26" fill="rgba(0,0,0,.55)"/>
+      <circle cx="${lx+1}" cy="${ly}" r="3.2" fill="${c}"/>
+      <text x="${lx+9}" y="${ly+1}" font-family='${FONT}' font-size="15.5" font-weight="700" fill="#fff" text-anchor="start" dominant-baseline="central" paint-order="stroke" stroke="rgba(0,0,0,.85)" stroke-width="1.9" stroke-linejoin="round">${label}</text>`;
+  }).join('');
+}
+/* 当前位置标记 */
+function markerOld(pt){
+  return [22,16,10].map((r,i)=>`<circle cx="${pt[0]}" cy="${pt[1]}" r="${r}" fill="rgba(255,80,80,${[.24,.47,.7][i]})"/>`).join('')+
+    `<circle cx="${pt[0]}" cy="${pt[1]}" r="6" fill="#fff"/><circle cx="${pt[0]}" cy="${pt[1]}" r="4" fill="#ff3c3c"/>`;
+}
+function markerNew(pt,dirDeg,uid,anim){
+  const ph=(Date.now()%1600)/1600;              /* JS 驱动脉冲相位，避免 innerHTML 重建重启 SMIL */
+  const pr=(9+17*ph).toFixed(1), po=(.8*(1-ph)).toFixed(2);
+  const cone=dirDeg==null?'':
+    `<path d="M0 0 L${(26*Math.cos((dirDeg-22)*Math.PI/180)).toFixed(1)} ${(26*Math.sin((dirDeg-22)*Math.PI/180)).toFixed(1)} A26 26 0 0 1 ${(26*Math.cos((dirDeg+22)*Math.PI/180)).toFixed(1)} ${(26*Math.sin((dirDeg+22)*Math.PI/180)).toFixed(1)} Z"
+       transform="translate(${pt[0]} ${pt[1]})" fill="url(#coneG${uid})" opacity=".55"/>`;
+  return `<defs>
+      <radialGradient id="mg${uid}"><stop offset="0%" stop-color="#fff" stop-opacity=".95"/><stop offset="35%" stop-color="#ffb84d" stop-opacity=".55"/><stop offset="100%" stop-color="#ff7a3c" stop-opacity="0"/></radialGradient>
+      <radialGradient id="coneG${uid}"><stop offset="0%" stop-color="#fff" stop-opacity=".5"/><stop offset="100%" stop-color="#fff" stop-opacity="0"/></radialGradient>
+    </defs>
+    ${cone}
+    <circle cx="${pt[0]}" cy="${pt[1]}" r="26" fill="url(#mg${uid})"/>
+    ${anim?`<circle cx="${pt[0]}" cy="${pt[1]}" r="${pr}" fill="none" stroke="#fff" stroke-width="2" stroke-opacity="${po}"/>`:''}
+    <circle cx="${pt[0]}" cy="${pt[1]}" r="7.5" fill="#fff" stroke="rgba(0,0,0,.35)" stroke-width="1.5"/>
+    <circle cx="${pt[0]}" cy="${pt[1]}" r="4" fill="#ff5f2e"/>`;
+}
+function dirAt(i){
+  const a=P[Math.max(0,i-2)], b=P[Math.min(N-1,i+2)];
+  return Math.atan2(b[1]-a[1], b[0]-a[0])*180/Math.PI;
+}
+/* 彗星尾迹 */
+function comet(head,k){
+  let s='';
+  for(let j=1;j<=12;j++){
+    const i=Math.max(0,Math.round(k*(N-1))-j*2);
+    const t=1-j/13;
+    s+=`<circle cx="${P[i][0]}" cy="${P[i][1]}" r="${(1+3*t).toFixed(1)}" fill="#fff" opacity="${(.5*t).toFixed(2)}"/>`;
+  }
+  return s;
+}
+
+/* ════════ 静态方案 tiles ════════ */
+const K=0.55, VI=Math.round(K*(N-1));
+const W=8.5, WV=9.5;
+document.getElementById('t1a').innerHTML = flatTrail(K,'#b464ff','#ff4646',W,WV)+seDots()+markerOld(P[VI]);
+document.getElementById('t1b').innerHTML = glowTrail(K,'#b464ff','#ff4646',W,WV)+seDots()+markerOld(P[VI]);
+document.getElementById('t2a').innerHTML = gradTrail(K,W,WV,false)+seDots()+markerOld(P[VI]);
+document.getElementById('t2b').innerHTML = gradTrail(K,W,WV,true)+seDots()+markerOld(P[VI]);
+document.getElementById('t3a').innerHTML = glowTrail(K,'#e8e0d0','#ff8c3b',W,WV)+seDots()+markerOld(P[VI]);
+document.getElementById('t3b').innerHTML = glowTrail(K,'#cfd8e3','#22d3ee',W,WV)+seDots()+markerOld(P[VI]);
+document.getElementById('t3c').innerHTML = glowTrail(K,'#3d4a5c','#22d3ee',W,WV)+seDots()+markerOld(P[VI]);
+document.getElementById('t4a').innerHTML = glowTrail(K,'#e8e0d0','#ff8c3b',W,WV)+markerOld(P[VI]);
+document.getElementById('t4b').innerHTML = glowTrail(K,'#e8e0d0','#ff8c3b',W,WV)+markerNew(P[VI],dirAt(VI),'s4',true);
+/* 方案四 tile 的脉冲动画（JS 相位驱动，定时重绘） */
+setInterval(()=>{
+  document.getElementById('t4b').innerHTML = glowTrail(K,'#e8e0d0','#ff8c3b',W,WV)+markerNew(P[VI],dirAt(VI),'s4',true);
+}, 50);
+document.getElementById('t5a').innerHTML = glowTrail(K,'#e8e0d0','#ff8c3b',W,WV)+seDots();
+document.getElementById('t5b').innerHTML = glowTrail(K,'#e8e0d0','#ff8c3b',W,WV)+seLabels();
+
+/* 方案六：新版数据面板 mock（真实数据） */
+(function(){
+  const rows=[['坡度','+2%','#ffab66'],['爬升','482.8 m','#50dc78'],['里程','5.71 km','#ffd25a'],
+              ['配速',`11'30"`,'#8cffdc'],['运动','3h27m','#78c8ff'],['总时','4h20m','#ff9850']];
+  let g=`<rect x="24" y="60" rx="16" width="316" height="212" fill="rgba(13,17,26,.62)" stroke="rgba(255,255,255,.16)"/>
+    <rect x="44" y="84" width="276" height="3.5" rx="1.75" fill="rgba(255,255,255,.18)"/>
+    <rect x="44" y="84" width="${(276*K).toFixed(0)}" height="3.5" rx="1.75" fill="#ffb347"/>
+    <text x="44" y="112" font-family='${FONT}' font-size="13" fill="#93a0b4">当前海拔</text>
+    <text x="44" y="152" font-family='${FONT}' font-size="42" font-weight="800" fill="#e6ccff" paint-order="stroke" stroke="rgba(0,0,0,.6)" stroke-width="3">348<tspan font-size="18" font-weight="600" fill="#b9a8d8"> m</tspan></text>
+    <text x="320" y="152" text-anchor="end" font-family='${FONT}' font-size="13" fill="#93a0b4">最高 348 m</text>`;
+  rows.forEach((r,i)=>{
+    const cx=44+(i%2)*142, cy=196+Math.floor(i/2)*26;
+    g+=`<text x="${cx}" y="${cy}" font-family='${FONT}' font-size="12.5" fill="#93a0b4">${r[0]}</text>
+        <text x="${cx+44}" y="${cy}" font-family='${FONT}' font-size="14.5" font-weight="700" fill="${r[2]}" paint-order="stroke" stroke="rgba(0,0,0,.55)" stroke-width="2">${r[1]}</text>`;
+  });
+  document.getElementById('t6a').innerHTML =
+    `<g transform="translate(320,120) scale(1.15)">${g}</g>`;
+})();
+
+/* ════════ 组合演示 playground ════════ */
+const THEMES={
+  classic:{unvis:'#b464ff', vis:'#ff4646'},
+  orange :{unvis:'#e8e0d0', vis:'#ff8c3b'},
+  cyan   :{unvis:'#cfd8e3', vis:'#22d3ee'},
+};
+const $=id=>document.getElementById(id);
+let playing=false, timer=null, dir=1, uidC=0;
+function panelSVG(k){
+  const elev=Math.round(18+(348-18)*ELEV[Math.round(k*(N-1))]);
+  const dist=(9.95*k).toFixed(2), asc=(597*k).toFixed(1);
+  const fmtT=min=>{const t=Math.round(min);return `${Math.floor(t/60)}h${String(t%60).padStart(2,'0')}m`;};
+  const rows=[['坡度','+2%','#ffab66'],['爬升',asc+' m','#50dc78'],['里程',dist+' km','#ffd25a'],
+              ['配速',`11'30"`,'#8cffdc'],['运动',fmtT(207*k),'#78c8ff'],['总时',fmtT(260*k),'#ff9850']];
+  let g=`<g transform="translate(0,8)">
+    <rect x="18" y="14" rx="15" width="272" height="196" fill="rgba(13,17,26,.62)" stroke="rgba(255,255,255,.15)"/>
+    <rect x="34" y="32" width="240" height="3" rx="1.5" fill="rgba(255,255,255,.18)"/>
+    <rect x="34" y="32" width="${(240*k).toFixed(0)}" height="3" rx="1.5" fill="#ffb347"/>
+    <text x="34" y="54" font-family='${FONT}' font-size="11.5" fill="#93a0b4">当前海拔</text>
+    <text x="34" y="86" font-family='${FONT}' font-size="36" font-weight="800" fill="#e6ccff" paint-order="stroke" stroke="rgba(0,0,0,.6)" stroke-width="2.5">${elev}<tspan font-size="15" font-weight="600" fill="#b9a8d8"> m</tspan></text>`;
+  rows.forEach((r,i)=>{
+    const cx=34+(i%2)*124, cy=124+Math.floor(i/2)*23;
+    g+=`<text x="${cx}" y="${cy}" font-family='${FONT}' font-size="11" fill="#93a0b4">${r[0]}</text>
+        <text x="${cx+38}" y="${cy}" font-family='${FONT}' font-size="12.5" font-weight="700" fill="${r[2]}" paint-order="stroke" stroke="rgba(0,0,0,.5)" stroke-width="1.8">${r[1]}</text>`;
+  });
+  return g+'</g>';
+}
+function renderStage(){
+  const k=+$('prog').value/100;
+  const i1=Math.max(1,Math.round(k*(N-1)));
+  const th=THEMES[$('theme').value];
+  let s='';
+  if($('ckGrad').checked){
+    s+=gradTrail(k,7.5,8.5,true);
+  }else if($('ckGlow').checked){
+    s+=glowTrail(k,th.unvis,th.vis,7.5,8.5);
+  }else{
+    s+=flatTrail(k,th.unvis,th.vis,7.5,8.5);
+  }
+  s+= $('ckSE').checked?seLabels():seDots();
+  if($('ckFlow').checked&&k>0.002) s+=comet(P[i1],k);
+  const pt=P[Math.min(N-1,i1)];
+  s+= $('ckPulse').checked?markerNew(pt,dirAt(i1),'st'+ (++uidC),playing):markerOld(pt);
+  if($('ckPanel').checked) s+=panelSVG(k);
+  $('stage').innerHTML=s;
+}
+function tick(){
+  let v=+$('prog').value;
+  v+=dir*0.35;
+  if(v>=100){v=100;dir=-1;}
+  if(v<=0){v=0;dir=1;}
+  $('prog').value=v;
+  renderStage();
+  timer=setTimeout(tick,33);
+}
+$('playBtn').onclick=()=>{
+  playing=!playing;
+  $('playBtn').textContent=playing?'⏸ 暂停':'▶ 播放';
+  $('playBtn').classList.toggle('on',playing);
+  if(playing) tick(); else { clearTimeout(timer); renderStage(); }
+};
+$('prog').oninput=renderStage;
+['ckGlow','ckGrad','ckPulse','ckSE','ckFlow','ckPanel'].forEach(id=>$(id).onchange=renderStage);
+$('theme').onchange=renderStage;
+renderStage();
+</script>
+</body>
+</html>
