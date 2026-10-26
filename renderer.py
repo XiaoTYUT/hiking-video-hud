@@ -382,25 +382,12 @@ GAUGE_CYAN = (60, 200, 220)
 GAUGE_GREEN = (50, 190, 110)
 GAUGE_ORANGE = (255, 170, 40)
 # 5 档色阶分界（%）：≤-25 冷端 / -25~-10 青 / -10~+10 绿 / +10~+25 橙 / ≥+25 暖端
-GAUGE_BAND_BOUNDS = (-25.0, -10.0, 10.0, 25.0)
+# （分界值已内联在 gauge_value_color 中，仅保留注释说明）
 
 
 def gauge_band_colors(cold, warm) -> List[tuple]:
     """5 档色阶颜色（冷端与暖端由用户配色，其余固定）。"""
     return [tuple(cold), GAUGE_CYAN, GAUGE_GREEN, GAUGE_ORANGE, tuple(warm)]
-
-
-def gauge_band_index(pct: float) -> int:
-    b0, b1, b2, b3 = GAUGE_BAND_BOUNDS
-    if pct <= b0:
-        return 0
-    if pct <= b1:
-        return 1
-    if pct < b2:
-        return 2
-    if pct < b3:
-        return 3
-    return 4
 
 
 def gauge_value_color(pct: float, cold, warm) -> tuple:
@@ -438,28 +425,96 @@ def _fit_font_size(measure, base_size: int, max_w: float) -> int:
     return max(8, int(base_size * max_w / w))
 
 
-def gauge_layout(size: float) -> dict:
-    """坡度仪布局（全部为 size 的比例值；渲染端与 GUI 预览共用同一套常量）。"""
-    bar_x0, bar_x1 = 0.36 * size, 0.58 * size
+GAUGE_LABEL_RATIO = 0.62   # 「坡度」标签字号 = 标签字号 × 该比例（渲染端与 GUI 共用）
+
+
+def gauge_gradient_stops(cold, warm) -> List[Tuple[float, tuple]]:
+    """横向渐变锚点（0=冷端左 → 1=暖端右），渲染端逐列取色与 GUI QLinearGradient
+    共用同一组锚点，保证两端渐变一致。"""
+    return [(0.0, tuple(cold)), (0.2917, GAUGE_CYAN), (0.4167, GAUGE_GREEN),
+            (0.5833, GAUGE_GREEN), (0.7083, GAUGE_ORANGE), (1.0, tuple(warm))]
+
+
+def gauge_footprint(style: str, size: float) -> Tuple[float, float]:
+    """坡度仪占位尺寸 (w, h)（渲染端与 GUI 预览共用同一规则）。"""
+    if style == "card":
+        return (1.2571 * size, 0.6286 * size)   # HUD 卡片：横宽竖矮
+    return (size, size)                          # 半圆弧仪表：正方形
+
+
+def gauge_arc_layout(size: float) -> dict:
+    """方案B 半圆弧仪表布局（全部为 size 的比例值；渲染端与 GUI 预览共用）。"""
     return {
-        "bar_x0": bar_x0,                       # 色阶条左边界
-        "bar_x1": bar_x1,                       # 色阶条右边界
-        "bar_top": 0.05 * size,                 # 色阶条上边界（+60%）
-        "bar_bot": 0.64 * size,                 # 色阶条下边界（-60%）
-        "tick_len": 0.045 * size,               # 主刻度线长度
-        "tick_label_right": 0.32 * size,        # 刻度文字右端 x
-        "mark_base": bar_x1 + 0.10 * size,      # 主滑标三角底边 x（顶点朝左指向色阶）
-        "mark_half": 0.045 * size,              # 主滑标三角半高
-        "text_cx": 0.5 * size,                  # 数值水平中心
-        "value_cy": 0.72 * size,                # 数值行中心 y（紧凑靠上）
-        "tick_font_ratio": 0.62,                # 刻度字号 = 标签字号 × 该比例
+        "cx": 0.5 * size,          # 圆心 x
+        "cy": 0.60 * size,         # 圆心 y
+        "R": 0.3357 * size,        # 弧半径
+        "W": 0.10 * size,          # 弧带厚度
+        "value_cy": 0.814 * size,  # 数值行中心 y
+        "label_cy": 0.93 * size,   # 「坡度」标签中心 y
+        "glow_r": 0.0714 * size,   # 弧端光点晕圈半径
+        "dot_r": 0.0371 * size,    # 弧端白色圆点半径
     }
 
 
-def gauge_y(pct: float, bar_top: float, bar_bot: float) -> float:
-    """坡度百分比 → 色阶条上的 y 坐标（+60% 在顶部，-60% 在底部）。"""
-    p = max(-SLOPE_LIMIT_PCT, min(SLOPE_LIMIT_PCT, float(pct)))
-    return bar_bot - (p + SLOPE_LIMIT_PCT) / (2 * SLOPE_LIMIT_PCT) * (bar_bot - bar_top)
+def gauge_card_layout(size: float) -> dict:
+    """方案D HUD 深色卡片布局（footprint = 1.2571s × 0.6286s，共用）。"""
+    return {
+        "w": 1.2571 * size,        # 卡片宽
+        "h": 0.6286 * size,        # 卡片高
+        "rx": 0.1286 * size,       # 圆角半径
+        "pad": 0.1286 * size,      # 内边距
+        "label_cy": 0.2357 * size, # 「坡度」标签中心 y
+        "value_cy": 0.25 * size,   # 数值行中心 y
+        "strip_cy": 0.4143 * size, # 渐变指示条中心 y
+        "strip_h": 0.05 * size,    # 渐变指示条厚度
+        "halo_r": 0.0443 * size,   # 游标深色晕圈半径
+        "dot_r": 0.03 * size,      # 游标白色圆点半径
+    }
+
+
+# ─────────────── 进度环（当前里程 / 全程里程）布局与配色（渲染端与 GUI 预览共用） ───────────────
+
+RING_PROGRESS_DEFAULT = (255, 200, 60)   # 进度弧默认暖黄（与海拔一览图进度同色）
+RING_TRACK = (255, 255, 255, 46)         # 轨道整圆：白 18%
+RING_CAPSULE_BG = (0, 0, 0, 115)         # 胶囊底：半透明黑（与关键节点标签一致）
+
+
+def ring_footprint(style: str, size: float) -> Tuple[float, float]:
+    """进度环占位尺寸 (w, h)（渲染端与 GUI 预览共用同一规则）。"""
+    if style == "capsule":
+        return (1.92 * size, 0.60 * size)   # 紧凑胶囊：横宽竖矮
+    return (size, size)                      # 经典满环：正方形
+
+
+def ring_circle_layout(size: float) -> dict:
+    """经典满环布局（全部为 size 的比例值；渲染端与 GUI 预览共用）。"""
+    return {
+        "cx": 0.5 * size,
+        "cy": 0.5 * size,
+        "R": 0.36 * size,          # 环半径
+        "W": 0.07 * size,          # 环带厚度
+        "num_size": 0.20 * size,   # 当前里程字号
+        "unit_ratio": 0.5,         # 「km」字号 = 当前里程字号 × 该比例
+        "total_size": 0.095 * size,  # 全程行字号
+        "num_dy": -0.06 * size,    # 当前里程中心相对圆心的偏移（上移）
+        "total_dy": 0.21 * size,   # 全程行中心相对圆心的下移
+    }
+
+
+def ring_capsule_layout(size: float) -> dict:
+    """紧凑胶囊布局（footprint = 1.92s × 0.60s，渲染端与 GUI 预览共用）。"""
+    w, h = 1.92 * size, 0.60 * size
+    return {
+        "w": w, "h": h,
+        "ring_cx": 0.18 * w,       # 小环圆心 x
+        "ring_cy": 0.5 * h,
+        "R": 0.32 * h,             # 小环半径
+        "W": 0.085 * h,            # 小环带厚度
+        "pct_size": 0.15 * h,      # 环心百分比字号
+        "num_size": 0.38 * h,      # 当前里程字号
+        "total_size": 0.19 * h,    # 「/ 23.4 km」字号
+        "num_x": 0.34 * w,         # 当前里程左缘 x
+    }
 
 
 # ─────────────── 海拔一览图配色 / 布局（渲染端与 GUI 预览共用，保证 WYSIWYG） ───────────────
@@ -683,17 +738,25 @@ class Renderer:
         self.panel_bg_color: Tuple[int, int, int] = (128, 128, 128)
         self.panel_bg_alpha_pct: float = 45.0    # 不透明度 0-100%（45 ≈ 115/255）
 
-        # 动态坡度仪：竖直色阶尺（5 档色阶 + 刻度 + 主滑标）随坡度实时变化（可单独拖动/调大小）
+        # 动态坡度仪：随坡度实时变化（可单独拖动/调大小；样式可在半圆弧/HUD卡片间切换）
         self.show_slope_gauge: bool = True
+        self.gauge_style: str = "arc"            # "arc" 半圆弧仪表 / "card" HUD 深色卡片
         self.slope_gauge_pos: Tuple[float, float] = (40.0, float(height) - 200.0)
-        self.slope_gauge_size: float = 140.0     # 示意区域边长（基准 px）
-        self.gauge_label_size: float = 20.0      # 刻度文字字号（px）
+        self.slope_gauge_size: float = 140.0     # 基准尺寸 px（arc=边长，card=基准单位）
+        self.gauge_label_size: float = 20.0      # 「坡度」标签字号（px）
         self.gauge_value_size: float = 24.0      # 坡度数值字号（px）
         self.gauge_edge_top_color: Tuple[int, int, int] = GAUGE_WARM_DEFAULT  # 色阶暖端（上坡）
         self.gauge_edge_bottom_color: Tuple[int, int, int] = GAUGE_COLD_DEFAULT  # 色阶冷端（下坡）
         self.gauge_fill_alpha_pct: float = 85.0  # 色阶条不透明度 0-100%
         self._gauge_series: List[float] = []     # 帧密度自适应平滑后的百分比序列（懒构建）
         self.preview_idx: float = -1.0           # GUI 画布预览索引（-1 = 末点），渲染时不参与
+
+        # 进度环：当前里程 / 全程里程（样式：circle 经典满环 / capsule 紧凑胶囊）
+        self.show_progress_ring: bool = True
+        self.progress_ring_style: str = "circle"
+        self.progress_ring_pos: Tuple[float, float] = (200.0, float(height) - 190.0)
+        self.progress_ring_size: float = 140.0   # 基准尺寸 px（满环=边长，胶囊=基准单位）
+        self.ring_progress_color: Tuple[int, int, int] = RING_PROGRESS_DEFAULT
 
         # 地图导航面板：以当前位置为中心的小地图，始终北朝上
         self.show_map = False                    # 是否显示
@@ -766,6 +829,8 @@ class Renderer:
         self.proj_margin = getattr(self, "proj_margin", 80)
         self.render_scale = getattr(self, "render_scale", 1)
         self._ss = getattr(self, "_ss", 1)
+        # 兼容旧快照：补齐坡度仪样式属性
+        self.gauge_style = getattr(self, "gauge_style", "arc")
         # 兼容旧快照：补齐海拔一览图属性
         self.show_elev_profile = getattr(self, "show_elev_profile", True)
         self.elev_profile_w = getattr(self, "elev_profile_w", 360.0)
@@ -774,6 +839,14 @@ class Renderer:
             self.elev_profile_pos = (float(self.width - 384),
                                      float(self.height - 214))
         self._elev_cache = None
+        # 兼容旧快照：补齐进度环属性
+        self.show_progress_ring = getattr(self, "show_progress_ring", True)
+        self.progress_ring_style = getattr(self, "progress_ring_style", "circle")
+        self.progress_ring_size = getattr(self, "progress_ring_size", 140.0)
+        self.ring_progress_color = getattr(self, "ring_progress_color",
+                                           RING_PROGRESS_DEFAULT)
+        if not hasattr(self, "progress_ring_pos"):
+            self.progress_ring_pos = (200.0, float(self.height) - 190.0)
         self._project = compute_projection(self.points, self.width, self.height,
                                            self.proj_margin)
         self.font_big = load_font(24)
@@ -910,7 +983,10 @@ class Renderer:
         self._draw_panel(d, ascent, dist_km, elapsed, elev, slope, pace)
 
         # 3b) 动态坡度仪（独立于数据面板，可单独拖动/调大小）
-        self._draw_slope_gauge(d, idx)
+        self._draw_slope_gauge(img, idx)
+
+        # 3c) 进度环（当前里程 / 全程里程，独立于数据面板）
+        self._draw_progress_ring(img, idx)
 
         # 4) 地图导航面板（以当前位置为中心，始终北朝上）
         if self.show_map:
@@ -1068,103 +1144,349 @@ class Renderer:
         p = float(getattr(self, "preview_idx", -1.0))
         return p if 0.0 <= p <= n - 1 else float(n - 1)
 
-    def _draw_slope_gauge(self, d: ImageDraw.ImageDraw, idx: int) -> None:
-        """动态坡度仪：竖直色阶尺（5 档色阶 + 刻度 + 主滑标）+ 百分比数值。
-
-        坡度以百分比表达（±60% 裁剪）；数值颜色在 5 档色之间连续线性插值，
-        与帧密度自适应平滑序列共同构成「由高到低 / 由低到高」的过渡细节。
-        布局与配色常量来自模块级 gauge_layout / gauge_* 函数，GUI 预览端同构复用。
-        独立于数据面板（panel_* 系列参数），有独立的 pos/size 与显示开关。
+    def _draw_slope_gauge(self, img: Image.Image, idx: int) -> None:
+        """动态坡度仪：在独立 RGBA 图层上绘制后整体 alpha 合成到帧（保证半透明
+        元素正确叠加）。样式二选一：
+        - "arc"  方案B 半圆弧仪表：暗色轨道 + 渐变刻度弧 + 当前进度弧 + 光点 + 数值
+        - "card" 方案D HUD 深色卡片：圆角卡片 + 大号数值 + 渐变指示条 + 白色游标
+        坡度以百分比表达（±60% 裁剪），数值颜色沿 5 档连续线性插值；
+        布局常量来自模块级 gauge_arc_layout / gauge_card_layout，GUI 预览端同构复用。
         """
         if not self.show_slope_gauge:
             return
         ss = int(getattr(self, "_ss", 1) or 1)
-        gx, gy = self.slope_gauge_pos[0] * ss, self.slope_gauge_pos[1] * ss
-        size = self.slope_gauge_size * ss
-
+        gx = int(round(self.slope_gauge_pos[0] * ss))
+        gy = int(round(self.slope_gauge_pos[1] * ss))
+        s = self.slope_gauge_size * ss
         pct = self.gauge_pct(idx)
-        L = gauge_layout(size)
+        a = max(0.0, min(100.0, self.gauge_fill_alpha_pct)) / 100.0
+
+        fw, fh = gauge_footprint(self.gauge_style, s)
+        layer = Image.new("RGBA", (max(2, int(round(fw))),
+                                   max(2, int(round(fh)))), (0, 0, 0, 0))
+        if self.gauge_style == "card":
+            self._paint_gauge_card(layer, s, pct, a, ss)
+        else:
+            self._paint_gauge_arc(layer, s, pct, a, ss)
+        if gx < 0 or gy < 0 or gx + layer.width > img.width \
+                or gy + layer.height > img.height:
+            img.paste(layer, (gx, gy), layer)     # 越界时退化为带掩膜 paste
+        else:
+            img.alpha_composite(layer, (gx, gy))
+
+    def _paint_gauge_arc(self, layer: Image.Image, s: float,
+                         pct: float, a: float, ss: int) -> None:
+        """方案B 半圆弧仪表（绘制到尺寸 s×s 图层，坐标原点=占位框左上角）。"""
+        ld = ImageDraw.Draw(layer)
+        L = gauge_arc_layout(s)
+        cx, cy, R, W = L["cx"], L["cy"], L["R"], L["W"]
         cold, warm = self.gauge_edge_bottom_color, self.gauge_edge_top_color
-        colors = gauge_band_colors(cold, warm)
+        bbox = [cx - R, cy - R, cx + R, cy + R]
+        w_i = max(1, int(round(W)))
+        stroke = max(1, int(round(getattr(self, "_ss", 1) or 1)))
 
-        bar_x0 = gx + L["bar_x0"]
-        bar_x1 = gx + L["bar_x1"]
-        bar_top = gy + L["bar_top"]
-        bar_bot = gy + L["bar_bot"]
-        lw = max(1, int(round(2 * ss)))
-        stroke = max(1, int(round(ss)))
+        # 1) 暗色轨道（左→顶→右半圆，圆头端点；透明度随 a）
+        ta = int(round(0.55 * a * 255))
+        tcol = (16, 22, 35, ta)
+        ld.arc(bbox, start=180, end=360, fill=tcol, width=w_i)
+        ld.ellipse([cx - R - W / 2, cy - W / 2, cx - R + W / 2, cy + W / 2],
+                   fill=tcol)
+        ld.ellipse([cx + R - W / 2, cy - W / 2, cx + R + W / 2, cy + W / 2],
+                   fill=tcol)
 
-        # 1) 色阶条：5 档分段填充（冷端→青→绿→橙→暖端，不透明度可调）
-        alpha = int(round(max(0.0, min(100.0, self.gauge_fill_alpha_pct)) * 255 / 100))
-        bounds = [(-SLOPE_LIMIT_PCT, -25.0), (-25.0, -10.0), (-10.0, 10.0),
-                  (10.0, 25.0), (25.0, SLOPE_LIMIT_PCT)]
-        for (lo, hi), c in zip(bounds, colors):
-            d.rectangle([bar_x0, gauge_y(hi, bar_top, bar_bot),
-                         bar_x1, gauge_y(lo, bar_top, bar_bot)],
-                        fill=(c[0], c[1], c[2], alpha))
+        # 2) 彩色刻度弧：48 段小弧拼成连续渐变（左=冷端 → 顶=绿 → 右=暖端）
+        ga = int(round(0.35 * a * 255))
+        seg = 180.0 / 48
+        ld.ellipse([cx - R - W / 2, cy - W / 2, cx - R + W / 2, cy + W / 2],
+                   fill=gauge_value_color(-60.0, cold, warm) + (ga,))
+        for i in range(48):
+            fa = 180 + i * seg
+            mid = math.radians(fa + seg / 2)
+            o = (1 + math.cos(mid)) / 2          # 0=左端 → 1=右端
+            col = gauge_value_color(o * 120 - 60, cold, warm)
+            ld.arc(bbox, start=fa, end=min(360.0, fa + seg + 0.6),
+                   fill=col + (ga,), width=w_i)
+        ld.ellipse([cx + R - W / 2, cy - W / 2, cx + R + W / 2, cy + W / 2],
+                   fill=gauge_value_color(60.0, cold, warm) + (ga,))
 
-        # 2) 刻度：主刻度带百分比文本 + 次刻度短线；0% 基线贯穿色阶条并加粗
-        tick_font = load_font(max(8, int(round(self.gauge_label_size
-                                               * L["tick_font_ratio"] * ss))))
-        tb = d.textbbox((0, 0), "-60%", font=tick_font)
-        tick_h = tb[3] - tb[1]
-        bar_h = bar_bot - bar_top
-        # 档距 15% 的像素间距足够时，才显示 ±10% 的文字（避免刻度文字互相重叠）
-        show_minor = (15.0 / (2 * SLOPE_LIMIT_PCT)) * bar_h >= 1.7 * tick_h
-        labeled = ({60.0, 25.0, 10.0, 0.0, -10.0, -25.0, -60.0} if show_minor
-                   else {60.0, 25.0, 0.0, -25.0, -60.0})
-        for v in (60.0, 40.0, 25.0, 10.0, 0.0, -10.0, -25.0, -40.0, -60.0):
-            y = gauge_y(v, bar_top, bar_bot)
-            zero = abs(v) < 1e-6
-            major = v in labeled
-            if zero:
-                d.line((bar_x0 - L["tick_len"] * 1.8, y, bar_x1, y),
-                       fill=(255, 255, 255, 240), width=lw)
-            else:
-                x0 = bar_x0 - L["tick_len"] * (1.0 if major else 0.55)
-                d.line((x0, y, bar_x0, y),
-                       fill=(255, 255, 255, 215 if major else 140),
-                       width=lw - 1 if major else max(1, lw - 2))
-            if major or zero:
-                txt = gauge_format_pct(v)
-                tw = d.textbbox((0, 0), txt, font=tick_font)[2]
-                d.text((gx + L["tick_label_right"] - tw,
-                        y - tick_h / 2 - tb[1]), txt,
-                       fill=(255, 255, 255, 255), font=tick_font,
-                       stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
-        d.rectangle([bar_x0, bar_top, bar_x1, bar_bot],
-                    outline=(255, 255, 255, 200), width=stroke)
-
-        # 3) 主滑标：贯穿色阶条的白色基准线 + 右侧实心三角（顶点朝左指向色阶，
-        #    颜色 = 当前档位的连续渐变色）
-        y_mark = gauge_y(pct, bar_top, bar_bot)
+        # 3) 当前进度弧：从顶部 0% 展开到当前坡度（圆头 + 弧端光点）
         vc = gauge_value_color(pct, cold, warm)
-        d.line((bar_x0, y_mark, bar_x1, y_mark), fill=(255, 255, 255, 230),
-               width=stroke)
-        mh = L["mark_half"]
-        base_x = gx + L["mark_base"]
-        d.polygon([(base_x, y_mark - mh), (base_x, y_mark + mh), (bar_x1, y_mark)],
-                  fill=(vc[0], vc[1], vc[2], 255))
-        # 白描边（polygon 的 width 参数依赖新版 Pillow，改用手绘三边更稳妥）
-        d.line((base_x, y_mark - mh, bar_x1, y_mark),
-               fill=(255, 255, 255, 255), width=stroke)
-        d.line((bar_x1, y_mark, base_x, y_mark + mh),
-               fill=(255, 255, 255, 255), width=stroke)
-        d.line((base_x, y_mark + mh, base_x, y_mark - mh),
-               fill=(255, 255, 255, 255), width=stroke)
+        if pct >= 0.75:
+            mdeg = 90 * (1 - pct / 60.0)         # 数学角（0=右端）
+            ld.arc(bbox, start=270, end=360 - mdeg, fill=vc + (255,), width=w_i)
+        elif pct <= -0.75:
+            mdeg = 90 * (1 + abs(pct) / 60.0)    # 数学角（90..180=左端）
+            ld.arc(bbox, start=360 - mdeg, end=270, fill=vc + (255,), width=w_i)
+        else:
+            mdeg = 90.0
+        tip = (cx + R * math.cos(math.radians(mdeg)),
+               cy - R * math.sin(math.radians(mdeg)))
+        # 顶部 0% 原点圆帽 + 弧端光点（晕圈 + 白点带深色描边）
+        ld.ellipse([cx - W / 2, cy - R - W / 2, cx + W / 2, cy - R + W / 2],
+                   fill=vc + (255,))
+        gr, dr = L["glow_r"], L["dot_r"]
+        ld.ellipse([tip[0] - gr, tip[1] - gr, tip[0] + gr, tip[1] + gr],
+                   fill=vc + (int(round(0.35 * 255)),))
+        ld.ellipse([tip[0] - dr, tip[1] - dr, tip[0] + dr, tip[1] + dr],
+                   fill=(255, 255, 255, 255), outline=(0, 0, 0, 110),
+                   width=stroke)
 
-        # 4) 数值（整数百分比，颜色连续渐变；超宽时等比收缩字号防越界）
+        # 4) 数值 + 「坡度」标签（居中；数值超宽时等比收缩字号防越界）
         value = gauge_format_pct(pct)
         vfs = _fit_font_size(
-            lambda fs: d.textbbox((0, 0), value, font=load_font(fs))[2],
-            int(round(self.gauge_value_size * ss)), 0.90 * size)
+            lambda fs: ld.textbbox((0, 0), value, font=load_font(fs))[2],
+            int(round(self.gauge_value_size * ss)), 0.84 * s)
         vf = load_font(vfs)
-        vb = d.textbbox((0, 0), value, font=vf)
+        vb = ld.textbbox((0, 0), value, font=vf)
         vw, vh = vb[2] - vb[0], vb[3] - vb[1]
-        cx = gx + L["text_cx"]
-        d.text((cx - vw / 2 - vb[0], gy + L["value_cy"] - vh / 2 - vb[1]),
-               value, fill=(vc[0], vc[1], vc[2], 255), font=vf,
-               stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+        ld.text((cx - vw / 2 - vb[0], L["value_cy"] - vh / 2 - vb[1]),
+                value, fill=vc + (255,), font=vf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+        lfs = max(8, int(round(self.gauge_label_size * GAUGE_LABEL_RATIO * ss)))
+        lf = load_font(lfs)
+        lb = ld.textbbox((0, 0), "坡度", font=lf)
+        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
+        ld.text((cx - lw / 2 - lb[0], L["label_cy"] - lh / 2 - lb[1]),
+                "坡度", fill=(230, 236, 244, 210), font=lf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+
+    def _paint_gauge_card(self, layer: Image.Image, s: float,
+                          pct: float, a: float, ss: int) -> None:
+        """方案D HUD 深色卡片（footprint = 1.2571s × 0.6286s，原点=左上角）。"""
+        ld = ImageDraw.Draw(layer)
+        L = gauge_card_layout(s)
+        w, h, pad, rx = L["w"], L["h"], L["pad"], L["rx"]
+        cold, warm = self.gauge_edge_bottom_color, self.gauge_edge_top_color
+        stroke = max(1, int(round(ss)))
+        vc = gauge_value_color(pct, cold, warm)
+
+        # 1) 卡片底：深色半透明圆角矩形 + 细白边
+        ld.rounded_rectangle([0, 0, w, h], radius=rx,
+                             fill=(13, 17, 26, int(round(0.62 * a * 255))),
+                             outline=(255, 255, 255, 46), width=stroke)
+
+        # 2) 渐变指示条：横向胶囊（左=冷端 → 中=绿 → 右=暖端），透明度随 a；
+        #    中段逐列渐变矩形 + 两端半圆端帽，直接绘制在图层上保证 alpha 正确
+        strip_h = L["strip_h"]
+        sy0 = L["strip_cy"] - strip_h / 2
+        sy1 = L["strip_cy"] + strip_h / 2
+        sx0, sx1 = pad, w - pad
+        cap_r = strip_h / 2
+        gx0, gx1 = sx0 + cap_r, sx1 - cap_r     # 渐变中段范围
+        ga = int(round(a * 255))
+        n = max(8, int(round(gx1 - gx0)))
+        for i in range(n):
+            x = gx0 + (gx1 - gx0) * i / n
+            o = (x - sx0) / max(1.0, sx1 - sx0)
+            c = gauge_value_color(o * 120 - 60, cold, warm)
+            ld.rectangle([x, sy0, x + (gx1 - gx0) / n + 0.6, sy1],
+                         fill=c + (ga,))
+        ld.pieslice([sx0, sy0, sx0 + 2 * cap_r, sy1], 90, 270,
+                    fill=gauge_value_color(-60.0, cold, warm) + (ga,))
+        ld.pieslice([sx1 - 2 * cap_r, sy0, sx1, sy1], 270, 90,
+                    fill=gauge_value_color(60.0, cold, warm) + (ga,))
+
+        # 3) 游标：深色晕圈 + 白色圆点（位置 = 当前坡度映射到条上）
+        mx = sx0 + (max(-SLOPE_LIMIT_PCT, min(SLOPE_LIMIT_PCT, pct)) + 60) \
+            / 120 * (sx1 - sx0)
+        my = L["strip_cy"]
+        hr, dr = L["halo_r"], L["dot_r"]
+        ld.ellipse([mx - hr, my - hr, mx + hr, my + hr], fill=(0, 0, 0, 115))
+        ld.ellipse([mx - dr, my - dr, mx + dr, my + dr],
+                   fill=(255, 255, 255, 255))
+
+        # 4) 文本：左侧灰色「坡度」标签 + 右对齐大号彩色数值
+        lfs = max(8, int(round(self.gauge_label_size * GAUGE_LABEL_RATIO * ss)))
+        lf = load_font(lfs)
+        lb = ld.textbbox((0, 0), "坡度", font=lf)
+        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
+        ld.text((pad - lb[0], L["label_cy"] - lh / 2 - lb[1]), "坡度",
+                fill=(169, 180, 196, 255), font=lf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 160))
+        value = gauge_format_pct(pct)
+        max_w = max(20.0, (w - 2 * pad) - lw - 8)
+        vfs = _fit_font_size(
+            lambda fs: ld.textbbox((0, 0), value, font=load_font(fs))[2],
+            int(round(self.gauge_value_size * ss)), max_w)
+        vf = load_font(vfs)
+        vb = ld.textbbox((0, 0), value, font=vf)
+        vw, vh = vb[2] - vb[0], vb[3] - vb[1]
+        ld.text((w - pad - vw - vb[0], L["value_cy"] - vh / 2 - vb[1]),
+                value, fill=vc + (255,), font=vf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+
+    # ── 进度环 ──
+
+    def _draw_progress_ring(self, img: Image.Image, idx: int) -> None:
+        """进度环：当前里程 / 全程里程。样式二选一：
+        - "circle"  经典满环：360° 圆环 + 中心大号当前里程 + 下方全程
+        - "capsule" 紧凑胶囊：深色胶囊底 + 左侧小环(含百分比) + 右侧里程数字
+        数据 = cum_dist（沿轨迹累计里程），布局常量见 ring_*_layout（GUI 预览共用）。
+        """
+        if not getattr(self, "show_progress_ring", False):
+            return
+        if not self.cum_dist:
+            return
+        ss = int(getattr(self, "_ss", 1) or 1)
+        gx = int(round(self.progress_ring_pos[0] * ss))
+        gy = int(round(self.progress_ring_pos[1] * ss))
+        s = self.progress_ring_size * ss
+        total_km = self.cum_dist[-1] / 1000.0
+        cur_km = self.cum_dist[idx] / 1000.0
+        frac = max(0.0, min(1.0, cur_km / total_km)) if total_km > 0 else 0.0
+
+        fw, fh = ring_footprint(self.progress_ring_style, s)
+        pad = max(2, int(round(0.06 * s)))   # 环带圆头端帽的外溢余量
+        layer = Image.new("RGBA", (int(round(fw)) + 2 * pad,
+                                   int(round(fh)) + 2 * pad), (0, 0, 0, 0))
+        if self.progress_ring_style == "capsule":
+            self._paint_ring_capsule(layer, s, cur_km, total_km, frac, pad, ss)
+        else:
+            self._paint_ring_circle(layer, s, cur_km, total_km, frac, pad, ss)
+        if gx < pad or gy < pad or gx - pad + layer.width > img.width \
+                or gy - pad + layer.height > img.height:
+            img.paste(layer, (gx - pad, gy - pad), layer)   # 越界退化为带掩膜 paste
+        else:
+            img.alpha_composite(layer, (gx - pad, gy - pad))
+
+    @staticmethod
+    def _ring_caps(ld, cx: float, cy: float, R: float,
+                   w_i: int, end_deg: float, color) -> None:
+        """进度弧圆头端帽：起点（顶部 12 点）与末端各补一个直径=线宽的圆。"""
+        r_cap = w_i / 2
+        for ang in (-90.0, end_deg):
+            px = cx + R * math.cos(math.radians(ang))
+            py = cy + R * math.sin(math.radians(ang))
+            ld.ellipse([px - r_cap, py - r_cap, px + r_cap, py + r_cap],
+                       fill=color)
+
+    def _paint_ring_circle(self, layer: Image.Image, s: float,
+                           cur_km: float, total_km: float, frac: float,
+                           pad: int, ss: int) -> None:
+        """经典满环（绘制到 size×size + 2*pad 图层，内容原点 = (pad, pad)）。"""
+        ld = ImageDraw.Draw(layer)
+        L = ring_circle_layout(s)
+        cx, cy, R, W = L["cx"] + pad, L["cy"] + pad, L["R"], L["W"]
+        w_i = max(1, int(round(W)))
+        stroke = max(1, int(round(ss)))
+        pc = tuple(self.ring_progress_color)
+        bbox = [cx - R, cy - R, cx + R, cy + R]
+
+        # 1) 轨道（整圆）+ 进度弧（顶部 12 点起顺时针，圆头端点）
+        ld.arc(bbox, start=0, end=360, fill=RING_TRACK, width=w_i)
+        if frac > 0:
+            end = -90.0 + 360.0 * frac
+            ld.arc(bbox, start=-90, end=end, fill=pc + (255,), width=w_i)
+            self._ring_caps(ld, cx, cy, R, w_i, end, pc + (255,))
+
+        # 2) 中心文字：当前里程（大号粗体白 + 小号 km），下方「全程 xx.x km」
+        num_txt = f"{cur_km:.1f}"
+        unit_txt = " km"
+        ir = R - W / 2     # 环内半径（文字可用范围）
+
+        def _group_w(fs: int) -> float:
+            nb = ld.textbbox((0, 0), num_txt, font=load_font(fs, bold=True))
+            ub = ld.textbbox((0, 0), unit_txt,
+                             font=load_font(max(8, int(fs * L["unit_ratio"])),
+                                            bold=True))
+            return (nb[2] - nb[0]) + (ub[2] - ub[0])
+
+        num_dy = L["num_dy"]
+        max_num_w = 2.0 * math.sqrt(max(ir * ir - num_dy * num_dy, 100.0))
+        nfs = _fit_font_size(_group_w, int(round(L["num_size"])), max_num_w)
+        nf = load_font(nfs, bold=True)
+        uf = load_font(max(8, int(round(nfs * L["unit_ratio"]))), bold=True)
+        nb = ld.textbbox((0, 0), num_txt, font=nf)
+        ub = ld.textbbox((0, 0), unit_txt, font=uf)
+        nw = (nb[2] - nb[0]) + (ub[2] - ub[0])
+        nh = nb[3] - nb[1]
+        x_num = cx - nw / 2 - nb[0]
+        y_num = cy + num_dy - nh / 2 - nb[1]
+        ld.text((x_num, y_num), num_txt, fill=(255, 255, 255, 255), font=nf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+        # 单位与数字底部对齐
+        ld.text((x_num + nb[2] - ub[0], y_num + nb[3] - ub[3]),
+                unit_txt, fill=(255, 255, 255, 230), font=uf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+
+        total_txt = f"全程 {total_km:.1f} km"
+        total_dy = L["total_dy"]
+        max_tw = 2.0 * math.sqrt(max(ir * ir - total_dy * total_dy, 100.0))
+        tfs = _fit_font_size(
+            lambda fs: ld.textbbox((0, 0), total_txt, font=load_font(fs))[2],
+            int(round(L["total_size"])), max_tw)
+        tf = load_font(tfs)
+        tb = ld.textbbox((0, 0), total_txt, font=tf)
+        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        ld.text((cx - tw / 2 - tb[0], cy + total_dy - th / 2 - tb[1]),
+                total_txt, fill=(255, 255, 255, 220), font=tf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+
+    def _paint_ring_capsule(self, layer: Image.Image, s: float,
+                            cur_km: float, total_km: float, frac: float,
+                            pad: int, ss: int) -> None:
+        """紧凑胶囊（footprint = 1.92s × 0.60s，内容原点 = (pad, pad)）。"""
+        ld = ImageDraw.Draw(layer)
+        L = ring_capsule_layout(s)
+        w, h = L["w"], L["h"]
+        stroke = max(1, int(round(ss)))
+        pc = tuple(self.ring_progress_color)
+
+        # 1) 胶囊底（半透明黑，与关键节点标签一致）
+        ld.rounded_rectangle([pad, pad, pad + w, pad + h],
+                             radius=h / 2, fill=RING_CAPSULE_BG)
+
+        # 2) 左侧小环：轨道 + 进度弧（圆头）+ 环心百分比
+        cx, cy = pad + L["ring_cx"], pad + L["ring_cy"]
+        R, W = L["R"], L["W"]
+        w_i = max(1, int(round(W)))
+        bbox = [cx - R, cy - R, cx + R, cy + R]
+        ld.arc(bbox, start=0, end=360, fill=RING_TRACK, width=w_i)
+        if frac > 0:
+            end = -90.0 + 360.0 * frac
+            ld.arc(bbox, start=-90, end=end, fill=pc + (255,), width=w_i)
+            self._ring_caps(ld, cx, cy, R, w_i, end, pc + (255,))
+        pct_txt = f"{int(round(frac * 100))}%"
+        ir = R - W / 2
+        pfs = _fit_font_size(
+            lambda fs: ld.textbbox((0, 0), pct_txt,
+                                   font=load_font(fs, bold=True))[2],
+            int(round(L["pct_size"])), 1.7 * ir)
+        pf = load_font(pfs, bold=True)
+        pb = ld.textbbox((0, 0), pct_txt, font=pf)
+        pw, ph = pb[2] - pb[0], pb[3] - pb[1]
+        ld.text((cx - pw / 2 - pb[0], cy - ph / 2 - pb[1]),
+                pct_txt, fill=pc + (255,), font=pf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+
+        # 3) 里程数字：当前大号粗体白 + 「/ 全程」小号灰白（底部对齐）；
+        #    超出胶囊右缘时整体等比收缩
+        num_txt = f"{cur_km:.1f}"
+        total_txt = f"/ {total_km:.1f} km"
+        gap = 0.03 * h
+
+        def _load_pair(k: float):
+            return (load_font(max(8, int(round(L["num_size"] * k))), bold=True),
+                    load_font(max(8, int(round(L["total_size"] * k)))))
+
+        nf, tf = _load_pair(1.0)
+        nx = pad + L["num_x"]
+        avail = (pad + w - 0.06 * w) - nx    # 右侧留 6% w 边距
+        nb = ld.textbbox((0, 0), num_txt, font=nf)
+        tb = ld.textbbox((0, 0), total_txt, font=tf)
+        combined = (nb[2] - nb[0]) + gap + (tb[2] - tb[0])
+        if 0 < avail < combined:
+            nf, tf = _load_pair(avail / combined)
+            nb = ld.textbbox((0, 0), num_txt, font=nf)
+            tb = ld.textbbox((0, 0), total_txt, font=tf)
+        nh = nb[3] - nb[1]
+        x_num = nx - nb[0]
+        y_num = pad + h / 2 - nh / 2 - nb[1]
+        ld.text((x_num, y_num), num_txt, fill=(255, 255, 255, 255), font=nf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+        ld.text((x_num + nb[2] + gap - tb[0], y_num + nb[3] - tb[3]),
+                total_txt, fill=(255, 255, 255, 200), font=tf,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
 
     # ── 海拔一览图 ──
 

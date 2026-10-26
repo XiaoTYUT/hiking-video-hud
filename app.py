@@ -15,7 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from PyQt5.QtCore import Qt, QPointF, QRectF, QThread, pyqtSignal, QStandardPaths, QTimer
 from PyQt5.QtGui import (QPen, QColor, QBrush, QPainterPath, QPainter, QFont,
-                         QFontMetrics, QPixmap, QPolygonF, QTransform)
+                         QFontMetrics, QPixmap, QPolygonF, QTransform,
+                         QLinearGradient)
 from PIL import Image, ImageDraw
 
 from PyQt5.QtWidgets import (
@@ -35,7 +36,8 @@ from renderer import (Renderer, format_duration, format_pace,
                       _fetch_tile, _wgs84_to_gcj02, _lonlat_to_webmerc_px,
                       _webmerc_px_to_lonlat,
                       GAUGE_COLD_DEFAULT, GAUGE_WARM_DEFAULT,
-                      gauge_layout, gauge_y, gauge_band_colors,
+                      gauge_footprint, gauge_arc_layout, gauge_card_layout,
+                      gauge_gradient_stops, GAUGE_LABEL_RATIO,
                       gauge_value_color, gauge_format_pct,
                       _fit_font_size, SLOPE_LIMIT_PCT)
 
@@ -56,6 +58,8 @@ _PROJECT_FIELDS = (
     "map_traj_ahead_m",
     "show_elev_profile", "elev_profile_pos",
     "elev_profile_w", "elev_profile_h",
+    "show_progress_ring", "progress_ring_style", "progress_ring_size",
+    "progress_ring_pos", "ring_progress_color",
 )
 
 
@@ -637,13 +641,16 @@ def _paint_outlined_text(painter, text, rect, color, font):
 
 
 class SlopeGaugeItem(QGraphicsRectItem):
-    """动态坡度仪的 GUI 预览：竖直色阶尺（5 档色阶 + 刻度 + 主滑标）+ 百分比数值。
-    可拖拽定位 + 滚轮调大小；布局与配色复用 renderer 模块级常量
-    （gauge_layout / gauge_y / gauge_*），与视频端 renderer._draw_slope_gauge WYSIWYG。"""
+    """动态坡度仪的 GUI 预览：样式二选一（renderer.gauge_style）。
+    - "arc"  方案B 半圆弧仪表：暗色轨道 + 渐变刻度弧 + 当前进度弧 + 光点 + 数值
+    - "card" 方案D HUD 深色卡片：圆角卡片 + 大号数值 + 渐变指示条 + 白色游标
+    可拖拽定位 + 滚轮调大小；布局复用 renderer 模块级 gauge_* 布局函数，
+    与视频端 renderer._draw_slope_gauge / _paint_gauge_* WYSIWYG。"""
 
     def __init__(self, renderer: Renderer):
-        size = renderer.slope_gauge_size
-        super().__init__(0, 0, size, size)
+        fw, fh = gauge_footprint(renderer.gauge_style,
+                                 renderer.slope_gauge_size)
+        super().__init__(0, 0, fw, fh)
         self.renderer = renderer
         self._hover = False
         self.setPos(renderer.slope_gauge_pos[0], renderer.slope_gauge_pos[1])
@@ -657,8 +664,9 @@ class SlopeGaugeItem(QGraphicsRectItem):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         size = max(60.0, min(600.0, self.renderer.slope_gauge_size * factor))
         self.renderer.slope_gauge_size = size
+        fw, fh = gauge_footprint(self.renderer.gauge_style, size)
         self.prepareGeometryChange()
-        self.setRect(0, 0, size, size)
+        self.setRect(0, 0, fw, fh)
         self.scene().update()
         _notify_main_dirty(self)
         _notify_main_scale(self, "gauge", size)
@@ -693,14 +701,19 @@ class SlopeGaugeItem(QGraphicsRectItem):
         super().hoverLeaveEvent(event)
 
     def paint(self, painter, option, widget=None):
-        # 透明底：竖直色阶尺 + 数值，布局与视频端同构
-        size = self.rect().width()
+        # 透明底：按样式自绘（与视频端同构）
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         r = self.renderer
         n = len(r.points)
         idx = r.preview_index() if n else 0.0
         pct = r.gauge_pct(idx) if n else 0.0
+        size = r.slope_gauge_size
+        a = max(0.0, min(100.0, r.gauge_fill_alpha_pct)) / 100.0
+        cold, warm = r.gauge_edge_bottom_color, r.gauge_edge_top_color
+        vc = gauge_value_color(pct, cold, warm)
+        vcol = QColor(vc[0], vc[1], vc[2])
+        value = gauge_format_pct(pct)
 
         # 选中/悬停时用虚线框标出命中区范围（不参与视频输出）
         if self.isSelected() or self._hover:
@@ -708,85 +721,143 @@ class SlopeGaugeItem(QGraphicsRectItem):
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.rect())
 
-        L = gauge_layout(size)
-        cold, warm = r.gauge_edge_bottom_color, r.gauge_edge_top_color
-        colors = gauge_band_colors(cold, warm)
-        bar_x0, bar_x1 = L["bar_x0"], L["bar_x1"]
-        bar_top, bar_bot = L["bar_top"], L["bar_bot"]
+        if r.gauge_style == "card":
+            self._paint_card(painter, size, pct, a, cold, warm, vcol, value)
+        else:
+            self._paint_arc(painter, size, pct, a, cold, warm, vcol, value)
 
-        # 1) 色阶条：5 档分段填充（冷端→青→绿→橙→暖端，不透明度与视频端一致）
-        alpha = int(round(max(0.0, min(100.0, r.gauge_fill_alpha_pct)) * 255 / 100))
-        bounds = [(-SLOPE_LIMIT_PCT, -25.0), (-25.0, -10.0), (-10.0, 10.0),
-                  (10.0, 25.0), (25.0, SLOPE_LIMIT_PCT)]
-        painter.setPen(Qt.NoPen)
-        for (lo, hi), c in zip(bounds, colors):
-            y_hi = gauge_y(hi, bar_top, bar_bot)
-            y_lo = gauge_y(lo, bar_top, bar_bot)
-            painter.setBrush(QColor(c[0], c[1], c[2], alpha))
-            painter.drawRect(QRectF(bar_x0, y_hi, bar_x1 - bar_x0, y_lo - y_hi))
+    def _paint_arc(self, painter, size, pct, a, cold, warm, vcol, value):
+        """方案B 半圆弧仪表（与 renderer._paint_gauge_arc 同构）。"""
+        L = gauge_arc_layout(size)
+        cx, cy, R, W = L["cx"], L["cy"], L["R"], L["W"]
+        rect = QRectF(cx - R, cy - R, 2 * R, 2 * R)
 
-        # 2) 刻度：主刻度带百分比文本 + 次刻度短线；0% 基线贯穿色阶条并加粗
-        tick_font = _ui_font(int(round(r.gauge_label_size
-                                       * L["tick_font_ratio"])))
-        fm_tick = QFontMetrics(tick_font)
-        tick_h = fm_tick.height()
-        show_minor = ((15.0 / (2 * SLOPE_LIMIT_PCT)) * (bar_bot - bar_top)
-                      >= 1.7 * tick_h)
-        labeled = ({60.0, 25.0, 10.0, 0.0, -10.0, -25.0, -60.0} if show_minor
-                   else {60.0, 25.0, 0.0, -25.0, -60.0})
-        for v in (60.0, 40.0, 25.0, 10.0, 0.0, -10.0, -25.0, -40.0, -60.0):
-            y = gauge_y(v, bar_top, bar_bot)
-            zero = abs(v) < 1e-6
-            major = v in labeled
-            if zero:
-                painter.setPen(QPen(QColor(255, 255, 255, 240), 2))
-                painter.drawLine(QPointF(bar_x0 - L["tick_len"] * 1.8, y),
-                                 QPointF(bar_x1, y))
-            else:
-                painter.setPen(QPen(QColor(255, 255, 255, 215 if major else 140),
-                                    2 if major else 1))
-                painter.drawLine(
-                    QPointF(bar_x0 - L["tick_len"] * (1.0 if major else 0.55), y),
-                    QPointF(bar_x0, y))
-            if major or zero:
-                txt = gauge_format_pct(v)
-                tw = fm_tick.horizontalAdvance(txt)
-                _paint_outlined_text(
-                    painter, txt,
-                    QRectF(L["tick_label_right"] - tw - 2, y - tick_h / 2,
-                           tw + 8, tick_h),
-                    QColor(255, 255, 255), tick_font)
-        painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
+        # 1) 暗色轨道（半圆，圆头端点；透明度随 a）
+        painter.setPen(QPen(QColor(16, 22, 35, int(round(0.55 * a * 255))),
+                            W, Qt.SolidLine, Qt.RoundCap))
         painter.setBrush(Qt.NoBrush)
-        painter.drawRect(QRectF(bar_x0, bar_top, bar_x1 - bar_x0,
-                                bar_bot - bar_top))
+        painter.drawArc(rect, 180 * 16, 180 * 16)
 
-        # 3) 主滑标：贯穿色阶条的白色基准线 + 右侧实心三角（颜色 = 当前档位连续渐变色）
-        y_mark = gauge_y(pct, bar_top, bar_bot)
-        vc = gauge_value_color(pct, cold, warm)
-        painter.setPen(QPen(QColor(255, 255, 255, 230), 1))
-        painter.drawLine(QPointF(bar_x0, y_mark), QPointF(bar_x1, y_mark))
-        mh = L["mark_half"]
-        painter.setPen(QPen(QColor(255, 255, 255, 255), 1))
-        painter.setBrush(QColor(vc[0], vc[1], vc[2], 255))
-        # 三角顶点朝左指向色阶（与视频端一致）
-        painter.drawPolygon(QPolygonF([QPointF(L["mark_base"], y_mark - mh),
-                                       QPointF(L["mark_base"], y_mark + mh),
-                                       QPointF(bar_x1, y_mark)]))
+        # 2) 彩色刻度弧：48 段小弧拼成连续渐变（左=冷端 → 顶=绿 → 右=暖端）
+        seg_pen = QPen()
+        seg_pen.setWidthF(W)
+        seg_pen.setCapStyle(Qt.FlatCap)
+        seg = 180.0 / 48
+        for i in range(48):
+            fa = 180 + i * seg
+            mid = math.radians(fa + seg / 2)
+            o = (1 + math.cos(mid)) / 2          # 0=左端 → 1=右端
+            c = gauge_value_color(o * 120 - 60, cold, warm)
+            seg_pen.setColor(QColor(c[0], c[1], c[2], int(round(0.35 * a * 255))))
+            painter.setPen(seg_pen)
+            # PIL 角 φ（顺时针，y 向下）→ Qt 角 = 360 − φ（逆时针）
+            painter.drawArc(rect, int(round((360 - fa - seg) * 16)) - 32,
+                            int(round(seg * 16)) + 64)
+        painter.setPen(Qt.NoPen)
+        for ex, o in ((cx - R, -60.0), (cx + R, 60.0)):
+            c = gauge_value_color(o, cold, warm)
+            painter.setBrush(QColor(c[0], c[1], c[2], int(round(0.35 * a * 255))))
+            painter.drawEllipse(QPointF(ex, cy), W / 2, W / 2)
 
-        # 4) 数值（整数百分比，颜色连续渐变；超宽时等比收缩字号防越界）
-        value = gauge_format_pct(pct)
+        # 3) 当前进度弧：从顶部 0% 展开到当前坡度（平头笔 + 手动圆帽，与 PIL 一致）
+        painter.setBrush(Qt.NoBrush)
+        pg = QPen(vcol, W, Qt.SolidLine, Qt.FlatCap)
+        painter.setPen(pg)
+        if pct >= 0.75:
+            mdeg = 90 * (1 - pct / 60.0)
+            painter.drawArc(rect, int(round(mdeg * 16)),
+                            int(round((90 - mdeg) * 16)))
+        elif pct <= -0.75:
+            mdeg = 90 * (1 + abs(pct) / 60.0)
+            painter.drawArc(rect, 90 * 16, int(round((mdeg - 90) * 16)))
+        else:
+            mdeg = 90.0
+        tip = QPointF(cx + R * math.cos(math.radians(mdeg)),
+                      cy - R * math.sin(math.radians(mdeg)))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(vcol)
+        painter.drawEllipse(QPointF(cx, cy - R), W / 2, W / 2)   # 顶部 0% 圆帽
+        painter.drawEllipse(tip, W / 2, W / 2)                   # 弧端圆帽
+        gr, dr = L["glow_r"], L["dot_r"]
+        painter.setBrush(QColor(vc[0], vc[1], vc[2], 90))
+        painter.drawEllipse(tip, gr, gr)
+        painter.setPen(QPen(QColor(0, 0, 0, 110), 1))
+        painter.setBrush(QColor(255, 255, 255))
+        painter.drawEllipse(tip, dr, dr)
+
+        # 4) 数值 + 「坡度」标签（居中）
         vfs = _fit_font_size(
             lambda fs: QFontMetrics(_ui_font(fs)).horizontalAdvance(value),
-            int(round(r.gauge_value_size)), 0.90 * size)
+            int(round(self.renderer.gauge_value_size)), 0.84 * size)
         vf = _ui_font(vfs)
         fm_v = QFontMetrics(vf)
         vw = fm_v.horizontalAdvance(value)
         _paint_outlined_text(
             painter, value,
-            QRectF(L["text_cx"] - vw / 2 - 4, L["value_cy"] - fm_v.height() / 2,
-                   vw + 8, fm_v.height()),
-            QColor(vc[0], vc[1], vc[2]), vf)
+            QRectF(cx - vw / 2 - 4, L["value_cy"] - fm_v.height() / 2,
+                   vw + 8, fm_v.height()), vcol, vf)
+        lf = _ui_font(int(round(self.renderer.gauge_label_size
+                                * GAUGE_LABEL_RATIO)))
+        fm_l = QFontMetrics(lf)
+        lw = fm_l.horizontalAdvance("坡度")
+        _paint_outlined_text(
+            painter, "坡度",
+            QRectF(cx - lw / 2 - 4, L["label_cy"] - fm_l.height() / 2,
+                   lw + 8, fm_l.height()), QColor(230, 236, 244, 210), lf)
+
+    def _paint_card(self, painter, size, pct, a, cold, warm, vcol, value):
+        """方案D HUD 深色卡片（与 renderer._paint_gauge_card 同构）。"""
+        L = gauge_card_layout(size)
+        w, h, pad, rx = L["w"], L["h"], L["pad"], L["rx"]
+
+        # 1) 卡片底：深色半透明圆角矩形 + 细白边
+        painter.setPen(QPen(QColor(255, 255, 255, 46), 1))
+        painter.setBrush(QColor(13, 17, 26, int(round(0.62 * a * 255))))
+        painter.drawRoundedRect(QRectF(0, 0, w, h), rx, rx)
+
+        # 2) 渐变指示条：横向胶囊（左=冷端 → 中=绿 → 右=暖端）
+        strip_h = L["strip_h"]
+        sy0 = L["strip_cy"] - strip_h / 2
+        sx0, sx1 = pad, w - pad
+        grad = QLinearGradient(sx0, 0, sx1, 0)
+        for off, c in gauge_gradient_stops(cold, warm):
+            grad.setColorAt(off, QColor(c[0], c[1], c[2],
+                                        int(round(a * 255))))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(grad)
+        painter.drawRoundedRect(QRectF(sx0, sy0, sx1 - sx0, strip_h),
+                                strip_h / 2, strip_h / 2)
+
+        # 3) 游标：深色晕圈 + 白色圆点
+        mx = sx0 + (max(-SLOPE_LIMIT_PCT, min(SLOPE_LIMIT_PCT, pct)) + 60) \
+            / 120 * (sx1 - sx0)
+        my = L["strip_cy"]
+        hr, dr = L["halo_r"], L["dot_r"]
+        painter.setBrush(QColor(0, 0, 0, 115))
+        painter.drawEllipse(QPointF(mx, my), hr, hr)
+        painter.setBrush(QColor(255, 255, 255))
+        painter.drawEllipse(QPointF(mx, my), dr, dr)
+
+        # 4) 文本：左侧灰色「坡度」标签 + 右对齐大号彩色数值
+        lf = _ui_font(int(round(self.renderer.gauge_label_size
+                                * GAUGE_LABEL_RATIO)))
+        fm_l = QFontMetrics(lf)
+        lw = fm_l.horizontalAdvance("坡度")
+        _paint_outlined_text(
+            painter, "坡度",
+            QRectF(pad - 4, L["label_cy"] - fm_l.height() / 2, lw + 8,
+                   fm_l.height()), QColor(169, 180, 196), lf)
+        max_w = max(20.0, (w - 2 * pad) - lw - 8)
+        vfs = _fit_font_size(
+            lambda fs: QFontMetrics(_ui_font(fs)).horizontalAdvance(value),
+            int(round(self.renderer.gauge_value_size)), max_w)
+        vf = _ui_font(vfs)
+        fm_v = QFontMetrics(vf)
+        vw = fm_v.horizontalAdvance(value)
+        _paint_outlined_text(
+            painter, value,
+            QRectF(w - pad - vw - 4, L["value_cy"] - fm_v.height() / 2,
+                   vw + 8, fm_v.height()), vcol, vf)
 
 
 # ─────────────────────── 海拔一览图 Item ───────────────────────
@@ -924,6 +995,140 @@ class ElevProfileItem(QGraphicsRectItem):
             painter.drawRoundedRect(self.rect(), 12, 12)
             painter.setPen(QColor(200, 200, 220, 180))
             painter.drawText(self.rect(), Qt.AlignCenter, "海拔一览")
+
+
+# ─────────────────────── 进度环 Item ───────────────────────
+
+class ProgressRingItem(QGraphicsRectItem):
+    """进度环的 GUI 预览：直接调用视频渲染端 _draw_progress_ring 生成位图，
+    与成片像素级一致（WYSIWYG）。可拖拽定位 + 滚轮调大小；
+    样式（经典满环 / 紧凑胶囊）切换时按 ring_footprint 重建命中区。"""
+
+    def __init__(self, renderer: Renderer):
+        fw, fh = ring_footprint(renderer.progress_ring_style,
+                                float(renderer.progress_ring_size))
+        super().__init__(0, 0, fw, fh)
+        self.renderer = renderer
+        self._hover = False
+        self.setPos(renderer.progress_ring_pos[0], renderer.progress_ring_pos[1])
+        self.setBrush(QBrush(Qt.NoBrush))
+        self.setPen(QPen(Qt.NoPen))
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setAcceptHoverEvents(True)
+        self._pix_item = QGraphicsPixmapItem(self)
+        self._pix_item.setAcceptedMouseButtons(Qt.NoButton)
+        self.refresh_preview()
+
+    def _preview_ss(self) -> int:
+        """预览倍率：按屏幕像素比放大渲染，屏幕显示尺寸不变、文字更清晰。"""
+        dpr = 1.0
+        sc = self.scene()
+        views = sc.views() if sc is not None else []
+        if views:
+            dpr = float(views[0].devicePixelRatioF())
+        return max(1, min(3, int(round(dpr))))
+
+    def refresh_preview(self):
+        """用视频同一套 _draw_progress_ring 渲染当前预览索引的一帧。"""
+        r = self.renderer
+        if r is None or self.scene() is None or len(r.points) < 2:
+            return
+        ss = self._preview_ss()
+        s = float(r.progress_ring_size) * ss
+        fw, fh = ring_footprint(r.progress_ring_style, s)
+        pad = max(2, int(round(0.06 * s)))     # 与渲染端一致的环帽余量
+        img = Image.new("RGBA", (int(round(fw)) + 2 * pad,
+                                 int(round(fh)) + 2 * pad), (0, 0, 0, 0))
+        saved_pos = r.progress_ring_pos
+        saved_ss = int(getattr(r, "_ss", 1) or 1)
+        r._ss = ss
+        r.progress_ring_pos = (pad / ss, pad / ss)   # 绘制内部 ×ss → 留 pad 边
+        try:
+            r._draw_progress_ring(img, int(round(r.preview_index())))
+        finally:
+            r.progress_ring_pos = saved_pos
+            r._ss = saved_ss
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        pix = QPixmap()
+        pix.loadFromData(buf.getvalue(), "PNG")
+        if pix.isNull():
+            return
+        pix.setDevicePixelRatio(float(ss))
+        self._pix_item.setPixmap(pix)
+        self._pix_item.setPos(-pad / ss, -pad / ss)   # 抵消环帽留白，内容对齐命中区
+        self.update()
+
+    def _relayout(self):
+        """样式/大小变化后按 renderer 重建命中区并重渲预览。"""
+        r = self.renderer
+        fw, fh = ring_footprint(r.progress_ring_style,
+                                float(r.progress_ring_size))
+        self.prepareGeometryChange()
+        self.setRect(0, 0, fw, fh)
+        self.refresh_preview()
+        if self.scene() is not None:
+            self.scene().update()
+
+    def sync_layout(self):
+        """按 renderer 的样式/尺寸/位置重建 item（恢复工程布局时调用）。"""
+        self.setPos(*self.renderer.progress_ring_pos)
+        self._relayout()
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        r = self.renderer
+        size = max(60.0, min(600.0, float(r.progress_ring_size) * factor))
+        r.progress_ring_size = size
+        self._relayout()
+        _notify_main_dirty(self)
+        _notify_main_scale(self, "ring", size)
+
+    def mousePressEvent(self, event):
+        self._raise_to_top()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self._sync()
+
+    def _raise_to_top(self):
+        if self.scene() is not None:
+            max_z = max((it.zValue() for it in self.scene().items()), default=0)
+            self.setZValue(max_z + 1)
+
+    def _sync(self):
+        pos = self.pos()
+        self.renderer.progress_ring_pos = (pos.x(), pos.y())
+        if self.scene() is not None:
+            self.scene().update()
+        _notify_main_dirty(self)
+
+    def hoverEnterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().hoverLeaveEvent(event)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        if self.isSelected() or self._hover:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(120, 200, 255, 160), 1, Qt.DashLine))
+            painter.drawRect(self.rect())
+            return
+        if self._pix_item.pixmap().isNull():
+            painter.setBrush(QBrush(QColor(0, 0, 0, 115)))
+            painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+            painter.drawRoundedRect(self.rect(), 12, 12)
+            painter.setPen(QColor(200, 200, 220, 180))
+            painter.drawText(self.rect(), Qt.AlignCenter, "进度环")
 
 
 # ─────────────────────── CanvasView ───────────────────────
@@ -2227,6 +2432,7 @@ class MainWindow(QMainWindow):
         self.map_item: MapPanelItem | None = None
         self.gauge_item: SlopeGaugeItem | None = None
         self.elev_item: ElevProfileItem | None = None
+        self.ring_item: ProgressRingItem | None = None
         self.worker: RenderWorker | None = None
 
         # 全局设置（仅窗口级状态：最近工程列表 / 视频输出目录 / 默认画布 / 上次工程路径）
@@ -2469,13 +2675,13 @@ class MainWindow(QMainWindow):
         bf.addRow("背景颜色", self.btn_panel_bg_color)
         self._page_panel.addWidget(bg)
 
-        # 动态坡度仪（竖直色阶尺：5 档色阶 + 刻度 + 主滑标，随坡度实时变化，可单独拖动/调大小）
+        # 动态坡度仪（样式二选一：半圆弧仪表 / HUD 深色卡片，随坡度实时变化）
         gg = QGroupBox("动态坡度仪")
         gf = QFormLayout(gg)
         self.chk_slope_gauge = QCheckBox("显示动态坡度仪")
         self.chk_slope_gauge.setChecked(bool(self.settings.get("show_slope_gauge", True)))
         self.chk_slope_gauge.setToolTip(
-            "竖直坡度色阶尺（滑标 + 百分比数值），独立于数据面板，可单独拖动位置")
+            "动态坡度仪（半圆弧仪表 / HUD 卡片），独立于数据面板，可单独拖动位置")
         self.chk_slope_gauge.toggled.connect(self._on_slope_gauge_toggled)
         gf.addRow(self.chk_slope_gauge)
         self.chk_gauge_preview = QCheckBox("画布预览播放（循环）")
@@ -2484,6 +2690,14 @@ class MainWindow(QMainWindow):
             "让坡度仪在画布上循环播放整段轨迹的坡度变化，便于查看过渡效果（不影响视频输出）")
         self.chk_gauge_preview.toggled.connect(self._on_gauge_preview_toggled)
         gf.addRow(self.chk_gauge_preview)
+        self.combo_gauge_style = QComboBox()
+        self.combo_gauge_style.addItem("半圆弧仪表（方案B）", "arc")
+        self.combo_gauge_style.addItem("HUD 深色卡片（方案D）", "card")
+        self.combo_gauge_style.setToolTip(
+            "坡度仪外观样式，切换后画布立即预览（半圆弧 = 正方形占位，HUD卡片 = 横宽占位）")
+        self.combo_gauge_style.currentIndexChanged.connect(
+            self._on_gauge_style_changed)
+        gf.addRow("仪表样式", self.combo_gauge_style)
         self.spin_gauge_size = QSpinBox()
         self.spin_gauge_size.setRange(60, 600)
         self.spin_gauge_size.setValue(_num(self.settings, "slope_gauge_size", 140))
@@ -2495,9 +2709,9 @@ class MainWindow(QMainWindow):
         self.spin_gauge_label_size.setRange(8, 60)
         self.spin_gauge_label_size.setValue(20)
         self.spin_gauge_label_size.setSuffix(" px")
-        self.spin_gauge_label_size.setToolTip("刻度文字的字号（基准 px）")
+        self.spin_gauge_label_size.setToolTip("「坡度」标签文字的字号（基准 px）")
         self.spin_gauge_label_size.valueChanged.connect(self._on_gauge_style_changed)
-        gf.addRow("刻度字号", self.spin_gauge_label_size)
+        gf.addRow("标签字号", self.spin_gauge_label_size)
         self.spin_gauge_value_size = QSpinBox()
         self.spin_gauge_value_size.setRange(8, 72)
         self.spin_gauge_value_size.setValue(24)
@@ -2509,9 +2723,10 @@ class MainWindow(QMainWindow):
         self.spin_gauge_alpha.setRange(0, 100)
         self.spin_gauge_alpha.setValue(85)
         self.spin_gauge_alpha.setSuffix(" %")
-        self.spin_gauge_alpha.setToolTip("色阶条不透明度：0 = 全透明，100 = 不透明")
+        self.spin_gauge_alpha.setToolTip(
+            "彩色刻度弧 / 渐变指示条 / 卡片底的不透明度：0 = 全透明，100 = 不透明")
         self.spin_gauge_alpha.valueChanged.connect(self._on_gauge_style_changed)
-        gf.addRow("色阶条不透明度", self.spin_gauge_alpha)
+        gf.addRow("彩色不透明度", self.spin_gauge_alpha)
         # 颜色配置：色阶冷端（下坡）/ 暖端（上坡）；数值颜色由 5 档色阶自动连续渐变
         self._gauge_colors = {
             "edge_top": QColor(*GAUGE_WARM_DEFAULT),
@@ -2553,6 +2768,42 @@ class MainWindow(QMainWindow):
         self.spin_elev_h.valueChanged.connect(self._on_elev_profile_style_changed)
         ef.addRow("面板高度", self.spin_elev_h)
         self._page_panel.addWidget(eg)
+
+        # 进度环（当前里程 / 全程里程；样式：经典满环 / 紧凑胶囊）
+        rg = QGroupBox("进度环")
+        rf = QFormLayout(rg)
+        self.chk_progress_ring = QCheckBox("显示进度环")
+        self.chk_progress_ring.setChecked(
+            bool(self.settings.get("show_progress_ring", True)))
+        self.chk_progress_ring.setToolTip(
+            "当前里程 / 全程里程的环形进度仪表，\n"
+            "可单独拖动位置、滚轮调整大小")
+        self.chk_progress_ring.toggled.connect(self._on_progress_ring_toggled)
+        rf.addRow(self.chk_progress_ring)
+        self.combo_ring_style = QComboBox()
+        self.combo_ring_style.addItem("经典满环", "circle")
+        self.combo_ring_style.addItem("紧凑胶囊", "capsule")
+        _sty = self.settings.get("progress_ring_style", "circle")
+        self.combo_ring_style.setCurrentIndex(1 if _sty == "capsule" else 0)
+        self.combo_ring_style.setToolTip("经典满环：圆环 + 中心里程数字；\n"
+                                         "紧凑胶囊：横向小环 + 里程，占位最小")
+        self.combo_ring_style.currentIndexChanged.connect(
+            self._on_ring_style_changed)
+        rf.addRow("样式", self.combo_ring_style)
+        self.spin_ring_size = QSpinBox()
+        self.spin_ring_size.setRange(60, 600)
+        self.spin_ring_size.setValue(_num(self.settings, "progress_ring_size", 140))
+        self.spin_ring_size.setSuffix(" px")
+        self.spin_ring_size.setToolTip("进度环的基准尺寸（也可在画布上滚轮调整）")
+        self.spin_ring_size.valueChanged.connect(self._on_ring_style_changed)
+        rf.addRow("仪表大小", self.spin_ring_size)
+        self._ring_color = QColor(*RING_PROGRESS_DEFAULT)
+        self.btn_ring_color = QPushButton("进度颜色…")
+        self.btn_ring_color.setToolTip("进度弧颜色（轨道固定为半透明白）")
+        self.btn_ring_color.clicked.connect(self._on_pick_ring_color)
+        rf.addRow("进度颜色", self.btn_ring_color)
+        self._refresh_ring_color_btn()
+        self._page_panel.addWidget(rg)
 
         # 轨迹（设置窗口「轨迹与标注」页）
         tg = QGroupBox("轨迹")
@@ -2895,7 +3146,8 @@ class MainWindow(QMainWindow):
         mapping = {"trajectory": ("spin_traj_scale", 100.0),
                    "panel": ("spin_panel_scale", 100.0),
                    "map": ("spin_map_scale", 100.0),
-                   "gauge": ("spin_gauge_size", 1.0)}
+                   "gauge": ("spin_gauge_size", 1.0),
+                   "ring": ("spin_ring_size", 1.0)}
         entry = mapping.get(kind)
         if entry is None:
             return
@@ -3125,11 +3377,57 @@ class MainWindow(QMainWindow):
         self.scene.update()
         self._mark_dirty()
 
-    def _on_gauge_style_changed(self, *_):
-        """坡度仪大小/字号/透明度变化 → 同步 renderer + 刷新 GUI。"""
+    def _on_progress_ring_toggled(self, on: bool):
+        """进度环开关：同步 renderer + 创建/移除 GUI 仪表。"""
+        if self.renderer is None:
+            return
+        self.renderer.show_progress_ring = on
+        if on and self.ring_item is None:
+            self.ring_item = ProgressRingItem(self.renderer)
+            self.scene.addItem(self.ring_item)
+            self.ring_item.refresh_preview()
+        elif not on and self.ring_item is not None:
+            self.scene.removeItem(self.ring_item)
+            self.ring_item = None
+        self.scene.update()
+        self._mark_dirty()
+
+    def _on_ring_style_changed(self, *_):
+        """进度环样式/大小/颜色变化 → 同步 renderer + 重建 GUI 预览。"""
         if self.renderer is None:
             return
         r = self.renderer
+        r.progress_ring_style = self.combo_ring_style.currentData() or "circle"
+        r.progress_ring_size = float(self.spin_ring_size.value())
+        c = self._ring_color
+        r.ring_progress_color = (c.red(), c.green(), c.blue())
+        if self.ring_item is not None:
+            self.ring_item._relayout()
+        self.scene.update()
+        self._mark_dirty()
+
+    def _on_pick_ring_color(self):
+        """进度环进度颜色按钮：调色板选择 → 写回 renderer。"""
+        c = QColorDialog.getColor(self._ring_color, self, "选择进度颜色")
+        if c.isValid():
+            self._ring_color = c
+            self._refresh_ring_color_btn()
+            self._on_ring_style_changed()
+
+    def _refresh_ring_color_btn(self):
+        """进度颜色按钮背景 = 当前色（按钮即色块预览）。"""
+        c = self._ring_color
+        txt = "#000" if (c.red() + c.green() + c.blue()) > 420 else "#fff"
+        self.btn_ring_color.setStyleSheet(
+            f"background-color: {c.name()}; color: {txt};"
+            "border: 1px solid #666; padding: 3px 8px;")
+
+    def _on_gauge_style_changed(self, *_):
+        """坡度仪样式/大小/字号/透明度变化 → 同步 renderer + 刷新 GUI。"""
+        if self.renderer is None:
+            return
+        r = self.renderer
+        r.gauge_style = self.combo_gauge_style.currentData() or "arc"
         r.slope_gauge_size = float(self.spin_gauge_size.value())
         r.gauge_label_size = float(self.spin_gauge_label_size.value())
         r.gauge_value_size = float(self.spin_gauge_value_size.value())
@@ -3140,8 +3438,9 @@ class MainWindow(QMainWindow):
             c = self._gauge_colors[key]
             setattr(r, attr, (c.red(), c.green(), c.blue()))
         if self.gauge_item is not None:
+            fw, fh = gauge_footprint(r.gauge_style, r.slope_gauge_size)
             self.gauge_item.prepareGeometryChange()
-            self.gauge_item.setRect(0, 0, r.slope_gauge_size, r.slope_gauge_size)
+            self.gauge_item.setRect(0, 0, fw, fh)
             self.gauge_item.update()
         self.scene.update()
         self._mark_dirty()
@@ -3163,10 +3462,12 @@ class MainWindow(QMainWindow):
                 self.gauge_item.update()
             if self.elev_item is not None:
                 self.elev_item.refresh_preview()
+            if self.ring_item is not None:
+                self.ring_item.refresh_preview()
             self.scene.update()
 
     def _on_preview_tick(self):
-        """预览推进一帧：索引循环前进（约 5s 走完整段），刷新坡度仪 / 海拔标记。"""
+        """预览推进一帧：索引循环前进（约 5s 走完整段），刷新坡度仪 / 进度环 / 海拔标记。"""
         if self.renderer is None:
             return
         n = len(self.renderer.points)
@@ -3180,6 +3481,8 @@ class MainWindow(QMainWindow):
             self.gauge_item.update()
         if self.elev_item is not None:
             self.elev_item.refresh_preview()
+        if self.ring_item is not None:
+            self.ring_item.refresh_preview()
 
     def _on_pick_gauge_color(self, key: str):
         """坡度仪颜色按钮：调色板选择 → 写回 renderer。"""
@@ -3560,6 +3863,11 @@ class MainWindow(QMainWindow):
         self.spin_gauge_alpha.blockSignals(True)
         self.spin_gauge_alpha.setValue(_num(s, "gauge_fill_alpha_pct", 85))
         self.spin_gauge_alpha.blockSignals(False)
+        # 仪表样式（arc 半圆弧 / card HUD卡片；旧工程无此键 → 默认半圆弧）
+        self.combo_gauge_style.blockSignals(True)
+        _gsi = self.combo_gauge_style.findData(str(s.get("gauge_style", "arc")))
+        self.combo_gauge_style.setCurrentIndex(_gsi if _gsi >= 0 else 0)
+        self.combo_gauge_style.blockSignals(False)
         # 色阶两端色（暖端/冷端）
         for _gk in ("edge_top", "edge_bottom"):
             _gv = s.get(f"gauge_{_gk}_color")
@@ -3676,9 +3984,10 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError, IndexError):
                 pass
         if self.gauge_item is not None:
-            gsz = float(self.renderer.slope_gauge_size)
+            gfw, gfh = gauge_footprint(self.renderer.gauge_style,
+                                       self.renderer.slope_gauge_size)
             self.gauge_item.prepareGeometryChange()
-            self.gauge_item.setRect(0, 0, gsz, gsz)
+            self.gauge_item.setRect(0, 0, gfw, gfh)
             self.gauge_item.setPos(*self.renderer.slope_gauge_pos)
             self.gauge_item._sync()
         # 海拔一览图位置/大小恢复
@@ -3848,6 +4157,8 @@ class MainWindow(QMainWindow):
         self.renderer.gauge_label_size = float(self.spin_gauge_label_size.value())
         self.renderer.gauge_value_size = float(self.spin_gauge_value_size.value())
         self.renderer.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
+        self.renderer.gauge_style = (self.combo_gauge_style.currentData()
+                                     or "arc")
         _gmap = {"edge_top": "gauge_edge_top_color",
                  "edge_bottom": "gauge_edge_bottom_color"}
         for _gk, _ga in _gmap.items():
@@ -4184,6 +4495,8 @@ class MainWindow(QMainWindow):
                                      if self.renderer else list(GAUGE_WARM_DEFAULT)),
             "gauge_edge_bottom_color": (list(self.renderer.gauge_edge_bottom_color)
                                         if self.renderer else list(GAUGE_COLD_DEFAULT)),
+            "gauge_style": (self.renderer.gauge_style
+                            if self.renderer else "arc"),
             "show_elev_profile": (self.renderer.show_elev_profile
                                   if self.renderer else True),
             "elev_profile_w": (self.renderer.elev_profile_w

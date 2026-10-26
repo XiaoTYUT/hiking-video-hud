@@ -213,17 +213,18 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 10. 基准测试必须先预热瓦片缓存（首次运行会被网络下载污染，401ms/帧 vs 真实 88ms/帧）
 11. PowerShell 不支持 `&&`，用 `;` 分隔
 
-## 10a. 动态坡度仪（2026-10-20 改版：竖直色阶尺 + 百分比）
+## 10a. 动态坡度仪（2026-10-26 改版：半圆弧仪表 / HUD 深色卡片 双样式）
 
-- 独立可拖动**竖直色阶尺**，与数据面板完全解耦。坡度以**百分比**表达（±60% 裁剪，滑标随坡度上下移动）。
-- 组成：① 色阶条（5 档：≤-25 冷端蓝 / -25~-10 青 / -10~+10 绿 / +10~+25 橙 / ≥+25 暖端红，段内填充，不透明度 `gauge_fill_alpha_pct`）；② 左侧百分比刻度（+60/+25/0/-25/-60，档距足够时自动补 ±10 文字，另加 ±40/±10 次刻度短线；0% 基线贯穿色阶条并加粗）；③ 主滑标（贯穿色阶条的白色基准线 + 右侧实心三角，颜色 = 当前值的连续渐变色）；④ 数值大字 `+23%`/`0%`。（状态词与趋势箭头已于 2026-10-20 按要求全部删除）
-- **过渡细节**（无状态依赖，纯 idx 函数）：帧密度自适应滑动平均序列（`half = max(4, ceil(1.5×step))`）+ 数值颜色在 5 档色之间**连续线性插值**。
-- **样式全可配**（Renderer 属性 → GUI「动态坡度仪」组 → .kmlproj 持久化）：`gauge_edge_top_color` 暖端（上坡）、`gauge_edge_bottom_color` 冷端（下坡）、`gauge_label_size` 刻度字号、`gauge_value_size` 数值字号（数值颜色由色阶自动渐变，不可配）、`gauge_fill_alpha_pct` 色阶条不透明度。旧工程的橙/白端色会自动迁移为暖红/冷蓝。
-- **排版**：布局与配色常量集中在 renderer 模块级 `gauge_layout(size)` / `gauge_y(pct,...)` / `gauge_band_colors` / `gauge_value_color` / `gauge_format_pct` / `_fit_font_size`，渲染端与 GUI 预览共用 → WYSIWYG。数值/刻度文字超宽时按宽度等比收缩字号，避免小尺寸越界。
-- Renderer：`show_slope_gauge`（默认 True）、`slope_gauge_pos`、`slope_gauge_size`（默认 140px，60-600）、`preview_idx`（GUI 预览索引，-1 = 末点）。方法 `_build_gauge_series(half)`、`prepare_gauge_smoothing(total_frames)`、`gauge_pct(idx)`（支持浮点插值）、`preview_index()`、`_draw_slope_gauge(d, idx)`。
-- app.py：`SlopeGaugeItem(QGraphicsRectItem)`：rect 作拖拽命中区，paint 完全自绘（色阶条 + 刻度 + 滑标 + 黑边描边文字），滚轮调大小，hover/selected 虚线框指示边界。控件组在「数据面板」页：显示开关 / **画布预览播放（循环，QTimer 60ms 推进 `renderer.preview_idx`，不影响视频输出）** / 仪表大小 / 刻度字号 / 数值字号 / 色阶条不透明度 / 暖端·冷端两色块；handlers `_on_slope_gauge_toggled` / `_on_gauge_style_changed` / `_on_gauge_preview_toggled` / `_on_preview_tick` / `_on_pick_gauge_color`。
+- 独立可拖动组件，与数据面板完全解耦。坡度以**百分比**表达（±60% 裁剪），数值颜色沿 5 档色（≤-25 冷端蓝 / -25~-10 青 / -10~+10 绿 / +10~+25 橙 / ≥+25 暖端红）**连续线性插值**。样式二选一（`renderer.gauge_style`：`"arc"` / `"card"`，GUI 下拉框随时切换，.kmlproj 持久化）：
+  - **方案B 半圆弧（arc）**：暗色轨道半圆（圆头）+ 48 段渐变刻度弧（左=冷端→顶=绿→右=暖端）+ 进度弧（pct>0 从顶向右 / pct<0 从顶向左）+ 顶部圆帽 + tip 光点（晕圈+白点黑描边）+ 居中数值大字 + 「坡度」标签。
+  - **方案D HUD 卡片（card）**：深色圆角卡片（白细边）+ 渐变指示条（逐列矩形+两端半圆端帽）+ 白色游标（黑晕）+ 左「坡度」标签 + 右对齐彩色数值。
+- **半透明正确叠加**：PIL ImageDraw 直接绘制会替换像素 → 统一在独立 RGBA 图层绘制后 `img.alpha_composite(layer, (gx,gy))`（越界退化为带掩膜 paste）。alpha 因子 `a = gauge_fill_alpha_pct/100`：arc 轨道 0.55a、刻度弧 0.35a；card 卡底 0.62a、指示条 a；进度弧/游标/文字恒不透明。
+- **排版**：布局常量集中在 renderer 模块级 `gauge_footprint(style,size)`（arc=正方形；card=1.2571×0.6286 倍）、`gauge_arc_layout(size)`、`gauge_card_layout(size)`、`gauge_gradient_stops(cold,warm)`（横向渐变锚点，PIL/Qt 共用）、`GAUGE_LABEL_RATIO`（标签字号比例）、`gauge_value_color` / `gauge_format_pct` / `_fit_font_size`，渲染端与 GUI 预览同构复用 → WYSIWYG。PIL arc 顺时针（0=3点钟）与 Qt drawArc（1/16 度逆时针）换算：**Qt角 = 360 − PILφ**。
+- **样式全可配**（Renderer 属性 → GUI「动态坡度仪」组 → .kmlproj 持久化）：`gauge_edge_top_color` 暖端（上坡）、`gauge_edge_bottom_color` 冷端（下坡）、`gauge_label_size` 标签字号、`gauge_value_size` 数值字号、`gauge_fill_alpha_pct` 彩色不透明度、`gauge_style` 样式。
+- Renderer：`show_slope_gauge`（默认 True）、`slope_gauge_pos`、`slope_gauge_size`（默认 140px）、`preview_idx`（GUI 预览索引，-1 = 末点）。方法 `_build_gauge_series(half)`、`prepare_gauge_smoothing(total_frames)`、`gauge_pct(idx)`（支持浮点插值）、`preview_index()`、`_draw_slope_gauge(img, idx)`（构建图层→分发 `_paint_gauge_arc` / `_paint_gauge_card`）。
+- app.py：`SlopeGaugeItem(QGraphicsRectItem)`：rect 用 `gauge_footprint` 设置（拖拽命中区），paint 分发 `_paint_arc` / `_paint_card`（Qt 同构绘制），滚轮调大小，hover/selected 虚线框。控件组在「数据面板」页：显示开关 / **画布预览播放（QTimer 60ms 推进 `renderer.preview_idx`）** / 样式下拉框（半圆弧仪表·方案B / HUD 深色卡片·方案D） / 仪表大小 / 标签字号 / 数值字号 / 彩色不透明度 / 暖端·冷端两色块。
 - **平滑方案**：渲染前按帧密度重建点数滑动平均序列，`half = max(4, ceil(1.5 × step))`。GUI 预览用默认 half=4。
-- 持久化：工程文件含 `show_slope_gauge`、`slope_gauge_size`、`slope_gauge_pos` 及 gauge_* 样式键；_load_kml 自动创建/移除；_apply_state_to_gui 恢复控件，_apply_state_dict 恢复位置大小。
+- 持久化：工程文件含 `show_slope_gauge`、`slope_gauge_size`、`slope_gauge_pos`、`gauge_style` 及 gauge_* 样式键；__setstate__ 对旧快照 `getattr(self,"gauge_style","arc")` 兜底。
 
 ## 16. 当前状态与待办（2026-10-19）
 
