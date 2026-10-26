@@ -431,7 +431,7 @@ def _fit_font_size(measure, base_size: int, max_w: float) -> int:
     return max(8, int(base_size * max_w / w))
 
 
-GAUGE_LABEL_RATIO = 0.62   # 「坡度」标签字号 = 标签字号 × 该比例（渲染端与 GUI 共用）
+GAUGE_LABEL_RATIO = 0.80   # 「坡度」标签字号 = 标签字号 × 该比例（渲染端与 GUI 共用）
 
 
 def gauge_gradient_stops(cold, warm) -> List[Tuple[float, tuple]]:
@@ -455,8 +455,8 @@ def gauge_arc_layout(size: float) -> dict:
         "cy": 0.60 * size,         # 圆心 y
         "R": 0.3357 * size,        # 弧半径
         "W": 0.10 * size,          # 弧带厚度
-        "value_cy": 0.814 * size,  # 数值行中心 y
-        "label_cy": 0.93 * size,   # 「坡度」标签中心 y
+        "value_cy": 0.750 * size,  # 数值行中心 y（半圆弧内部空白区，上宽下窄）
+        "label_cy": 0.876 * size,  # 「坡度」标签中心 y（数值下方，仍在弧内）
         "glow_r": 0.0714 * size,   # 弧端光点晕圈半径
         "dot_r": 0.0371 * size,    # 弧端白色圆点半径
     }
@@ -1244,11 +1244,11 @@ class Renderer:
                    fill=(255, 255, 255, 255), outline=(0, 0, 0, 110),
                    width=stroke)
 
-        # 4) 数值 + 「坡度」标签（居中；数值超宽时等比收缩字号防越界）
+        # 4) 数值 + 「坡度」标签（居中；数值超宽时等比收缩，限制在弧内空白宽度内）
         value = gauge_format_pct(pct)
         vfs = _fit_font_size(
             lambda fs: ld.textbbox((0, 0), value, font=load_font(fs))[2],
-            int(round(self.gauge_value_size * ss)), 0.84 * s)
+            int(round(self.gauge_value_size * ss)), 0.56 * s)
         vf = load_font(vfs)
         vb = ld.textbbox((0, 0), value, font=vf)
         vw, vh = vb[2] - vb[0], vb[3] - vb[1]

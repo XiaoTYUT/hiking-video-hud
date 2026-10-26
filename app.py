@@ -786,10 +786,10 @@ class SlopeGaugeItem(QGraphicsRectItem):
         painter.setBrush(QColor(255, 255, 255))
         painter.drawEllipse(tip, dr, dr)
 
-        # 4) 数值 + 「坡度」标签（居中）
+        # 4) 数值 + 「坡度」标签（居中，均在弧内空白区）
         vfs = _fit_font_size(
             lambda fs: QFontMetrics(_ui_font(fs)).horizontalAdvance(value),
-            int(round(self.renderer.gauge_value_size)), 0.84 * size)
+            int(round(self.renderer.gauge_value_size)), 0.56 * size)
         vf = _ui_font(vfs)
         fm_v = QFontMetrics(vf)
         vw = fm_v.horizontalAdvance(value)
