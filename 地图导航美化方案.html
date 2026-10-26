@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>地图导航面板 · 美化方案</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #12151c; color: #dde3ec;
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    padding: 32px 24px 64px; max-width: 1180px; margin: 0 auto;
+  }
+  h1 { font-size: 26px; margin-bottom: 8px; }
+  .sub { color: #93a0b4; font-size: 14px; line-height: 1.7; margin-bottom: 28px; }
+  .sub b { color: #cdd6e4; }
+  .card {
+    background: #1a1f2a; border: 1px solid #2a3242; border-radius: 14px;
+    padding: 20px 22px; margin-bottom: 22px;
+  }
+  .card h2 { font-size: 18px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill {
+    font-size: 11px; font-weight: 700; letter-spacing: .5px;
+    padding: 3px 11px; border-radius: 20px; flex: none;
+  }
+  .pill.a { background: #1f4a3d; color: #8ee6c3; }
+  .pill.b { background: #55361f; color: #ffc38e; }
+  .pill.c { background: #4a2f63; color: #d3b0ff; }
+  .pill.d { background: #274067; color: #9cc4ff; }
+  .pill.cur { background: #3a3f4a; color: #aab2bf; }
+  .tag2 { font-size: 12px; font-weight: 400; }
+  .desc { color: #98a4b8; font-size: 13.5px; line-height: 1.75; margin: 8px 0 16px; }
+  .desc b { color: #ccd5e2; }
+  .duo { display: flex; gap: 18px; flex-wrap: wrap; }
+  .shot { flex: 0 1 340px; }
+  .shot img {
+    width: 100%; border-radius: 10px; display: block;
+    background: #2a3140; box-shadow: 0 4px 18px #0007;
+  }
+  .shot .lbl { font-size: 12px; color: #8b96a8; margin-top: 6px; text-align: center; }
+  .diag { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .diag img { width: 330px; border-radius: 10px; box-shadow: 0 4px 18px #0008; }
+  .diag ul { margin: 2px 0 0 18px; color: #a8b3c4; font-size: 13.5px; line-height: 2.05; }
+  .diag ul b { color: #e6ecf5; }
+  .impl { color: #7d8a9e; font-size: 12.5px; margin-top: 12px; line-height: 1.8; }
+  .impl code { background: #10151d; padding: 1px 6px; border-radius: 5px; color: #9fc3ff; font-size: 12px; }
+  .rec { background: #1f2836; border: 1px solid #31435e; border-radius: 12px; padding: 16px 20px; }
+  .rec b { color: #ffd9a0; }
+</style>
+</head>
+<body>
+
+<h1>地图导航面板 · 美化方案</h1>
+<div class="sub">
+  以下实例全部用 <b>test.kml 真实位置（北高峰，z15）的高德真实瓦片</b>渲染，轨迹叠加与现有逻辑一致。
+  所有方案<b>互相正交、可自由组合</b>：底图样式（B/C/D）× 边框（A）× HUD 元素（E）× 罗盘（F）。
+</div>
+
+<!-- ───────── 现状诊断 ───────── -->
+<div class="card">
+  <h2><span class="pill cur">现状</span>当前地图面板诊断</h2>
+  <div class="diag">
+    <img src="assets/map_mock_now.png" alt="当前地图面板">
+    <ul>
+      <li><b>边框生硬</b>：方形是纯直角 + 2px 亮蓝细边（80,160,255），工程感重</li>
+      <li><b>底图单一</b>：只有高德 style=8 浅绿标准图，与户外视频画面色调不搭</li>
+      <li><b>指北针简陋</b>：一个小黑圆 + 一条白线 + N 字</li>
+      <li><b>缺比例尺</b>：观众无法感知地图的实际空间尺度</li>
+      <li><b>无阴影层次</b>：面板像「贴」在画面上，与深色玻璃风的海拔一览图不统一</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ───────── 方案 A ───────── -->
+<div class="card">
+  <h2><span class="pill a">方案 A</span>精致边框：圆角 + 白边 + 柔阴影
+    <span class="tag2" style="color:#8ee6c3">性价比最高，改动最小</span></h2>
+  <div class="desc">
+    方形改<b>圆角（半径 ~26px 可配）</b>，边缘改为 <b>4px 白色描边 + 1px 深色发丝线</b>，
+    面板下方加<b>高斯柔阴影</b>，立刻从「贴图」变成「悬浮卡片」；圆形同款处理。
+    与海拔一览图的深色圆角卡片语言统一。
+  </div>
+  <div class="duo">
+    <div class="shot"><img src="assets/map_mock_frame.png"><div class="lbl">圆角方形 + 白边 + 柔阴影</div></div>
+    <div class="shot"><img src="assets/map_mock_circle.png"><div class="lbl">圆形 + 白环 + 柔阴影</div></div>
+  </div>
+  <div class="impl">实现：瓦片合成后按圆角/圆形 alpha 遮罩裁剪（圆形已有遮罩管线），阴影 = 预生成模糊圆角矩形贴片（缓存复用），描边两条 <code>rounded_rectangle</code>。逐帧成本 ≈ 0（遮罩/阴影按尺寸缓存）。</div>
+</div>
+
+<!-- ───────── 方案 B ───────── -->
+<div class="card">
+  <h2><span class="pill b">方案 B</span>卫星影像底图
+    <span class="tag2" style="color:#ffc38e">山野场景最「实景」</span></h2>
+  <div class="desc">
+    底图换为<b>高德卫星影像</b>（webst style=6，已实测可用），山林纹理、山脊线直接可见，
+    徒步视频观感最接近实景导航。缺点：没有路名标注（高德的标注层是不透明的，无法叠加）——
+    适合「纯地形氛围」；需要地名时仍选标准图。
+  </div>
+  <div class="duo">
+    <div class="shot"><img src="assets/map_mock_satellite.png"><div class="lbl">卫星影像 + 圆角白边 + 新罗盘</div></div>
+  </div>
+  <div class="impl">实现：<code>GAODE_TILE_URL</code> 增加 <code>map_style</code> 维度（standard/satellite），瓦片缓存目录按样式分桶；GUI 加「底图样式」下拉。已验证 style=6 瓦片可直接下载（实测 200 image/jpeg）。</div>
+</div>
+
+<!-- ───────── 方案 C ───────── -->
+<div class="card">
+  <h2><span class="pill c">方案 C</span>暗夜底图（标准图实时滤镜）
+    <span class="tag2" style="color:#d3b0ff">与深色 UI 最统一</span></h2>
+  <div class="desc">
+    不换新瓦片源：对现有标准瓦片做<b>暗化 + 降饱和 + 冷色调</b>滤镜
+    （亮度 ×0.52、饱和 ×0.6、叠 15% 深蓝），地名标注仍然完整可读，
+    整张地图立刻融入深色 HUD 体系。零额外网络请求，滤镜结果随瓦片缓存。
+  </div>
+  <div class="duo">
+    <div class="shot"><img src="assets/map_mock_dark.png"><div class="lbl">暗夜底图 + 圆角白边 + 新罗盘</div></div>
+  </div>
+  <div class="impl">实现：<code>ImageEnhance.Brightness/Color</code> + 色调叠加，处理发生在瓦片合成后、轨迹叠加前，每帧一次 460² 图像运算（&lt;5ms），或缓存到合成层。</div>
+</div>
+
+<!-- ───────── 方案 D ───────── -->
+<div class="card">
+  <h2><span class="pill d">方案 D</span>HUD 三件套：新罗盘 + 比例尺 + 速度胶囊</h2>
+  <div class="desc">
+    <b>罗盘</b>：刻度环 + 红白双针（红针恒指真北，随「运动方向朝上」模式反向旋转），替代现在的黑圆白线；<br>
+    <b>比例尺</b>：左下角黑白分段线段，按当前纬度与 zoom 自动取 50/100/200/500m 整齐档位；<br>
+    <b>速度胶囊</b>：左上角半透明胶囊实时显示当前速度（配速换算 km/h），可开关。
+  </div>
+  <div class="duo">
+    <div class="shot"><img src="assets/map_mock_hud.png"><div class="lbl">新罗盘 + 200m 比例尺 + 速度胶囊（真实数据）</div></div>
+  </div>
+  <div class="impl">实现：罗盘/比例尺为纯 PIL 绘制；比例尺米/像素 = <code>156543.03·cos(lat)/2^z</code>；速度取自现有 <code>pace_s</code>。三个元素各自独立开关，持久化进 .kmlproj。</div>
+</div>
+
+<!-- ───────── 推荐组合 ───────── -->
+<div class="card rec">
+  <h2>推荐落地顺序</h2>
+  <div class="desc" style="margin-bottom:0">
+    ① <b>方案 A（边框）</b>必选 —— 投入最小、观感提升最大；② <b>方案 D（HUD）</b>按需勾选；
+    ③ 底图三选一做成 GUI 下拉：<b>标准 / 卫星 / 暗夜</b>（B、C 都做成可切换而非替换，现有标准图保持默认）。
+    所有新参数沿用 .kmlproj 持久化机制，GUI 预览实时生效。
+    确认后我按选定组合实现到 <code>renderer.py</code> 与 GUI。
+  </div>
+</div>
+
+</body>
+</html>
