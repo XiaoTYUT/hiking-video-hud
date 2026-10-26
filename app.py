@@ -2793,7 +2793,7 @@ class MainWindow(QMainWindow):
         # 各档文字字号倍率（100% = 随面板尺寸自动推导的基准字号）
         self._elev_scale_spins = {}
         for _key, _label, _tip in (
-                ("elev_title_scale", "标题字号", "「海拔一览」标题字号倍率"),
+                ("elev_title_scale", "海拔字号", "左上当前海拔数值的字号倍率"),
                 ("elev_stat_scale", "统计字号", "右上「最高 xxx m」字号倍率"),
                 ("elev_axis_scale", "刻度字号", "左侧海拔刻度与底部里程字号倍率"),
                 ("elev_value_scale", "气泡字号", "当前海拔气泡字号倍率")):

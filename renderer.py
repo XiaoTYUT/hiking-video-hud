@@ -794,7 +794,7 @@ class Renderer:
         self.elev_profile_w: float = 360.0
         self.elev_profile_h: float = 190.0
         # 各档文字字号倍率（1.0 = 跟随面板尺寸自动推导的基准值）
-        self.elev_title_scale: float = 1.0   # 标题「海拔一览」
+        self.elev_title_scale: float = 1.0   # 左上当前海拔数值
         self.elev_stat_scale: float = 1.0    # 右上「最高 xxx m」
         self.elev_axis_scale: float = 1.0    # 左侧海拔刻度 + 底部里程
         self.elev_value_scale: float = 1.0   # 当前海拔气泡
@@ -1525,7 +1525,6 @@ class Renderer:
                 len(self.points), round(float(self.elev_min), 3),
                 round(float(self.elev_max), 3),
                 round(float(self.cum_dist[-1]), 3) if self.cum_dist else 0.0,
-                round(float(getattr(self, "elev_title_scale", 1.0)), 3),
                 round(float(getattr(self, "elev_stat_scale", 1.0)), 3),
                 round(float(getattr(self, "elev_axis_scale", 1.0)), 3))
 
@@ -1586,16 +1585,10 @@ class Renderer:
         if len(pts) >= 2:
             ld.line(pts, fill=ELEV_LINE, width=max(1, int(round(L["line_w"]))))
 
-        # 标题 + 最高海拔（右上）
-        ts = getattr(self, "elev_title_scale", 1.0)
+        # 右上「最高海拔」统计（左上标题改为每帧绘制的当前海拔数值）
         sscl = getattr(self, "elev_stat_scale", 1.0)
-        title_font = load_font(
-            max(8, int(round(L["title_size"] * ts))), bold=True)
         stat_font = load_font(max(8, int(round(L["stat_size"] * sscl))))
         t_stroke = max(1, int(round(ss)))
-        ld.text((L["pad_x"], L["title_y"]), "海拔一览",
-                fill=(255, 255, 255, 245), font=title_font,
-                stroke_width=t_stroke, stroke_fill=(0, 0, 0, 160))
         stat = f"最高 {self.elev_max:.0f} m"
         sb = ld.textbbox((0, 0), stat, font=stat_font)
         ld.text((x1 - (sb[2] - sb[0]), L["title_y"] + 2 * L["k"]), stat,
@@ -1710,6 +1703,27 @@ class Renderer:
                              fill=(255, 205, 80, 238))
         ld.text((bx + padx, by + (bh - th) / 2 - tb[1]), txt, font=vfont,
                 fill=(30, 20, 8, 255))
+
+        # 4.5) 左上：当前海拔数值（替代原「海拔一览」标题，随视频实时变化）
+        etxt = f"{e_cur:.0f} m"
+        stat = f"最高 {self.elev_max:.0f} m"
+        sfont = load_font(max(8, int(round(
+            L["stat_size"] * getattr(self, "elev_stat_scale", 1.0)))))
+        sb = ld.textbbox((0, 0), stat, font=sfont)
+        # 可用宽度 = 到右上「最高」统计左侧留白，超宽时等比收缩防越界
+        max_tw = max(20.0, (x1 - (sb[2] - sb[0]) - 10 * L["k"]) - L["pad_x"])
+        efs = _fit_font_size(
+            lambda fs: ld.textbbox((0, 0), etxt,
+                                   font=load_font(fs, bold=True))[2],
+            int(round(L["title_size"] * getattr(self, "elev_title_scale", 1.0))),
+            max_tw)
+        # 高度上限：限制在标题带内，避免压到绘图区顶部刻度
+        efs = min(efs, max(8, int(round(y0 - L["title_y"] - 4 * L["k"]))))
+        efont = load_font(efs, bold=True)
+        eb = ld.textbbox((0, 0), etxt, font=efont)
+        ld.text((L["pad_x"] - eb[0], L["title_y"] - eb[1]), etxt,
+                fill=ELEV_PROGRESS, font=efont,
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 200))
 
         # 5) 叠到输出画布（裁剪到画布内，允许面板拖出边界一部分）
         px = int(round(self.elev_profile_pos[0] * ss))
