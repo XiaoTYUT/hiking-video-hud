@@ -780,7 +780,7 @@ class SlopeGaugeItem(QGraphicsRectItem):
         painter.drawEllipse(QPointF(cx, cy - R), W / 2, W / 2)   # 顶部 0% 圆帽
         painter.drawEllipse(tip, W / 2, W / 2)                   # 弧端圆帽
         gr, dr = L["glow_r"], L["dot_r"]
-        painter.setBrush(QColor(vc[0], vc[1], vc[2], 90))
+        painter.setBrush(QColor(vcol.red(), vcol.green(), vcol.blue(), 90))
         painter.drawEllipse(tip, gr, gr)
         painter.setPen(QPen(QColor(0, 0, 0, 110), 1))
         painter.setBrush(QColor(255, 255, 255))
