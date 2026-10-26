@@ -39,7 +39,8 @@ from renderer import (Renderer, format_duration, format_pace,
                       gauge_footprint, gauge_arc_layout, gauge_card_layout,
                       gauge_gradient_stops, GAUGE_LABEL_RATIO,
                       gauge_value_color, gauge_format_pct,
-                      _fit_font_size, SLOPE_LIMIT_PCT)
+                      _fit_font_size, SLOPE_LIMIT_PCT,
+                      ring_footprint, RING_PROGRESS_DEFAULT)
 
 # ─────────────────────── 工程文件 & 全局设置 持久化 ───────────────────────
 # 全局 settings.json 存放在系统用户配置目录（Windows: %APPDATA%\KmlPath），
@@ -3900,6 +3901,35 @@ class MainWindow(QMainWindow):
             self.renderer.show_elev_profile = self.chk_elev_profile.isChecked()
             self.renderer.elev_profile_w = float(self.spin_elev_w.value())
             self.renderer.elev_profile_h = float(self.spin_elev_h.value())
+        # 进度环控件
+        self.chk_progress_ring.blockSignals(True)
+        self.chk_progress_ring.setChecked(
+            bool(s.get("show_progress_ring", True)))
+        self.chk_progress_ring.blockSignals(False)
+        self.combo_ring_style.blockSignals(True)
+        self.combo_ring_style.setCurrentIndex(
+            1 if s.get("progress_ring_style", "circle") == "capsule" else 0)
+        self.combo_ring_style.blockSignals(False)
+        self.spin_ring_size.blockSignals(True)
+        self.spin_ring_size.setValue(_num(s, "progress_ring_size", 140))
+        self.spin_ring_size.blockSignals(False)
+        _rc = s.get("ring_progress_color")
+        if _rc and len(_rc) >= 3:
+            try:
+                self._ring_color = QColor(int(_rc[0]), int(_rc[1]), int(_rc[2]))
+            except (TypeError, ValueError, IndexError):
+                self._ring_color = QColor(*RING_PROGRESS_DEFAULT)
+        else:
+            self._ring_color = QColor(*RING_PROGRESS_DEFAULT)
+        self._refresh_ring_color_btn()
+        if self.renderer is not None:
+            self.renderer.show_progress_ring = self.chk_progress_ring.isChecked()
+            self.renderer.progress_ring_style = \
+                self.combo_ring_style.currentData() or "circle"
+            self.renderer.progress_ring_size = float(self.spin_ring_size.value())
+            self.renderer.ring_progress_color = (
+                self._ring_color.red(), self._ring_color.green(),
+                self._ring_color.blue())
         # 关键节点（无文本框，仅写回 renderer）
         nodes = s.get("key_nodes")
         if nodes is not None and self.renderer is not None:
@@ -3999,6 +4029,15 @@ class MainWindow(QMainWindow):
                 pass
         if self.elev_item is not None:
             self.elev_item.sync_layout()
+        # 进度环位置/大小恢复
+        rp = s.get("progress_ring_pos")
+        if rp:
+            try:
+                self.renderer.progress_ring_pos = (float(rp[0]), float(rp[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        if self.ring_item is not None:
+            self.ring_item.sync_layout()
         nodes = s.get("key_nodes") or []
         if nodes:
             try:
@@ -4168,6 +4207,14 @@ class MainWindow(QMainWindow):
         self.renderer.show_elev_profile = self.chk_elev_profile.isChecked()
         self.renderer.elev_profile_w = float(self.spin_elev_w.value())
         self.renderer.elev_profile_h = float(self.spin_elev_h.value())
+        # 进度环设置（从 GUI 控件同步）
+        self.renderer.show_progress_ring = self.chk_progress_ring.isChecked()
+        self.renderer.progress_ring_style = \
+            self.combo_ring_style.currentData() or "circle"
+        self.renderer.progress_ring_size = float(self.spin_ring_size.value())
+        _rc = self._ring_color
+        self.renderer.ring_progress_color = (_rc.red(), _rc.green(),
+                                             _rc.blue())
         self.renderer.preview_idx = -1.0
         # 分段生成模式（从 GUI 单选按钮同步）
         self.renderer.use_segments = self.rb_segments.isChecked()
@@ -4212,6 +4259,13 @@ class MainWindow(QMainWindow):
             self.elev_item = ElevProfileItem(self.renderer)
             self.scene.addItem(self.elev_item)
             self.elev_item.refresh_preview()
+
+        # 进度环（仅当用户勾选时显示）
+        self.ring_item = None
+        if self.renderer.show_progress_ring:
+            self.ring_item = ProgressRingItem(self.renderer)
+            self.scene.addItem(self.ring_item)
+            self.ring_item.refresh_preview()
 
         # 新建 item 的缩放值与设置项对齐（工程恢复时随后由 _apply_state_dict 覆盖）
         self._on_preview_scaled("trajectory", self.trajectory_item.scale())
@@ -4505,6 +4559,17 @@ class MainWindow(QMainWindow):
                                if self.renderer else 190.0),
             "elev_profile_pos": (list(self.renderer.elev_profile_pos)
                                  if self.renderer else [1536.0, 866.0]),
+            "show_progress_ring": (self.renderer.show_progress_ring
+                                   if self.renderer else False),
+            "progress_ring_style": (self.renderer.progress_ring_style
+                                    if self.renderer else "circle"),
+            "progress_ring_size": (self.renderer.progress_ring_size
+                                   if self.renderer else 140.0),
+            "progress_ring_pos": (list(self.renderer.progress_ring_pos)
+                                  if self.renderer else [200.0, 350.0]),
+            "ring_progress_color": (list(self.renderer.ring_progress_color)
+                                    if self.renderer
+                                    else list(RING_PROGRESS_DEFAULT)),
             "use_segments": (self.renderer.use_segments if self.renderer else False),
         }
         if self.trajectory_item is not None:
