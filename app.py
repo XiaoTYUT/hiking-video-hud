@@ -3559,6 +3559,12 @@ class MainWindow(QMainWindow):
                           ("end", "end_color")]:
             _tc = self._traj_colors[key]
             setattr(self.renderer, attr, (_tc.red(), _tc.green(), _tc.blue()))
+        # 数据面板背景（宽度/外扩边距/颜色/不透明度，从 GUI 控件同步）
+        self.renderer.panel_bg_w = float(self.spin_panel_bg_w.value())
+        self.renderer.panel_bg_pad = float(self.spin_panel_bg_pad.value())
+        self.renderer.panel_bg_alpha_pct = float(self.spin_panel_bg_alpha.value())
+        _pbc = self._panel_bg_color
+        self.renderer.panel_bg_color = (_pbc.red(), _pbc.green(), _pbc.blue())
         # 地图导航设置（从 GUI 控件同步，确保 _load_kml 内能正确创建 map_item）
         self.renderer.show_map = self.chk_map.isChecked()
         self.renderer.map_zoom = self.spin_map_zoom.value()
