@@ -56,7 +56,7 @@ _PROJECT_FIELDS = (
     "trajectory", "panel", "map",
     "show_map", "map_zoom", "map_shape", "map_text_delta",
     "map_arrow_size", "map_heading_up", "map_show_trajectory",
-    "map_traj_ahead_m",
+    "map_traj_ahead_m", "map_style", "map_traj_style",
     "show_elev_profile", "elev_profile_pos",
     "elev_profile_w", "elev_profile_h",
     "show_progress_ring", "progress_ring_style", "progress_ring_size",
@@ -2929,6 +2929,29 @@ class MainWindow(QMainWindow):
             1 if self.settings.get("map_shape", "rect") == "circle" else 0)
         self.combo_map_shape.currentIndexChanged.connect(self._on_map_shape_changed)
         mf.addRow("地图形状", self.combo_map_shape)
+        # 底图样式：标准矢量 / 卫星影像
+        self.combo_map_style = QComboBox()
+        self.combo_map_style.addItem("标准地图", "standard")
+        self.combo_map_style.addItem("卫星影像", "satellite")
+        self.combo_map_style.setCurrentIndex(
+            1 if self.settings.get("map_style", "standard") == "satellite" else 0)
+        self.combo_map_style.setToolTip(
+            "标准地图：浅绿矢量底图，含路名/村庄名等地名标注\n"
+            "卫星影像：真实航拍地形纹理，无地名标注，更贴近实景")
+        self.combo_map_style.currentIndexChanged.connect(self._on_map_style_changed)
+        mf.addRow("底图样式", self.combo_map_style)
+        # 地图上轨迹样式：高对比 / 经典
+        self.combo_map_traj_style = QComboBox()
+        self.combo_map_traj_style.addItem("高对比（白+主色）", "contrast")
+        self.combo_map_traj_style.addItem("经典（同主画布配色）", "classic")
+        self.combo_map_traj_style.setCurrentIndex(
+            0 if self.settings.get("map_traj_style", "contrast") == "contrast" else 1)
+        self.combo_map_traj_style.setToolTip(
+            "高对比：未走=白色、已走=主色，行进语义最强\n"
+            "经典：未走/已走沿用主画布轨迹配色（默认紫/红）")
+        self.combo_map_traj_style.currentIndexChanged.connect(
+            self._on_map_traj_style_changed)
+        mf.addRow("轨迹样式", self.combo_map_traj_style)
         # 朝向模式：正北朝上 / 运动方向朝上
         self.combo_map_orient = QComboBox()
         self.combo_map_orient.addItems(["正北朝上", "运动方向朝上"])
@@ -3521,6 +3544,24 @@ class MainWindow(QMainWindow):
             self.scene.update()
         self._mark_dirty()
 
+    def _on_map_style_changed(self):
+        """底图样式（标准/卫星）变化 → 同步 renderer + 刷新首帧预览。"""
+        if self.renderer is not None:
+            self.renderer.map_style = (self.combo_map_style.currentData()
+                                       or "standard")
+            if self.map_item is not None:
+                self.map_item.refresh_preview()
+        self._mark_dirty()
+
+    def _on_map_traj_style_changed(self):
+        """地图上轨迹样式（高对比/经典）变化 → 同步 renderer + 刷新预览。"""
+        if self.renderer is not None:
+            self.renderer.map_traj_style = (self.combo_map_traj_style.currentData()
+                                            or "contrast")
+            if self.map_item is not None:
+                self.map_item.refresh_preview()
+        self._mark_dirty()
+
     def _on_map_text_changed(self):
         """文字图例大小变化 → 同步 renderer + 刷新首帧预览。"""
         if self.renderer is not None:
@@ -3949,6 +3990,14 @@ class MainWindow(QMainWindow):
         self.combo_map_shape.setCurrentIndex(
             1 if s.get("map_shape", "rect") == "circle" else 0)
         self.combo_map_shape.blockSignals(False)
+        self.combo_map_style.blockSignals(True)
+        self.combo_map_style.setCurrentIndex(
+            1 if s.get("map_style", "standard") == "satellite" else 0)
+        self.combo_map_style.blockSignals(False)
+        self.combo_map_traj_style.blockSignals(True)
+        self.combo_map_traj_style.setCurrentIndex(
+            0 if s.get("map_traj_style", "contrast") == "contrast" else 1)
+        self.combo_map_traj_style.blockSignals(False)
         self.combo_map_orient.blockSignals(True)
         self.combo_map_orient.setCurrentIndex(
             1 if s.get("map_heading_up", False) else 0)
@@ -4183,6 +4232,10 @@ class MainWindow(QMainWindow):
         self.renderer.map_shape = ("circle"
                                    if self.combo_map_shape.currentIndex() == 1
                                    else "rect")
+        self.renderer.map_style = (self.combo_map_style.currentData()
+                                   or "standard")
+        self.renderer.map_traj_style = (self.combo_map_traj_style.currentData()
+                                        or "contrast")
         self.renderer.map_text_delta = self._map_text_deltas[
             self.combo_map_text.currentIndex()]
         self.renderer.map_arrow_size = self.spin_map_arrow.value()
@@ -4523,6 +4576,10 @@ class MainWindow(QMainWindow):
             "show_map": (self.renderer.show_map if self.renderer else False),
             "map_zoom": (self.renderer.map_zoom if self.renderer else 15),
             "map_shape": (self.renderer.map_shape if self.renderer else "rect"),
+            "map_style": (self.renderer.map_style
+                          if self.renderer else "standard"),
+            "map_traj_style": (self.renderer.map_traj_style
+                               if self.renderer else "contrast"),
             "map_text_delta": (self.renderer.map_text_delta
                                if self.renderer else 0),
             "map_arrow_size": (self.renderer.map_arrow_size

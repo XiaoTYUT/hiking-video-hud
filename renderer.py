@@ -39,6 +39,8 @@ TILE_CACHE_DIR = (Path(os.environ.get("APPDATA", Path.home())) / "KmlPath" / "ti
 
 GAODE_TILE_URL = ("https://webrd0{s}.is.autonavi.com/appmaptile"
                   "?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}")
+GAODE_SAT_TILE_URL = ("https://webst0{s}.is.autonavi.com/appmaptile"
+                      "?style=6&x={x}&y={y}&z={z}")
 
 
 def _lonlat_to_webmerc_px(lon: float, lat: float, z: int) -> Tuple[float, float]:
@@ -101,10 +103,13 @@ def _wgs84_to_gcj02(lon: float, lat: float) -> Tuple[float, float]:
     return lon + dlon, lat + dlat
 
 
-def _fetch_tile(z: int, x: int, y: int):
-    """下载一个地图瓦片，带磁盘缓存。返回 PIL Image 或 None。"""
-    TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = TILE_CACHE_DIR / f"{z}_{x}_{y}.png"
+def _fetch_tile(z: int, x: int, y: int, style: int = 8):
+    """下载一个地图瓦片，带磁盘缓存（style=8 标准 / 6 卫星，按样式分桶）。
+    返回 PIL Image 或 None。"""
+    # 标准图沿用旧的平铺缓存目录，避免已缓存瓦片重新下载
+    cache_dir = TILE_CACHE_DIR if style == 8 else TILE_CACHE_DIR / f"s{style}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{z}_{x}_{y}.png"
     if cache_file.exists():
         try:
             return Image.open(cache_file).convert("RGBA")
@@ -112,7 +117,8 @@ def _fetch_tile(z: int, x: int, y: int):
             cache_file.unlink(missing_ok=True)
 
     s = (x + y) % 4 + 1
-    url = GAODE_TILE_URL.format(s=s, x=x, y=y, z=z)
+    tpl = GAODE_TILE_URL if style == 8 else GAODE_SAT_TILE_URL
+    url = tpl.format(s=s, x=x, y=y, z=z)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -775,6 +781,10 @@ class Renderer:
         self.map_show_trajectory = False       # 是否在地图上叠加轨迹折线
         # 轨迹前视距离(米)：0 = 显示完整轨迹；>0 只显示当前位置前方该距离内的轨迹
         self.map_traj_ahead_m = 0.0
+        # 底图样式：standard 标准矢量(含地名标注) / satellite 卫星影像(纯地形)
+        self.map_style = "standard"
+        # 地图上轨迹样式：classic 紫红(同主画布配色) / contrast 白+红高对比
+        self.map_traj_style = "contrast"
 
         # 海拔一览图：整条路线的海拔剖面 + 随视频位置移动的动态标记
         # 独立面板（可拖拽/缩放），与数据面板、坡度仪互不依赖
@@ -829,6 +839,9 @@ class Renderer:
         self.proj_margin = getattr(self, "proj_margin", 80)
         self.render_scale = getattr(self, "render_scale", 1)
         self._ss = getattr(self, "_ss", 1)
+        # 兼容旧快照：补齐地图底图/轨迹样式属性
+        self.map_style = getattr(self, "map_style", "standard")
+        self.map_traj_style = getattr(self, "map_traj_style", "contrast")
         # 兼容旧快照：补齐坡度仪样式属性
         self.gauge_style = getattr(self, "gauge_style", "arc")
         # 兼容旧快照：补齐海拔一览图属性
@@ -1685,8 +1698,9 @@ class Renderer:
                 (left, top))
 
     def _get_tile(self, z: int, x: int, y: int):
-        """获取瓦片（带磁盘缓存），返回 PIL Image 或 None。"""
-        return _fetch_tile(z, x, y)
+        """获取瓦片（带磁盘缓存；样式跟随 map_style），返回 PIL Image 或 None。"""
+        style = 6 if getattr(self, "map_style", "standard") == "satellite" else 8
+        return _fetch_tile(z, x, y, style)
 
     def _map_render_params(self):
         """返回 (显示 zoom z, 取瓦片的 zoom zf, zf 下需裁剪边长 span, 面板像素边长 panel)。
@@ -1902,10 +1916,15 @@ class Renderer:
             # 深色描边提升浅色地图上的可读性（轨迹较短时尤其重要）。
             # 全部用不透明色：半透明色会经 paste 混色把地图区域的 alpha 拉低，
             # 在带透明通道的成片里留下半透明斑块
+            # 轨迹样式：contrast = 白(未走)+主色(已走) 高对比行进语义；
+            #           classic  = 与主画布一致的未走/已走配色
+            unvis_rgb = ((245, 246, 250)
+                         if getattr(self, "map_traj_style", "classic") == "contrast"
+                         else self.unvisited_color)
             if len(line_pts) >= 2:
                 ld.line(line_pts, fill=(45, 45, 55, 255),
                         width=w_p + max(2, int(round(2 * ss))))
-                ld.line(line_pts, fill=self.unvisited_color + (255,), width=w_p)
+                ld.line(line_pts, fill=unvis_rgb + (255,), width=w_p)
                 # 前视窗口模式全部是未走轨迹，无需再叠已走色
                 if ahead_m <= 0.0 and cut > i0:
                     ld.line(line_pts[:cut + 1 - i0],
