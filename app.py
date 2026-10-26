@@ -16,6 +16,8 @@ from pathlib import Path
 from PyQt5.QtCore import Qt, QPointF, QRectF, QThread, pyqtSignal, QStandardPaths, QTimer
 from PyQt5.QtGui import (QPen, QColor, QBrush, QPainterPath, QPainter, QFont,
                          QFontMetrics, QPixmap, QPolygonF, QTransform)
+from PIL import Image, ImageDraw
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGraphicsView, QGraphicsScene,
     QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem, QGraphicsEllipseItem,
@@ -455,7 +457,10 @@ class DataPanelItem(QGraphicsRectItem):
 # ─────────────────────── 可拖拽地图导航面板 Item ───────────────────────
 
 class MapPanelItem(QGraphicsRectItem):
-    """地图导航面板的 GUI 预览：可拖拽定位 + 滚轮缩放（与视频输出 WYSIWYG）。"""
+    """地图导航面板的 GUI 预览：直接复用视频渲染代码绘制「视频首帧」的完整地图
+    （瓦片底图 + 位置箭头 + 指北针 + 边框 + 可选轨迹），
+    调整缩放级别/形状/朝向/文字图例/箭头等设置都会即时刷新预览。
+    可拖拽定位 + 滚轮缩放（与视频输出 WYSIWYG）。"""
 
     def __init__(self, renderer: Renderer):
         s = renderer.map_scale
@@ -463,6 +468,7 @@ class MapPanelItem(QGraphicsRectItem):
         super().__init__(0, 0, size, size)
         self.renderer = renderer
         self._s = s
+        self._hover = False
         self.setPos(renderer.map_pos[0], renderer.map_pos[1])
         self.setBrush(QBrush(QColor(10, 10, 20, 120)))
         self.setPen(QPen(QColor(80, 160, 255, 200), 2))
@@ -470,12 +476,72 @@ class MapPanelItem(QGraphicsRectItem):
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self.setAcceptHoverEvents(True)
-        # 文字标记
+        # 首帧预览图（含边框/箭头/指北针，铺满整个面板）
+        self._pix_item = QGraphicsPixmapItem(self)
+        self._pix_item.setAcceptedMouseButtons(Qt.NoButton)
+        # 占位文字：未加载轨迹 / 预览尚未生成时可见
         self._label = QGraphicsTextItem("地图导航", self)
         self._label.setDefaultTextColor(QColor(200, 200, 220, 200))
         f = QFont("Microsoft YaHei", 10)
         self._label.setFont(f)
         self._label.setPos(10, 10)
+        # 防抖：连续调整数值时合并刷新，避免反复拉瓦片
+        self._preview_timer = QTimer()
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._render_preview)
+
+    def refresh_preview(self, delay_ms: int = 120):
+        """请求刷新首帧预览（默认 120ms 防抖，连续调数值只渲染最后一次）。"""
+        self._preview_timer.start(max(0, int(delay_ms)))
+
+    def _preview_ss(self) -> int:
+        """预览倍率：按屏幕像素比放大渲染，屏幕显示尺寸不变、文字边框更清晰。"""
+        dpr = 1.0
+        sc = self.scene()
+        views = sc.views() if sc is not None else []
+        if views:
+            dpr = float(views[0].devicePixelRatioF())
+        return max(1, min(3, int(round(dpr))))
+
+    def _render_preview(self):
+        """用视频同一套 _draw_map 绘制首帧（idx=0），转成 QPixmap 显示。
+
+        只临时改写 renderer.map_pos/_ss（把面板摆到临时图片左上角），
+        其余参数全部原样复用，因此预览与成片首帧像素级一致。
+        """
+        r = self.renderer
+        if r is None or self.scene() is None or len(r.points) < 2:
+            return
+        ss = self._preview_ss()
+        panel = int(r.map_size * r.map_scale)
+        if panel <= 0:
+            return
+        pad = ss                                    # 四周留 1px（×ss）给边框描边
+        img = Image.new("RGBA", (panel + 2 * pad, panel + 2 * pad), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        saved_pos = r.map_pos
+        saved_ss = int(getattr(r, "_ss", 1) or 1)
+        r._ss = ss
+        r.map_pos = (1.0, 1.0)                      # _draw_map 内部会 ×ss
+        try:
+            r._draw_map(img, d, 0)                  # 视频首帧 = 轨迹索引 0
+        finally:
+            r.map_pos = saved_pos
+            r._ss = saved_ss
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        pix = QPixmap()
+        pix.loadFromData(buf.getvalue(), "PNG")
+        if pix.isNull():
+            return
+        pix.setDevicePixelRatio(float(ss))
+        self._pix_item.setPixmap(pix)
+        self._pix_item.setPos(-1.0, -1.0)            # 抵消 1px 边框留白
+        self._label.hide()
+        # 预览图已自带形状与蓝色边框，去掉占位矩形
+        self.setBrush(QBrush(Qt.NoBrush))
+        self.setPen(QPen(Qt.NoPen))
+        self.update()
 
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -483,12 +549,22 @@ class MapPanelItem(QGraphicsRectItem):
         size = self.renderer.map_size * self._s
         self.setRect(0, 0, size, size)
         self.renderer.map_scale = self._s
+        self.refresh_preview(60)
         self.scene().update()
         _notify_main_dirty(self)
         _notify_main_scale(self, "map", self._s)
 
     def paint(self, painter, option, widget=None):
-        """方形走默认绘制；圆形画椭圆占位（与视频输出形状一致）。"""
+        """有预览图时只画悬停高亮轮廓；无预览时按形状画占位框。"""
+        if not self._pix_item.pixmap().isNull():
+            if self._hover:
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor(120, 200, 255, 240), 2))
+                if getattr(self.renderer, "map_shape", "rect") == "circle":
+                    painter.drawEllipse(self.rect())
+                else:
+                    painter.drawRect(self.rect())
+            return
         if getattr(self.renderer, "map_shape", "rect") == "circle":
             painter.setBrush(self.brush())
             painter.setPen(self.pen())
@@ -509,11 +585,13 @@ class MapPanelItem(QGraphicsRectItem):
         _notify_main_scale(self, "map", self._s)
 
     def hoverEnterEvent(self, event):
-        self.setPen(QPen(QColor(120, 200, 255, 240), 3))
+        self._hover = True
+        self.update()
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
-        self.setPen(QPen(QColor(80, 160, 255, 200), 2))
+        self._hover = False
+        self.update()
         super().hoverLeaveEvent(event)
 
 
@@ -2361,7 +2439,8 @@ class MainWindow(QMainWindow):
         self.chk_map_traj.setChecked(
             bool(self.settings.get("map_show_trajectory", False)))
         self.chk_map_traj.setToolTip(
-            "在地图导航面板上叠加轨迹折线（未走色 + 已走色）\n仅影响视频输出")
+            "在地图导航面板上叠加轨迹折线（未走色 + 已走色）\n"
+            "画布预览与视频输出同步生效")
         self.chk_map_traj.toggled.connect(self._on_map_traj_toggled)
         mf.addRow(self.chk_map_traj)
         # 轨迹前视距离：0 = 全部轨迹；>0 只显示当前位置前方该距离内的轨迹
@@ -2375,7 +2454,7 @@ class MainWindow(QMainWindow):
         self.spin_map_traj_ahead.setToolTip(
             "只显示当前位置前方多远内的轨迹\n"
             "「全部」= 显示完整轨迹；填 50 = 只显示前方 50 米内的轨迹\n"
-            "仅影响视频输出")
+            "画布预览与视频输出同步生效")
         self.spin_map_traj_ahead.setEnabled(self.chk_map_traj.isChecked())
         self.spin_map_traj_ahead.valueChanged.connect(
             self._on_map_traj_ahead_changed)
@@ -2648,6 +2727,7 @@ class MainWindow(QMainWindow):
             size = self.renderer.map_size * self.map_item._s
             self.map_item.setRect(0, 0, size, size)
             self.map_item._sync()
+            self.map_item.refresh_preview()
         self.scene.update()
         self._mark_dirty()
 
@@ -2744,6 +2824,10 @@ class MainWindow(QMainWindow):
                 self.trajectory_item._apply_pen()
             elif key in ("start", "end"):
                 self._refresh_start_end_dots()
+            # 地图导航面板叠加了轨迹时，颜色变化也要刷新首帧预览
+            if (self.map_item is not None
+                    and getattr(self.renderer, "map_show_trajectory", False)):
+                self.map_item.refresh_preview()
         self._mark_dirty()
 
     def _refresh_start_end_dots(self):
@@ -2783,6 +2867,7 @@ class MainWindow(QMainWindow):
             self.renderer.map_scale = self.spin_map_scale.value() / 100.0
             self.map_item = MapPanelItem(self.renderer)
             self.scene.addItem(self.map_item)
+            self.map_item.refresh_preview(0)     # 立即渲出首帧预览
             _notify_main_scale(self.map_item, "map", self.map_item._s)
         elif not on and self.map_item is not None:
             self.scene.removeItem(self.map_item)
@@ -2874,9 +2959,11 @@ class MainWindow(QMainWindow):
                 "border: 1px solid #666; padding: 3px 8px;")
 
     def _on_map_zoom_changed(self):
-        """地图缩放级别变化 → 同步 renderer。"""
+        """地图缩放级别变化 → 同步 renderer + 刷新首帧预览。"""
         if self.renderer is not None:
             self.renderer.map_zoom = self.spin_map_zoom.value()
+            if self.map_item is not None:
+                self.map_item.refresh_preview()
         self._mark_dirty()
 
     def _on_map_shape_changed(self):
@@ -2886,33 +2973,41 @@ class MainWindow(QMainWindow):
                                        if self.combo_map_shape.currentIndex() == 1
                                        else "rect")
             if self.map_item is not None:
-                self.map_item.update()
+                self.map_item.refresh_preview()
             self.scene.update()
         self._mark_dirty()
 
     def _on_map_text_changed(self):
-        """文字图例大小变化 → 同步 renderer。"""
+        """文字图例大小变化 → 同步 renderer + 刷新首帧预览。"""
         if self.renderer is not None:
             self.renderer.map_text_delta = self._map_text_deltas[
                 self.combo_map_text.currentIndex()]
+            if self.map_item is not None:
+                self.map_item.refresh_preview()
         self._mark_dirty()
 
     def _on_map_orient_changed(self):
-        """朝向模式（正北朝上/运动方向朝上）变化 → 同步 renderer。"""
+        """朝向模式（正北朝上/运动方向朝上）变化 → 同步 renderer + 刷新预览。"""
         if self.renderer is not None:
             self.renderer.map_heading_up = (self.combo_map_orient.currentIndex() == 1)
+            if self.map_item is not None:
+                self.map_item.refresh_preview()
         self._mark_dirty()
 
     def _on_map_arrow_changed(self):
-        """位置箭头大小变化 → 同步 renderer。"""
+        """位置箭头大小变化 → 同步 renderer + 刷新首帧预览。"""
         if self.renderer is not None:
             self.renderer.map_arrow_size = self.spin_map_arrow.value()
+            if self.map_item is not None:
+                self.map_item.refresh_preview()
         self._mark_dirty()
 
     def _on_map_traj_toggled(self, on: bool):
-        """地图上是否叠加轨迹 → 同步 renderer（仅影响视频输出）。"""
+        """地图上是否叠加轨迹 → 同步 renderer + 刷新首帧预览。"""
         if self.renderer is not None:
             self.renderer.map_show_trajectory = on
+            if self.map_item is not None:
+                self.map_item.refresh_preview()
         self.spin_map_traj_ahead.setEnabled(on)
         self._mark_dirty()
 
@@ -2921,6 +3016,8 @@ class MainWindow(QMainWindow):
         if self.renderer is not None:
             self.renderer.map_traj_ahead_m = float(
                 self.spin_map_traj_ahead.value())
+            if self.map_item is not None:
+                self.map_item.refresh_preview()
         self._mark_dirty()
 
     def _open_node_editor(self):
@@ -3315,6 +3412,7 @@ class MainWindow(QMainWindow):
             size = self.renderer.map_size * self.map_item._s
             self.map_item.setRect(0, 0, size, size)
             self.map_item._sync()
+            self.map_item.refresh_preview(0)     # 恢复工程布局后重渲首帧预览
         # 动态坡度仪位置/大小恢复
         gp = s.get("slope_gauge_pos")
         if gp:
@@ -3528,6 +3626,7 @@ class MainWindow(QMainWindow):
         self._on_preview_scaled("panel", self.panel_item._s)
         if self.map_item is not None:
             self._on_preview_scaled("map", self.map_item._s)
+            self.map_item.refresh_preview(0)     # 加载 KML 后渲出首帧预览
 
         # 起/终点：作为轨迹的子项，拖拽/缩放自动跟随（放大到半径14）
         sx, sy = projected[0]
