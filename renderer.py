@@ -751,6 +751,8 @@ class Renderer:
         self.slope_gauge_size: float = 140.0     # 基准尺寸 px（arc=边长，card=基准单位）
         self.gauge_label_size: float = 20.0      # 「坡度」标签字号（px）
         self.gauge_value_size: float = 24.0      # 坡度数值字号（px）
+        self.gauge_label_dy: float = 0.0         # 标签垂直偏移（px，正值下移）
+        self.gauge_value_dy: float = 0.0         # 数值垂直偏移（px，正值下移）
         self.gauge_edge_top_color: Tuple[int, int, int] = GAUGE_WARM_DEFAULT  # 色阶暖端（上坡）
         self.gauge_edge_bottom_color: Tuple[int, int, int] = GAUGE_COLD_DEFAULT  # 色阶冷端（下坡）
         self.gauge_fill_alpha_pct: float = 85.0  # 色阶条不透明度 0-100%
@@ -844,6 +846,8 @@ class Renderer:
         self.map_traj_style = getattr(self, "map_traj_style", "contrast")
         # 兼容旧快照：补齐坡度仪样式属性
         self.gauge_style = getattr(self, "gauge_style", "arc")
+        self.gauge_label_dy = getattr(self, "gauge_label_dy", 0.0)
+        self.gauge_value_dy = getattr(self, "gauge_value_dy", 0.0)
         # 兼容旧快照：补齐海拔一览图属性
         self.show_elev_profile = getattr(self, "show_elev_profile", True)
         self.elev_profile_w = getattr(self, "elev_profile_w", 360.0)
@@ -1252,14 +1256,16 @@ class Renderer:
         vf = load_font(vfs)
         vb = ld.textbbox((0, 0), value, font=vf)
         vw, vh = vb[2] - vb[0], vb[3] - vb[1]
-        ld.text((cx - vw / 2 - vb[0], L["value_cy"] - vh / 2 - vb[1]),
+        ld.text((cx - vw / 2 - vb[0],
+                 L["value_cy"] + self.gauge_value_dy * ss - vh / 2 - vb[1]),
                 value, fill=vc + (255,), font=vf,
                 stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
         lfs = max(8, int(round(self.gauge_label_size * GAUGE_LABEL_RATIO * ss)))
         lf = load_font(lfs)
         lb = ld.textbbox((0, 0), "坡度", font=lf)
         lw, lh = lb[2] - lb[0], lb[3] - lb[1]
-        ld.text((cx - lw / 2 - lb[0], L["label_cy"] - lh / 2 - lb[1]),
+        ld.text((cx - lw / 2 - lb[0],
+                 L["label_cy"] + self.gauge_label_dy * ss - lh / 2 - lb[1]),
                 "坡度", fill=(230, 236, 244, 210), font=lf,
                 stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
 
@@ -1313,7 +1319,8 @@ class Renderer:
         lf = load_font(lfs)
         lb = ld.textbbox((0, 0), "坡度", font=lf)
         lw, lh = lb[2] - lb[0], lb[3] - lb[1]
-        ld.text((pad - lb[0], L["label_cy"] - lh / 2 - lb[1]), "坡度",
+        ld.text((pad - lb[0],
+                 L["label_cy"] + self.gauge_label_dy * ss - lh / 2 - lb[1]), "坡度",
                 fill=(169, 180, 196, 255), font=lf,
                 stroke_width=stroke, stroke_fill=(0, 0, 0, 160))
         value = gauge_format_pct(pct)
@@ -1324,7 +1331,8 @@ class Renderer:
         vf = load_font(vfs)
         vb = ld.textbbox((0, 0), value, font=vf)
         vw, vh = vb[2] - vb[0], vb[3] - vb[1]
-        ld.text((w - pad - vw - vb[0], L["value_cy"] - vh / 2 - vb[1]),
+        ld.text((w - pad - vw - vb[0],
+                 L["value_cy"] + self.gauge_value_dy * ss - vh / 2 - vb[1]),
                 value, fill=vc + (255,), font=vf,
                 stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
 

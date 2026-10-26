@@ -795,7 +795,9 @@ class SlopeGaugeItem(QGraphicsRectItem):
         vw = fm_v.horizontalAdvance(value)
         _paint_outlined_text(
             painter, value,
-            QRectF(cx - vw / 2 - 4, L["value_cy"] - fm_v.height() / 2,
+            QRectF(cx - vw / 2 - 4,
+                   L["value_cy"] + self.renderer.gauge_value_dy
+                   - fm_v.height() / 2,
                    vw + 8, fm_v.height()), vcol, vf)
         lf = _ui_font(int(round(self.renderer.gauge_label_size
                                 * GAUGE_LABEL_RATIO)))
@@ -803,7 +805,9 @@ class SlopeGaugeItem(QGraphicsRectItem):
         lw = fm_l.horizontalAdvance("坡度")
         _paint_outlined_text(
             painter, "坡度",
-            QRectF(cx - lw / 2 - 4, L["label_cy"] - fm_l.height() / 2,
+            QRectF(cx - lw / 2 - 4,
+                   L["label_cy"] + self.renderer.gauge_label_dy
+                   - fm_l.height() / 2,
                    lw + 8, fm_l.height()), QColor(230, 236, 244, 210), lf)
 
     def _paint_card(self, painter, size, pct, a, cold, warm, vcol, value):
@@ -846,8 +850,10 @@ class SlopeGaugeItem(QGraphicsRectItem):
         lw = fm_l.horizontalAdvance("坡度")
         _paint_outlined_text(
             painter, "坡度",
-            QRectF(pad - 4, L["label_cy"] - fm_l.height() / 2, lw + 8,
-                   fm_l.height()), QColor(169, 180, 196), lf)
+            QRectF(pad - 4,
+                   L["label_cy"] + self.renderer.gauge_label_dy
+                   - fm_l.height() / 2,
+                   lw + 8, fm_l.height()), QColor(169, 180, 196), lf)
         max_w = max(20.0, (w - 2 * pad) - lw - 8)
         vfs = _fit_font_size(
             lambda fs: QFontMetrics(_ui_font(fs)).horizontalAdvance(value),
@@ -857,7 +863,9 @@ class SlopeGaugeItem(QGraphicsRectItem):
         vw = fm_v.horizontalAdvance(value)
         _paint_outlined_text(
             painter, value,
-            QRectF(w - pad - vw - 4, L["value_cy"] - fm_v.height() / 2,
+            QRectF(w - pad - vw - 4,
+                   L["value_cy"] + self.renderer.gauge_value_dy
+                   - fm_v.height() / 2,
                    vw + 8, fm_v.height()), vcol, vf)
 
 
@@ -2720,6 +2728,20 @@ class MainWindow(QMainWindow):
         self.spin_gauge_value_size.setToolTip("坡度百分比数值的字号（基准 px）")
         self.spin_gauge_value_size.valueChanged.connect(self._on_gauge_style_changed)
         gf.addRow("数值字号", self.spin_gauge_value_size)
+        self.spin_gauge_value_dy = QSpinBox()
+        self.spin_gauge_value_dy.setRange(-200, 200)
+        self.spin_gauge_value_dy.setValue(0)
+        self.spin_gauge_value_dy.setSuffix(" px")
+        self.spin_gauge_value_dy.setToolTip("坡度数值的垂直位置偏移（正值下移）")
+        self.spin_gauge_value_dy.valueChanged.connect(self._on_gauge_style_changed)
+        gf.addRow("数值高度", self.spin_gauge_value_dy)
+        self.spin_gauge_label_dy = QSpinBox()
+        self.spin_gauge_label_dy.setRange(-200, 200)
+        self.spin_gauge_label_dy.setValue(0)
+        self.spin_gauge_label_dy.setSuffix(" px")
+        self.spin_gauge_label_dy.setToolTip("「坡度」标签的垂直位置偏移（正值下移）")
+        self.spin_gauge_label_dy.valueChanged.connect(self._on_gauge_style_changed)
+        gf.addRow("标签高度", self.spin_gauge_label_dy)
         self.spin_gauge_alpha = QSpinBox()
         self.spin_gauge_alpha.setRange(0, 100)
         self.spin_gauge_alpha.setValue(85)
@@ -3455,6 +3477,8 @@ class MainWindow(QMainWindow):
         r.slope_gauge_size = float(self.spin_gauge_size.value())
         r.gauge_label_size = float(self.spin_gauge_label_size.value())
         r.gauge_value_size = float(self.spin_gauge_value_size.value())
+        r.gauge_value_dy = float(self.spin_gauge_value_dy.value())
+        r.gauge_label_dy = float(self.spin_gauge_label_dy.value())
         r.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
         mapping = {"edge_top": "gauge_edge_top_color",
                    "edge_bottom": "gauge_edge_bottom_color"}
@@ -3902,6 +3926,12 @@ class MainWindow(QMainWindow):
         self.spin_gauge_value_size.blockSignals(True)
         self.spin_gauge_value_size.setValue(_num(s, "gauge_value_size", 24))
         self.spin_gauge_value_size.blockSignals(False)
+        self.spin_gauge_value_dy.blockSignals(True)
+        self.spin_gauge_value_dy.setValue(_num(s, "gauge_value_dy", 0))
+        self.spin_gauge_value_dy.blockSignals(False)
+        self.spin_gauge_label_dy.blockSignals(True)
+        self.spin_gauge_label_dy.setValue(_num(s, "gauge_label_dy", 0))
+        self.spin_gauge_label_dy.blockSignals(False)
         self.spin_gauge_alpha.blockSignals(True)
         self.spin_gauge_alpha.setValue(_num(s, "gauge_fill_alpha_pct", 85))
         self.spin_gauge_alpha.blockSignals(False)
@@ -4248,6 +4278,8 @@ class MainWindow(QMainWindow):
         self.renderer.slope_gauge_size = float(self.spin_gauge_size.value())
         self.renderer.gauge_label_size = float(self.spin_gauge_label_size.value())
         self.renderer.gauge_value_size = float(self.spin_gauge_value_size.value())
+        self.renderer.gauge_value_dy = float(self.spin_gauge_value_dy.value())
+        self.renderer.gauge_label_dy = float(self.spin_gauge_label_dy.value())
         self.renderer.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
         self.renderer.gauge_style = (self.combo_gauge_style.currentData()
                                      or "arc")
@@ -4600,6 +4632,10 @@ class MainWindow(QMainWindow):
                                  if self.renderer else 20.0),
             "gauge_value_size": (self.renderer.gauge_value_size
                                  if self.renderer else 24.0),
+            "gauge_value_dy": (self.renderer.gauge_value_dy
+                               if self.renderer else 0.0),
+            "gauge_label_dy": (self.renderer.gauge_label_dy
+                               if self.renderer else 0.0),
             "gauge_fill_alpha_pct": (self.renderer.gauge_fill_alpha_pct
                                      if self.renderer else 85.0),
             "gauge_edge_top_color": (list(self.renderer.gauge_edge_top_color)
