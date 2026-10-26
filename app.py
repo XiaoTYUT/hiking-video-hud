@@ -2795,8 +2795,7 @@ class MainWindow(QMainWindow):
         for _key, _label, _tip in (
                 ("elev_title_scale", "海拔字号", "左上当前海拔数值的字号倍率"),
                 ("elev_stat_scale", "统计字号", "右上「最高 xxx m」字号倍率"),
-                ("elev_axis_scale", "刻度字号", "左侧海拔刻度与底部里程字号倍率"),
-                ("elev_value_scale", "气泡字号", "当前海拔气泡字号倍率")):
+                ("elev_axis_scale", "刻度字号", "左侧海拔刻度与底部里程字号倍率")):
             sp = QSpinBox()
             sp.setRange(50, 250)
             sp.setValue(100)
@@ -4681,8 +4680,6 @@ class MainWindow(QMainWindow):
                                 if self.renderer else 1.0),
             "elev_axis_scale": (self.renderer.elev_axis_scale
                                 if self.renderer else 1.0),
-            "elev_value_scale": (self.renderer.elev_value_scale
-                                 if self.renderer else 1.0),
             "elev_profile_pos": (list(self.renderer.elev_profile_pos)
                                  if self.renderer else [1536.0, 866.0]),
             "show_progress_ring": (self.renderer.show_progress_ring

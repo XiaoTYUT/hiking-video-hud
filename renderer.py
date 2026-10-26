@@ -797,7 +797,6 @@ class Renderer:
         self.elev_title_scale: float = 1.0   # 左上当前海拔数值
         self.elev_stat_scale: float = 1.0    # 右上「最高 xxx m」
         self.elev_axis_scale: float = 1.0    # 左侧海拔刻度 + 底部里程
-        self.elev_value_scale: float = 1.0   # 当前海拔气泡
         self.elev_profile_pos: Tuple[float, float] = (
             float(width - 384), float(height - 214))
         self._elev_cache = None              # 静态底图缓存（bg + 面积 + 曲线 + 刻度）
@@ -858,7 +857,7 @@ class Renderer:
         self.elev_profile_w = getattr(self, "elev_profile_w", 360.0)
         self.elev_profile_h = getattr(self, "elev_profile_h", 190.0)
         for _k in ("elev_title_scale", "elev_stat_scale",
-                   "elev_axis_scale", "elev_value_scale"):
+                   "elev_axis_scale"):
             setattr(self, _k, getattr(self, _k, 1.0))
         if not hasattr(self, "elev_profile_pos"):
             self.elev_profile_pos = (float(self.width - 384),
@@ -1683,28 +1682,7 @@ class Renderer:
         ld.ellipse([cur_x - ri, cur_y - ri, cur_x + ri, cur_y + ri],
                    fill=ELEV_PROGRESS)
 
-        # 4) 当前海拔气泡（跟随标记，默认在上方；贴近顶部时翻到下方）
-        vfont = load_font(max(8, int(round(
-            L["value_size"] * getattr(self, "elev_value_scale", 1.0)))),
-            bold=True)
-        txt = f"{e_cur:.0f} m"
-        tb = ld.textbbox((0, 0), txt, font=vfont)
-        tw, th = tb[2] - tb[0], tb[3] - tb[1]
-        padx = max(4.0, 5 * L["k"])
-        pady = max(2.0, 2.5 * L["k"])
-        bw, bh = tw + 2 * padx, th + 2 * pady
-        bx = min(max(cur_x - bw / 2, 2.0 * ss), pw - bw - 2.0 * ss)
-        by = cur_y - L["marker_r"] * 2.0 - bh
-        if by < L["title_y"] + L["title_size"] + 2.0 * ss:
-            by = cur_y + L["marker_r"] * 2.0
-        by = min(by, ph - bh - 2.0 * ss)
-        ld.rounded_rectangle([bx, by, bx + bw, by + bh],
-                             radius=max(2, int(round(4 * L["k"]))),
-                             fill=(255, 205, 80, 238))
-        ld.text((bx + padx, by + (bh - th) / 2 - tb[1]), txt, font=vfont,
-                fill=(30, 20, 8, 255))
-
-        # 4.5) 左上：当前海拔数值（替代原「海拔一览」标题，随视频实时变化）
+        # 4) 左上：当前海拔数值（替代原「海拔一览」标题，随视频实时变化）
         etxt = f"{e_cur:.0f} m"
         stat = f"最高 {self.elev_max:.0f} m"
         sfont = load_font(max(8, int(round(
