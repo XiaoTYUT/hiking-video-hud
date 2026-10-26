@@ -462,6 +462,47 @@ def gauge_y(pct: float, bar_top: float, bar_bot: float) -> float:
     return bar_bot - (p + SLOPE_LIMIT_PCT) / (2 * SLOPE_LIMIT_PCT) * (bar_bot - bar_top)
 
 
+# ─────────────── 海拔一览图配色 / 布局（渲染端与 GUI 预览共用，保证 WYSIWYG） ───────────────
+
+ELEV_BG = (14, 18, 26, 150)            # 面板半透明深色底
+ELEV_BORDER = (255, 255, 255, 42)      # 细边框
+ELEV_GRID = (255, 255, 255, 28)        # 水平参考线
+ELEV_LINE = (255, 255, 255, 235)       # 全路线海拔曲线（白）
+ELEV_PROGRESS = (255, 205, 80, 255)    # 已行进度（暖黄）
+ELEV_AREA_TOP = (255, 176, 70)         # 山形面积渐变：高处暖色
+ELEV_AREA_BOTTOM = (88, 66, 178)       # 山形面积渐变：低处紫蓝
+
+
+def elev_profile_layout(w: float, h: float) -> dict:
+    """海拔一览图布局（按面板宽高取比例；渲染端与 GUI 共用同一套常量）。"""
+    k = max(0.45, min(w / 360.0, h / 190.0))
+    return {
+        "k": k,
+        "radius": 12 * k,
+        "pad_x": 14 * k,
+        "title_y": 10 * k,
+        "title_size": 15 * k,
+        "stat_size": 11 * k,
+        "axis_size": 10 * k,
+        "value_size": 12 * k,
+        "x0": 0.115 * w,          # 绘图区左界（左侧留出海拔刻度）
+        "x1": 0.95 * w,           # 绘图区右界
+        "y0": 0.22 * h,           # 绘图区上界（最高海拔）
+        "y1": 0.82 * h,           # 绘图区下界（最低海拔）
+        "marker_r": 5 * k,
+        "line_w": max(1.0, 2.0 * k),
+        "progress_w": max(1.0, 2.5 * k),
+    }
+
+
+def elev_profile_range(elevs: List[float]) -> Tuple[float, float, float, float]:
+    """海拔序列 → (最低, 最高, 映射下界, 映射上界)，上下各留 10% 余量。"""
+    lo = min(elevs)
+    hi = max(elevs)
+    span = max(1e-6, hi - lo)
+    return lo, hi, lo - 0.10 * span, hi + 0.10 * span
+
+
 # ─────────────────────── 坐标投影 ───────────────────────
 
 def compute_projection(points: List[Point], width: int, height: int,
@@ -577,6 +618,19 @@ class Renderer:
         else:
             self.cum_dist = raw_dist
 
+        # 海拔一览图：距离归一化横坐标 + 海拔范围（渲染端与 GUI 预览共用，
+        # 逐帧只做 O(n) 折线绘制，无需重复计算）
+        n_pts = len(points)
+        total_dist = self.cum_dist[-1] if self.cum_dist else 0.0
+        if total_dist > 0:
+            self._elev_frac = [d / total_dist for d in self.cum_dist]
+        else:
+            self._elev_frac = ([i / (n_pts - 1) for i in range(n_pts)]
+                               if n_pts > 1 else [0.0])
+        elevs = [p[2] for p in self.points_smoothed]
+        self.elev_min = min(elevs)
+        self.elev_max = max(elevs)
+
         # 当前坡度（百分比 %，平滑海拔 + 对称窗口，物理裁剪 ±60%）
         self.slope_pct = compute_slope_pct(
             points, [p[2] for p in self.points_smoothed])
@@ -659,6 +713,15 @@ class Renderer:
         # 轨迹前视距离(米)：0 = 显示完整轨迹；>0 只显示当前位置前方该距离内的轨迹
         self.map_traj_ahead_m = 0.0
 
+        # 海拔一览图：整条路线的海拔剖面 + 随视频位置移动的动态标记
+        # 独立面板（可拖拽/缩放），与数据面板、坡度仪互不依赖
+        self.show_elev_profile: bool = True
+        self.elev_profile_w: float = 360.0
+        self.elev_profile_h: float = 190.0
+        self.elev_profile_pos: Tuple[float, float] = (
+            float(width - 384), float(height - 214))
+        self._elev_cache = None              # 静态底图缓存（bg + 面积 + 曲线 + 刻度）
+
         # 分段视频：None = 未设置分段；否则 (cut_points, durations)
         # cut_points = 轨迹进度分割点列表(0<c<1 升序)，durations = 各段视频秒数
         # 段数 = len(cut_points) + 1，总时长 = sum(durations)
@@ -694,6 +757,7 @@ class Renderer:
         state["font_big"] = None
         state["font_small"] = None
         state["font_title"] = None
+        state["_elev_cache"] = None      # 静态底图缓存不随快照传输，子进程懒构建
         return state
 
     def __setstate__(self, state):
@@ -702,6 +766,14 @@ class Renderer:
         self.proj_margin = getattr(self, "proj_margin", 80)
         self.render_scale = getattr(self, "render_scale", 1)
         self._ss = getattr(self, "_ss", 1)
+        # 兼容旧快照：补齐海拔一览图属性
+        self.show_elev_profile = getattr(self, "show_elev_profile", True)
+        self.elev_profile_w = getattr(self, "elev_profile_w", 360.0)
+        self.elev_profile_h = getattr(self, "elev_profile_h", 190.0)
+        if not hasattr(self, "elev_profile_pos"):
+            self.elev_profile_pos = (float(self.width - 384),
+                                     float(self.height - 214))
+        self._elev_cache = None
         self._project = compute_projection(self.points, self.width, self.height,
                                            self.proj_margin)
         self.font_big = load_font(24)
@@ -843,6 +915,10 @@ class Renderer:
         # 4) 地图导航面板（以当前位置为中心，始终北朝上）
         if self.show_map:
             self._draw_map(img, d, idx_f)   # 传浮点 idx：地图中心平滑插值
+
+        # 5) 海拔一览图（整条路线的海拔剖面 + 跟随当前位置的动态标记）
+        if getattr(self, "show_elev_profile", False):
+            self._draw_elev_profile(img, d, idx_f)
 
         return img
 
@@ -1089,6 +1165,202 @@ class Renderer:
         d.text((cx - vw / 2 - vb[0], gy + L["value_cy"] - vh / 2 - vb[1]),
                value, fill=(vc[0], vc[1], vc[2], 255), font=vf,
                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+
+    # ── 海拔一览图 ──
+
+    def _elev_profile_cache_key(self, ss: int):
+        return (int(round(self.elev_profile_w * ss)),
+                int(round(self.elev_profile_h * ss)), ss,
+                len(self.points), round(float(self.elev_min), 3),
+                round(float(self.elev_max), 3),
+                round(float(self.cum_dist[-1]), 3) if self.cum_dist else 0.0)
+
+    def _elev_profile_base(self, ss: int):
+        """构建 / 复用海拔一览图的静态底图（背景 + 山形渐变 + 白色曲线 + 刻度）。
+
+        返回 (底图, xs, ys)；底图与数据/尺寸绑定，逐帧只复制后叠加动态标记，
+        避免每帧重画上百行渐变。多进程快照中该缓存被丢弃，子进程懒构建一次。
+        """
+        key = self._elev_profile_cache_key(ss)
+        cache = getattr(self, "_elev_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1], cache[2], cache[3]
+
+        pw = max(1, int(round(self.elev_profile_w * ss)))
+        ph = max(1, int(round(self.elev_profile_h * ss)))
+        L = elev_profile_layout(pw, ph)
+        x0, x1, y0, y1 = L["x0"], L["x1"], L["y0"], L["y1"]
+        stroke = max(1, int(round(ss)))
+
+        layer = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rounded_rectangle([0, 0, pw - 1, ph - 1],
+                             radius=max(2, int(round(L["radius"]))),
+                             fill=ELEV_BG)
+        ld.rounded_rectangle([0, 0, pw - 1, ph - 1],
+                             radius=max(2, int(round(L["radius"]))),
+                             outline=ELEV_BORDER, width=stroke)
+
+        # 水平参考线（上/中/下三档，弱化到几乎只是氛围）
+        for t in (0.0, 0.5, 1.0):
+            gy = y0 + (y1 - y0) * t
+            ld.line((x0, gy, x1, gy), fill=ELEV_GRID, width=stroke)
+
+        elevs = [p[2] for p in self.points_smoothed]
+        _lo, _hi, e_lo, e_hi = elev_profile_range(elevs)
+        xs = [x0 + f * (x1 - x0) for f in self._elev_frac]
+        ys = [y1 - (e - e_lo) / (e_hi - e_lo) * (y1 - y0) for e in elevs]
+        pts = list(zip(xs, ys))
+
+        # 山形面积：垂直渐变（高处暖橙 → 低处紫蓝），用多边形遮罩裁切
+        mask = Image.new("L", (pw, ph), 0)
+        ImageDraw.Draw(mask).polygon([(x0, y1)] + pts + [(x1, y1)], fill=255)
+        grad = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(grad)
+        plot_h = max(1.0, y1 - y0)
+        top, bottom = ELEV_AREA_TOP, ELEV_AREA_BOTTOM
+        for yy in range(ph):
+            t = max(0.0, min(1.0, (yy - y0) / plot_h))
+            rgb = tuple(int(round(top[i] + (bottom[i] - top[i]) * t))
+                        for i in range(3))
+            a = int(round(168 + (28 - 168) * t))
+            gd.line((0, yy, pw, yy), fill=rgb + (a,))
+        grad.putalpha(ImageChops.multiply(grad.getchannel("A"), mask))
+        layer.alpha_composite(grad)
+
+        # 全路线海拔曲线
+        if len(pts) >= 2:
+            ld.line(pts, fill=ELEV_LINE, width=max(1, int(round(L["line_w"]))))
+
+        # 标题 + 最高海拔（右上）
+        title_font = load_font(max(8, int(round(L["title_size"]))), bold=True)
+        stat_font = load_font(max(8, int(round(L["stat_size"]))))
+        t_stroke = max(1, int(round(ss)))
+        ld.text((L["pad_x"], L["title_y"]), "海拔一览",
+                fill=(255, 255, 255, 245), font=title_font,
+                stroke_width=t_stroke, stroke_fill=(0, 0, 0, 160))
+        stat = f"最高 {self.elev_max:.0f} m"
+        sb = ld.textbbox((0, 0), stat, font=stat_font)
+        ld.text((x1 - (sb[2] - sb[0]), L["title_y"] + 2 * L["k"]), stat,
+                fill=(255, 214, 150, 235), font=stat_font,
+                stroke_width=t_stroke, stroke_fill=(0, 0, 0, 140))
+
+        # 左侧海拔刻度：最高 / 最低（右对齐到绘图区左侧）
+        axis_font = load_font(max(8, int(round(L["axis_size"]))))
+        ast = max(1, int(round(ss)))
+        for value, yy in ((self.elev_max, y0), (self.elev_min, y1)):
+            txt = f"{value:.0f}"
+            tb = ld.textbbox((0, 0), txt, font=axis_font)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            ld.text((x0 - 6 * L["k"] - tw, yy - th / 2), txt,
+                    fill=(255, 255, 255, 190), font=axis_font,
+                    stroke_width=ast, stroke_fill=(0, 0, 0, 180))
+
+        # 底部里程：起点 0 / 终点总里程
+        bottom_y = y1 + 5 * L["k"]
+        ld.text((x0, bottom_y), "0", fill=(255, 255, 255, 160),
+                font=axis_font, stroke_width=ast, stroke_fill=(0, 0, 0, 160))
+        total_txt = f"{self.cum_dist[-1] / 1000.0:.1f} km"
+        tb = ld.textbbox((0, 0), total_txt, font=axis_font)
+        ld.text((x1 - (tb[2] - tb[0]), bottom_y), total_txt,
+                fill=(255, 255, 255, 160), font=axis_font,
+                stroke_width=ast, stroke_fill=(0, 0, 0, 160))
+
+        self._elev_cache = (key, layer, xs, ys)
+        return layer, xs, ys
+
+    def _draw_elev_profile(self, img: Image.Image, d: ImageDraw.ImageDraw,
+                           idx_f: float) -> None:
+        """绘制海拔一览图：整条路线海拔剖面 + 已行进度 + 跟随当前位置的动态标记。"""
+        n = len(self.points)
+        if n < 2:
+            return
+        ss = int(getattr(self, "_ss", 1) or 1)
+        base, xs, ys = self._elev_profile_base(ss)
+        pw, ph = base.size
+        L = elev_profile_layout(pw, ph)
+        x0, x1, y0, y1 = L["x0"], L["x1"], L["y0"], L["y1"]
+
+        idx = max(0.0, min(float(n - 1), float(idx_f)))
+        i = int(idx)
+        f = idx - i
+        if i < n - 1:
+            frac = self._elev_frac[i] + (self._elev_frac[i + 1]
+                                         - self._elev_frac[i]) * f
+            e_cur = (self.points_smoothed[i][2]
+                     + (self.points_smoothed[i + 1][2]
+                        - self.points_smoothed[i][2]) * f)
+        else:
+            frac = self._elev_frac[-1]
+            e_cur = self.points_smoothed[-1][2]
+        elevs = [p[2] for p in self.points_smoothed]
+        _lo, _hi, e_lo, e_hi = elev_profile_range(elevs)
+        cur_x = x0 + frac * (x1 - x0)
+        cur_y = y1 - (e_cur - e_lo) / (e_hi - e_lo) * (y1 - y0)
+
+        layer = base.copy()
+        ld = ImageDraw.Draw(layer)
+        stroke = max(1, int(round(ss)))
+
+        # 1) 已行进度面积（暖黄半透明，叠在渐变之上）
+        pts = list(zip(xs[:i + 1], ys[:i + 1]))
+        if i < n - 1:
+            pts.append((cur_x, cur_y))
+        if len(pts) >= 2:
+            prog = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+            ImageDraw.Draw(prog).polygon(
+                [(x0, y1)] + pts + [(cur_x, y1)],
+                fill=(255, 205, 80, 58))
+            layer.alpha_composite(prog)
+
+        # 2) 已行曲线（暖黄粗线 + 当前位置竖向虚线引导）
+        if len(pts) >= 2:
+            ld.line(pts, fill=ELEV_PROGRESS,
+                    width=max(1, int(round(L["progress_w"]))))
+        step = max(3, int(round(6 * L["k"])))
+        yy = int(round(cur_y + L["marker_r"] * 1.4))
+        while yy < int(y1):
+            ld.line((cur_x, yy, cur_x, min(yy + step, y1)),
+                    fill=(255, 255, 255, 105), width=stroke)
+            yy += step * 2
+
+        # 3) 当前位置圆点（白边 + 暖黄芯）
+        ro = L["marker_r"] * 1.3
+        ri = L["marker_r"] * 0.82
+        ld.ellipse([cur_x - ro, cur_y - ro, cur_x + ro, cur_y + ro],
+                   fill=(255, 255, 255, 245))
+        ld.ellipse([cur_x - ri, cur_y - ri, cur_x + ri, cur_y + ri],
+                   fill=ELEV_PROGRESS)
+
+        # 4) 当前海拔气泡（跟随标记，默认在上方；贴近顶部时翻到下方）
+        vfont = load_font(max(8, int(round(L["value_size"]))), bold=True)
+        txt = f"{e_cur:.0f} m"
+        tb = ld.textbbox((0, 0), txt, font=vfont)
+        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        padx = max(4.0, 5 * L["k"])
+        pady = max(2.0, 2.5 * L["k"])
+        bw, bh = tw + 2 * padx, th + 2 * pady
+        bx = min(max(cur_x - bw / 2, 2.0 * ss), pw - bw - 2.0 * ss)
+        by = cur_y - L["marker_r"] * 2.0 - bh
+        if by < L["title_y"] + L["title_size"] + 2.0 * ss:
+            by = cur_y + L["marker_r"] * 2.0
+        by = min(by, ph - bh - 2.0 * ss)
+        ld.rounded_rectangle([bx, by, bx + bw, by + bh],
+                             radius=max(2, int(round(4 * L["k"]))),
+                             fill=(255, 205, 80, 238))
+        ld.text((bx + padx, by + (bh - th) / 2 - tb[1]), txt, font=vfont,
+                fill=(30, 20, 8, 255))
+
+        # 5) 叠到输出画布（裁剪到画布内，允许面板拖出边界一部分）
+        px = int(round(self.elev_profile_pos[0] * ss))
+        py = int(round(self.elev_profile_pos[1] * ss))
+        left, top = max(0, px), max(0, py)
+        right = min(img.width, px + pw)
+        bottom = min(img.height, py + ph)
+        if right > left and bottom > top:
+            img.alpha_composite(
+                layer.crop((left - px, top - py, right - px, bottom - py)),
+                (left, top))
 
     def _get_tile(self, z: int, x: int, y: int):
         """获取瓦片（带磁盘缓存），返回 PIL Image 或 None。"""

@@ -54,6 +54,8 @@ _PROJECT_FIELDS = (
     "show_map", "map_zoom", "map_shape", "map_text_delta",
     "map_arrow_size", "map_heading_up", "map_show_trajectory",
     "map_traj_ahead_m",
+    "show_elev_profile", "elev_profile_pos",
+    "elev_profile_w", "elev_profile_h",
 )
 
 
@@ -348,9 +350,19 @@ class DataPanelItem(QGraphicsRectItem):
         self._apply_scale()
         self._sync()
 
+    def mousePressEvent(self, event):
+        self._raise_to_top()
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         self._sync()
+
+    def _raise_to_top(self):
+        """最后点击的仪表盘压在最上层（zValue 最高）。"""
+        if self.scene() is not None:
+            max_z = max((it.zValue() for it in self.scene().items()), default=0)
+            self.setZValue(max_z + 1)
 
     def _apply_scale(self):
         """按内部缩放系数重建 rect（paint 中所有尺寸 = 基准值 * _s）。"""
@@ -572,9 +584,18 @@ class MapPanelItem(QGraphicsRectItem):
         else:
             super().paint(painter, option, widget)
 
+    def mousePressEvent(self, event):
+        self._raise_to_top()
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         self._sync()
+
+    def _raise_to_top(self):
+        if self.scene() is not None:
+            max_z = max((it.zValue() for it in self.scene().items()), default=0)
+            self.setZValue(max_z + 1)
 
     def _sync(self):
         pos = self.pos()
@@ -642,9 +663,18 @@ class SlopeGaugeItem(QGraphicsRectItem):
         _notify_main_dirty(self)
         _notify_main_scale(self, "gauge", size)
 
+    def mousePressEvent(self, event):
+        self._raise_to_top()
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         self._sync()
+
+    def _raise_to_top(self):
+        if self.scene() is not None:
+            max_z = max((it.zValue() for it in self.scene().items()), default=0)
+            self.setZValue(max_z + 1)
 
     def _sync(self):
         pos = self.pos()
@@ -757,6 +787,143 @@ class SlopeGaugeItem(QGraphicsRectItem):
             QRectF(L["text_cx"] - vw / 2 - 4, L["value_cy"] - fm_v.height() / 2,
                    vw + 8, fm_v.height()),
             QColor(vc[0], vc[1], vc[2]), vf)
+
+
+# ─────────────────────── 海拔一览图 Item ───────────────────────
+
+class ElevProfileItem(QGraphicsRectItem):
+    """海拔一览图的 GUI 预览：直接调用视频渲染端 _draw_elev_profile 生成位图，
+    与成片像素级一致（WYSIWYG）。可拖拽定位 + 滚轮等比缩放。"""
+
+    def __init__(self, renderer: Renderer):
+        w = float(renderer.elev_profile_w)
+        h = float(renderer.elev_profile_h)
+        super().__init__(0, 0, w, h)
+        self.renderer = renderer
+        self._hover = False
+        self.setPos(renderer.elev_profile_pos[0], renderer.elev_profile_pos[1])
+        self.setBrush(QBrush(Qt.NoBrush))
+        self.setPen(QPen(Qt.NoPen))
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setAcceptHoverEvents(True)
+        self._pix_item = QGraphicsPixmapItem(self)
+        self._pix_item.setAcceptedMouseButtons(Qt.NoButton)
+        self.refresh_preview()
+
+    def _preview_ss(self) -> int:
+        """预览倍率：按屏幕像素比放大渲染，屏幕显示尺寸不变、文字曲线更清晰。"""
+        dpr = 1.0
+        sc = self.scene()
+        views = sc.views() if sc is not None else []
+        if views:
+            dpr = float(views[0].devicePixelRatioF())
+        return max(1, min(3, int(round(dpr))))
+
+    def refresh_preview(self):
+        """用视频同一套 _draw_elev_profile 渲染当前预览索引的一帧。"""
+        r = self.renderer
+        if r is None or self.scene() is None or len(r.points) < 2:
+            return
+        ss = self._preview_ss()
+        w = max(40.0, float(r.elev_profile_w))
+        h = max(24.0, float(r.elev_profile_h))
+        pad = ss
+        img = Image.new(
+            "RGBA",
+            (int(round(w * ss)) + 2 * pad, int(round(h * ss)) + 2 * pad),
+            (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        saved_pos = r.elev_profile_pos
+        saved_ss = int(getattr(r, "_ss", 1) or 1)
+        r._ss = ss
+        r.elev_profile_pos = (1.0, 1.0)      # _draw_elev_profile 内部 ×ss → 1px 留白
+        try:
+            r._draw_elev_profile(img, d, r.preview_index())
+        finally:
+            r.elev_profile_pos = saved_pos
+            r._ss = saved_ss
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        pix = QPixmap()
+        pix.loadFromData(buf.getvalue(), "PNG")
+        if pix.isNull():
+            return
+        pix.setDevicePixelRatio(float(ss))
+        self._pix_item.setPixmap(pix)
+        self._pix_item.setPos(-1.0, -1.0)    # 抵消 1px 边框留白
+        self.update()
+
+    def sync_layout(self):
+        """按 renderer 的尺寸/位置重建 item（恢复工程布局时调用）。"""
+        r = self.renderer
+        self.prepareGeometryChange()
+        self.setRect(0, 0, float(r.elev_profile_w), float(r.elev_profile_h))
+        self.setPos(*r.elev_profile_pos)
+        self.refresh_preview()
+        if self.scene() is not None:
+            self.scene().update()
+
+    def wheelEvent(self, event):
+        r = self.renderer
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        ratio = r.elev_profile_h / max(1.0, r.elev_profile_w)
+        w = max(220.0, min(1400.0, r.elev_profile_w * factor))
+        h = max(90.0, min(800.0, w * ratio))
+        r.elev_profile_w = w
+        r.elev_profile_h = h
+        self.prepareGeometryChange()
+        self.setRect(0, 0, w, h)
+        self.refresh_preview()
+        if self.scene() is not None:
+            self.scene().update()
+        _notify_main_dirty(self)
+        _notify_main_scale(self, "elev", w)
+
+    def mousePressEvent(self, event):
+        self._raise_to_top()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self._sync()
+
+    def _raise_to_top(self):
+        if self.scene() is not None:
+            max_z = max((it.zValue() for it in self.scene().items()), default=0)
+            self.setZValue(max_z + 1)
+
+    def _sync(self):
+        pos = self.pos()
+        self.renderer.elev_profile_pos = (pos.x(), pos.y())
+        if self.scene() is not None:
+            self.scene().update()
+        _notify_main_dirty(self)
+
+    def hoverEnterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().hoverLeaveEvent(event)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        if self.isSelected() or self._hover:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(120, 200, 255, 160), 1, Qt.DashLine))
+            painter.drawRect(self.rect())
+            return
+        if self._pix_item.pixmap().isNull():
+            painter.setBrush(QBrush(QColor(14, 18, 26, 150)))
+            painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+            painter.drawRoundedRect(self.rect(), 12, 12)
+            painter.setPen(QColor(200, 200, 220, 180))
+            painter.drawText(self.rect(), Qt.AlignCenter, "海拔一览")
 
 
 # ─────────────────────── CanvasView ───────────────────────
@@ -2059,6 +2226,7 @@ class MainWindow(QMainWindow):
         self.panel_item: DataPanelItem | None = None
         self.map_item: MapPanelItem | None = None
         self.gauge_item: SlopeGaugeItem | None = None
+        self.elev_item: ElevProfileItem | None = None
         self.worker: RenderWorker | None = None
 
         # 全局设置（仅窗口级状态：最近工程列表 / 视频输出目录 / 默认画布 / 上次工程路径）
@@ -2358,6 +2526,33 @@ class MainWindow(QMainWindow):
             gf.addRow(text, btn)
         self._refresh_gauge_color_btns()
         self._page_panel.addWidget(gg)
+
+        # 海拔一览图（整条路线海拔剖面 + 跟随视频位置移动的标记）
+        eg = QGroupBox("海拔一览图")
+        ef = QFormLayout(eg)
+        self.chk_elev_profile = QCheckBox("显示海拔一览图")
+        self.chk_elev_profile.setChecked(
+            bool(self.settings.get("show_elev_profile", True)))
+        self.chk_elev_profile.setToolTip(
+            "整条路线的海拔剖面（山形剪影），标记随视频当前位置移动，\n"
+            "可单独拖动位置、滚轮等比缩放")
+        self.chk_elev_profile.toggled.connect(self._on_elev_profile_toggled)
+        ef.addRow(self.chk_elev_profile)
+        self.spin_elev_w = QSpinBox()
+        self.spin_elev_w.setRange(220, 1400)
+        self.spin_elev_w.setValue(_num(self.settings, "elev_profile_w", 360))
+        self.spin_elev_w.setSuffix(" px")
+        self.spin_elev_w.setToolTip("面板宽度（也可在画布上滚轮等比缩放）")
+        self.spin_elev_w.valueChanged.connect(self._on_elev_profile_style_changed)
+        ef.addRow("面板宽度", self.spin_elev_w)
+        self.spin_elev_h = QSpinBox()
+        self.spin_elev_h.setRange(90, 800)
+        self.spin_elev_h.setValue(_num(self.settings, "elev_profile_h", 190))
+        self.spin_elev_h.setSuffix(" px")
+        self.spin_elev_h.setToolTip("面板高度（滚轮缩放时按宽高比同步变化）")
+        self.spin_elev_h.valueChanged.connect(self._on_elev_profile_style_changed)
+        ef.addRow("面板高度", self.spin_elev_h)
+        self._page_panel.addWidget(eg)
 
         # 轨迹（设置窗口「轨迹与标注」页）
         tg = QGroupBox("轨迹")
@@ -2687,6 +2882,16 @@ class MainWindow(QMainWindow):
 
     def _on_preview_scaled(self, kind: str, value: float):
         """画布组件被滚轮缩放 → 回写设置面板数值（屏蔽信号，避免回环）。"""
+        if kind == "elev" and self.renderer is not None:
+            for name, v in (("spin_elev_w", self.renderer.elev_profile_w),
+                            ("spin_elev_h", self.renderer.elev_profile_h)):
+                spin = getattr(self, name, None)
+                if spin is None:
+                    continue
+                spin.blockSignals(True)
+                spin.setValue(int(round(v)))
+                spin.blockSignals(False)
+            return
         mapping = {"trajectory": ("spin_traj_scale", 100.0),
                    "panel": ("spin_panel_scale", 100.0),
                    "map": ("spin_map_scale", 100.0),
@@ -2889,6 +3094,37 @@ class MainWindow(QMainWindow):
         self.scene.update()
         self._mark_dirty()
 
+    def _on_elev_profile_toggled(self, on: bool):
+        """海拔一览图开关：同步 renderer + 创建/移除 GUI 面板。"""
+        if self.renderer is None:
+            return
+        self.renderer.show_elev_profile = on
+        if on and self.elev_item is None:
+            self.renderer.elev_profile_w = float(self.spin_elev_w.value())
+            self.renderer.elev_profile_h = float(self.spin_elev_h.value())
+            self.elev_item = ElevProfileItem(self.renderer)
+            self.scene.addItem(self.elev_item)
+            self.elev_item.refresh_preview()
+        elif not on and self.elev_item is not None:
+            self.scene.removeItem(self.elev_item)
+            self.elev_item = None
+        self.scene.update()
+        self._mark_dirty()
+
+    def _on_elev_profile_style_changed(self, *_):
+        """海拔一览图宽/高变化 → 同步 renderer + 重建预览。"""
+        if self.renderer is None:
+            return
+        r = self.renderer
+        r.elev_profile_w = float(self.spin_elev_w.value())
+        r.elev_profile_h = float(self.spin_elev_h.value())
+        if self.elev_item is not None:
+            self.elev_item.prepareGeometryChange()
+            self.elev_item.setRect(0, 0, r.elev_profile_w, r.elev_profile_h)
+            self.elev_item.refresh_preview()
+        self.scene.update()
+        self._mark_dirty()
+
     def _on_gauge_style_changed(self, *_):
         """坡度仪大小/字号/透明度变化 → 同步 renderer + 刷新 GUI。"""
         if self.renderer is None:
@@ -2925,10 +3161,12 @@ class MainWindow(QMainWindow):
                 self.renderer.preview_idx = -1.0
             if self.gauge_item is not None:
                 self.gauge_item.update()
+            if self.elev_item is not None:
+                self.elev_item.refresh_preview()
             self.scene.update()
 
     def _on_preview_tick(self):
-        """预览推进一帧：索引循环前进（约 5s 走完整段），刷新坡度仪。"""
+        """预览推进一帧：索引循环前进（约 5s 走完整段），刷新坡度仪 / 海拔标记。"""
         if self.renderer is None:
             return
         n = len(self.renderer.points)
@@ -2940,6 +3178,8 @@ class MainWindow(QMainWindow):
         self.renderer.preview_idx = self._preview_pos
         if self.gauge_item is not None:
             self.gauge_item.update()
+        if self.elev_item is not None:
+            self.elev_item.refresh_preview()
 
     def _on_pick_gauge_color(self, key: str):
         """坡度仪颜色按钮：调色板选择 → 写回 renderer。"""
@@ -3337,6 +3577,21 @@ class MainWindow(QMainWindow):
         self._refresh_gauge_color_btns()
         if self.renderer is not None:
             self.renderer.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
+        # 海拔一览图控件
+        self.chk_elev_profile.blockSignals(True)
+        self.chk_elev_profile.setChecked(
+            bool(s.get("show_elev_profile", True)))
+        self.chk_elev_profile.blockSignals(False)
+        self.spin_elev_w.blockSignals(True)
+        self.spin_elev_w.setValue(int(_num(s, "elev_profile_w", 360)))
+        self.spin_elev_w.blockSignals(False)
+        self.spin_elev_h.blockSignals(True)
+        self.spin_elev_h.setValue(int(_num(s, "elev_profile_h", 190)))
+        self.spin_elev_h.blockSignals(False)
+        if self.renderer is not None:
+            self.renderer.show_elev_profile = self.chk_elev_profile.isChecked()
+            self.renderer.elev_profile_w = float(self.spin_elev_w.value())
+            self.renderer.elev_profile_h = float(self.spin_elev_h.value())
         # 关键节点（无文本框，仅写回 renderer）
         nodes = s.get("key_nodes")
         if nodes is not None and self.renderer is not None:
@@ -3426,6 +3681,15 @@ class MainWindow(QMainWindow):
             self.gauge_item.setRect(0, 0, gsz, gsz)
             self.gauge_item.setPos(*self.renderer.slope_gauge_pos)
             self.gauge_item._sync()
+        # 海拔一览图位置/大小恢复
+        ep = s.get("elev_profile_pos")
+        if ep:
+            try:
+                self.renderer.elev_profile_pos = (float(ep[0]), float(ep[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        if self.elev_item is not None:
+            self.elev_item.sync_layout()
         nodes = s.get("key_nodes") or []
         if nodes:
             try:
@@ -3589,6 +3853,10 @@ class MainWindow(QMainWindow):
         for _gk, _ga in _gmap.items():
             _gc = self._gauge_colors[_gk]
             setattr(self.renderer, _ga, (_gc.red(), _gc.green(), _gc.blue()))
+        # 海拔一览图设置（从 GUI 控件同步）
+        self.renderer.show_elev_profile = self.chk_elev_profile.isChecked()
+        self.renderer.elev_profile_w = float(self.spin_elev_w.value())
+        self.renderer.elev_profile_h = float(self.spin_elev_h.value())
         self.renderer.preview_idx = -1.0
         # 分段生成模式（从 GUI 单选按钮同步）
         self.renderer.use_segments = self.rb_segments.isChecked()
@@ -3626,6 +3894,13 @@ class MainWindow(QMainWindow):
         if self.renderer.show_slope_gauge:
             self.gauge_item = SlopeGaugeItem(self.renderer)
             self.scene.addItem(self.gauge_item)
+
+        # 海拔一览图（仅当用户勾选时显示）
+        self.elev_item = None
+        if self.renderer.show_elev_profile:
+            self.elev_item = ElevProfileItem(self.renderer)
+            self.scene.addItem(self.elev_item)
+            self.elev_item.refresh_preview()
 
         # 新建 item 的缩放值与设置项对齐（工程恢复时随后由 _apply_state_dict 覆盖）
         self._on_preview_scaled("trajectory", self.trajectory_item.scale())
@@ -3909,6 +4184,14 @@ class MainWindow(QMainWindow):
                                      if self.renderer else list(GAUGE_WARM_DEFAULT)),
             "gauge_edge_bottom_color": (list(self.renderer.gauge_edge_bottom_color)
                                         if self.renderer else list(GAUGE_COLD_DEFAULT)),
+            "show_elev_profile": (self.renderer.show_elev_profile
+                                  if self.renderer else True),
+            "elev_profile_w": (self.renderer.elev_profile_w
+                               if self.renderer else 360.0),
+            "elev_profile_h": (self.renderer.elev_profile_h
+                               if self.renderer else 190.0),
+            "elev_profile_pos": (list(self.renderer.elev_profile_pos)
+                                 if self.renderer else [1536.0, 866.0]),
             "use_segments": (self.renderer.use_segments if self.renderer else False),
         }
         if self.trajectory_item is not None:
