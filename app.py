@@ -2790,6 +2790,21 @@ class MainWindow(QMainWindow):
         self.spin_elev_h.setToolTip("面板高度（滚轮缩放时按宽高比同步变化）")
         self.spin_elev_h.valueChanged.connect(self._on_elev_profile_style_changed)
         ef.addRow("面板高度", self.spin_elev_h)
+        # 各档文字字号倍率（100% = 随面板尺寸自动推导的基准字号）
+        self._elev_scale_spins = {}
+        for _key, _label, _tip in (
+                ("elev_title_scale", "标题字号", "「海拔一览」标题字号倍率"),
+                ("elev_stat_scale", "统计字号", "右上「最高 xxx m」字号倍率"),
+                ("elev_axis_scale", "刻度字号", "左侧海拔刻度与底部里程字号倍率"),
+                ("elev_value_scale", "气泡字号", "当前海拔气泡字号倍率")):
+            sp = QSpinBox()
+            sp.setRange(50, 250)
+            sp.setValue(100)
+            sp.setSuffix(" %")
+            sp.setToolTip(_tip)
+            sp.valueChanged.connect(self._on_elev_profile_style_changed)
+            ef.addRow(_label, sp)
+            self._elev_scale_spins[_key] = sp
         self._page_panel.addWidget(eg)
 
         # 进度环（当前里程 / 全程里程；样式：经典满环 / 紧凑胶囊）
@@ -3416,6 +3431,8 @@ class MainWindow(QMainWindow):
         r = self.renderer
         r.elev_profile_w = float(self.spin_elev_w.value())
         r.elev_profile_h = float(self.spin_elev_h.value())
+        for _key, sp in self._elev_scale_spins.items():
+            setattr(r, _key, sp.value() / 100.0)
         if self.elev_item is not None:
             self.elev_item.prepareGeometryChange()
             self.elev_item.setRect(0, 0, r.elev_profile_w, r.elev_profile_h)
@@ -3968,10 +3985,16 @@ class MainWindow(QMainWindow):
         self.spin_elev_h.blockSignals(True)
         self.spin_elev_h.setValue(int(_num(s, "elev_profile_h", 190)))
         self.spin_elev_h.blockSignals(False)
+        for _key, sp in self._elev_scale_spins.items():
+            sp.blockSignals(True)
+            sp.setValue(int(round(_num(s, _key, 1.0) * 100)))
+            sp.blockSignals(False)
         if self.renderer is not None:
             self.renderer.show_elev_profile = self.chk_elev_profile.isChecked()
             self.renderer.elev_profile_w = float(self.spin_elev_w.value())
             self.renderer.elev_profile_h = float(self.spin_elev_h.value())
+            for _key, sp in self._elev_scale_spins.items():
+                setattr(self.renderer, _key, sp.value() / 100.0)
         # 进度环控件
         self.chk_progress_ring.blockSignals(True)
         self.chk_progress_ring.setChecked(
@@ -4292,6 +4315,8 @@ class MainWindow(QMainWindow):
         self.renderer.show_elev_profile = self.chk_elev_profile.isChecked()
         self.renderer.elev_profile_w = float(self.spin_elev_w.value())
         self.renderer.elev_profile_h = float(self.spin_elev_h.value())
+        for _key, sp in self._elev_scale_spins.items():
+            setattr(self.renderer, _key, sp.value() / 100.0)
         # 进度环设置（从 GUI 控件同步）
         self.renderer.show_progress_ring = self.chk_progress_ring.isChecked()
         self.renderer.progress_ring_style = \
@@ -4650,6 +4675,14 @@ class MainWindow(QMainWindow):
                                if self.renderer else 360.0),
             "elev_profile_h": (self.renderer.elev_profile_h
                                if self.renderer else 190.0),
+            "elev_title_scale": (self.renderer.elev_title_scale
+                                 if self.renderer else 1.0),
+            "elev_stat_scale": (self.renderer.elev_stat_scale
+                                if self.renderer else 1.0),
+            "elev_axis_scale": (self.renderer.elev_axis_scale
+                                if self.renderer else 1.0),
+            "elev_value_scale": (self.renderer.elev_value_scale
+                                 if self.renderer else 1.0),
             "elev_profile_pos": (list(self.renderer.elev_profile_pos)
                                  if self.renderer else [1536.0, 866.0]),
             "show_progress_ring": (self.renderer.show_progress_ring

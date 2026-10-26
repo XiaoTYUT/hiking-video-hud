@@ -793,6 +793,11 @@ class Renderer:
         self.show_elev_profile: bool = True
         self.elev_profile_w: float = 360.0
         self.elev_profile_h: float = 190.0
+        # 各档文字字号倍率（1.0 = 跟随面板尺寸自动推导的基准值）
+        self.elev_title_scale: float = 1.0   # 标题「海拔一览」
+        self.elev_stat_scale: float = 1.0    # 右上「最高 xxx m」
+        self.elev_axis_scale: float = 1.0    # 左侧海拔刻度 + 底部里程
+        self.elev_value_scale: float = 1.0   # 当前海拔气泡
         self.elev_profile_pos: Tuple[float, float] = (
             float(width - 384), float(height - 214))
         self._elev_cache = None              # 静态底图缓存（bg + 面积 + 曲线 + 刻度）
@@ -852,6 +857,9 @@ class Renderer:
         self.show_elev_profile = getattr(self, "show_elev_profile", True)
         self.elev_profile_w = getattr(self, "elev_profile_w", 360.0)
         self.elev_profile_h = getattr(self, "elev_profile_h", 190.0)
+        for _k in ("elev_title_scale", "elev_stat_scale",
+                   "elev_axis_scale", "elev_value_scale"):
+            setattr(self, _k, getattr(self, _k, 1.0))
         if not hasattr(self, "elev_profile_pos"):
             self.elev_profile_pos = (float(self.width - 384),
                                      float(self.height - 214))
@@ -1516,7 +1524,10 @@ class Renderer:
                 int(round(self.elev_profile_h * ss)), ss,
                 len(self.points), round(float(self.elev_min), 3),
                 round(float(self.elev_max), 3),
-                round(float(self.cum_dist[-1]), 3) if self.cum_dist else 0.0)
+                round(float(self.cum_dist[-1]), 3) if self.cum_dist else 0.0,
+                round(float(getattr(self, "elev_title_scale", 1.0)), 3),
+                round(float(getattr(self, "elev_stat_scale", 1.0)), 3),
+                round(float(getattr(self, "elev_axis_scale", 1.0)), 3))
 
     def _elev_profile_base(self, ss: int):
         """构建 / 复用海拔一览图的静态底图（背景 + 山形渐变 + 白色曲线 + 刻度）。
@@ -1576,8 +1587,11 @@ class Renderer:
             ld.line(pts, fill=ELEV_LINE, width=max(1, int(round(L["line_w"]))))
 
         # 标题 + 最高海拔（右上）
-        title_font = load_font(max(8, int(round(L["title_size"]))), bold=True)
-        stat_font = load_font(max(8, int(round(L["stat_size"]))))
+        ts = getattr(self, "elev_title_scale", 1.0)
+        sscl = getattr(self, "elev_stat_scale", 1.0)
+        title_font = load_font(
+            max(8, int(round(L["title_size"] * ts))), bold=True)
+        stat_font = load_font(max(8, int(round(L["stat_size"] * sscl))))
         t_stroke = max(1, int(round(ss)))
         ld.text((L["pad_x"], L["title_y"]), "海拔一览",
                 fill=(255, 255, 255, 245), font=title_font,
@@ -1589,7 +1603,8 @@ class Renderer:
                 stroke_width=t_stroke, stroke_fill=(0, 0, 0, 140))
 
         # 左侧海拔刻度：最高 / 最低（右对齐到绘图区左侧）
-        axis_font = load_font(max(8, int(round(L["axis_size"]))))
+        axis_font = load_font(max(8, int(round(
+            L["axis_size"] * getattr(self, "elev_axis_scale", 1.0)))))
         ast = max(1, int(round(ss)))
         for value, yy in ((self.elev_max, y0), (self.elev_min, y1)):
             txt = f"{value:.0f}"
@@ -1676,7 +1691,9 @@ class Renderer:
                    fill=ELEV_PROGRESS)
 
         # 4) 当前海拔气泡（跟随标记，默认在上方；贴近顶部时翻到下方）
-        vfont = load_font(max(8, int(round(L["value_size"]))), bold=True)
+        vfont = load_font(max(8, int(round(
+            L["value_size"] * getattr(self, "elev_value_scale", 1.0)))),
+            bold=True)
         txt = f"{e_cur:.0f} m"
         tb = ld.textbbox((0, 0), txt, font=vfont)
         tw, th = tb[2] - tb[0], tb[3] - tb[1]
