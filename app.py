@@ -15,11 +15,11 @@ from datetime import datetime
 from pathlib import Path
 from PyQt5.QtCore import Qt, QPointF, QRectF, QThread, pyqtSignal, QStandardPaths, QTimer
 from PyQt5.QtGui import (QPen, QColor, QBrush, QPainterPath, QPainter, QFont,
-                         QFontMetrics, QPixmap, QPolygonF)
+                         QFontMetrics, QPixmap, QPolygonF, QTransform)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGraphicsView, QGraphicsScene,
     QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem, QGraphicsEllipseItem,
-    QGraphicsTextItem,
+    QGraphicsTextItem, QGraphicsPolygonItem,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QFileDialog, QMessageBox, QGroupBox, QFormLayout, QTextEdit,
     QProgressBar, QDockWidget, QStatusBar, QFrame, QSizePolicy,
@@ -31,7 +31,11 @@ from PyQt5.QtWidgets import (
 
 from renderer import (Renderer, format_duration, format_pace,
                       _fetch_tile, _wgs84_to_gcj02, _lonlat_to_webmerc_px,
-                      _webmerc_px_to_lonlat)
+                      _webmerc_px_to_lonlat,
+                      GAUGE_COLD_DEFAULT, GAUGE_WARM_DEFAULT,
+                      gauge_layout, gauge_y, gauge_band_colors,
+                      gauge_value_color, gauge_format_pct,
+                      _fit_font_size, SLOPE_LIMIT_PCT)
 
 # ─────────────────────── 工程文件 & 全局设置 持久化 ───────────────────────
 # 全局 settings.json 存放在系统用户配置目录（Windows: %APPDATA%\KmlPath），
@@ -41,11 +45,13 @@ from renderer import (Renderer, format_duration, format_pace,
 # 工程文件字段：从旧 settings.json 抽出的渲染相关键
 _PROJECT_FIELDS = (
     "kml_path", "canvas", "line_width", "node_font_size", "node_color",
+    "unvisited_color", "visited_color", "start_color", "end_color",
     "duration", "fps", "panel_fields", "key_nodes",
     "use_segments", "segments",
     "trajectory", "panel", "map",
     "show_map", "map_zoom", "map_shape", "map_text_delta",
-    "map_arrow_size", "map_heading_up",
+    "map_arrow_size", "map_heading_up", "map_show_trajectory",
+    "map_traj_ahead_m",
 )
 
 
@@ -221,13 +227,22 @@ def _notify_main_dirty(item) -> None:
         p._mark_dirty()
 
 
+def _notify_main_scale(item, kind: str, value: float) -> None:
+    """预览框内组件被滚轮缩放后：把最新数值回写到设置面板对应控件。
+    kind: "trajectory" / "panel" / "map" / "gauge"
+    """
+    p = item.scene().parent() if item.scene() else None
+    if p is not None and hasattr(p, "_on_preview_scaled"):
+        p._on_preview_scaled(kind, value)
+
+
 # ─────────────────────── 可拖拽轨迹 Item ───────────────────────
 
 class DraggablePathItem(QGraphicsPathItem):
     def __init__(self, path: QPainterPath, renderer: Renderer):
         super().__init__(path)
         self.renderer = renderer
-        self._apply_pen()  # 紫色 = 未走轨迹，粗细由 renderer.trajectory_width 决定
+        self._apply_pen()  # 未走轨迹色，粗细由 renderer.trajectory_width 决定
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
@@ -237,7 +252,7 @@ class DraggablePathItem(QGraphicsPathItem):
         self.setTransformOriginPoint(self._anchor)
 
     def wheelEvent(self, event):
-        factor = 1.15 if event.delta() > 0 else 1 / 1.15
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         # Qt5 必须用 setScale（scale(sx,sy) 旧 API 已移除）
         self.setScale(self.scale() * factor)
         self._sync()
@@ -257,11 +272,17 @@ class DraggablePathItem(QGraphicsPathItem):
         self.renderer.trajectory_center = (self._anchor.x(), self._anchor.y())
         self.scene().update()
         _notify_main_dirty(self)
+        _notify_main_scale(self, "trajectory", self.scale())
 
     def _apply_pen(self, hover: bool = False):
         """按 renderer.trajectory_width 设置画笔（与视频线宽同源，所见即所得）。"""
         w = self.renderer.trajectory_width + (2 if hover else 0)
-        color = QColor(210, 160, 255, 250) if hover else QColor(180, 100, 255, 220)
+        base = self.renderer.unvisited_color
+        if hover:
+            # 悬停提亮（混合白色）
+            base = (min(255, base[0] + 30), min(255, base[1] + 60),
+                    min(255, base[2] + 0))
+        color = QColor(base[0], base[1], base[2], 250 if hover else 220)
         self.setPen(QPen(color, w))
 
     def hoverEnterEvent(self, event):
@@ -317,7 +338,7 @@ class DataPanelItem(QGraphicsRectItem):
         return cls.TOP_PAD + (n - 1) * cls.ROW_H + cls.LAST_H + cls.BOTTOM_PAD
 
     def wheelEvent(self, event):
-        factor = 1.15 if event.delta() > 0 else 1 / 1.15
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         # 不用 Qt setScale：缩放由 _s 驱动 rect+paint 统一变化，
         # 避免“Qt 变换 × paint 内 s”双重放大导致文字溢出、标签被数值遮挡
         # 下限 0.5：字号有 8px 最小可读下限，再小会导致标签与数值重叠
@@ -353,6 +374,7 @@ class DataPanelItem(QGraphicsRectItem):
         self.renderer.panel_scale = self._s
         self.scene().update()
         _notify_main_dirty(self)
+        _notify_main_scale(self, "panel", self._s)
 
     def paint(self, painter, option, widget=None):
         # 布局与 renderer._draw_panel 完全同构：背景/字号/间距全部 = 基准值 * s，
@@ -365,7 +387,7 @@ class DataPanelItem(QGraphicsRectItem):
         ascent = self.renderer.cum_ascent[-1]
         dist_km = self.renderer.cum_dist[-1] / 1000.0
         elev = self.renderer.points_smoothed[-1][2]
-        slope = self.renderer.slope_deg[-1]
+        slope = self.renderer.slope_pct[-1]
         pace = self.renderer.pace_s[-1]
 
         # setPixelSize 与视频端 PIL 像素字号一致，保证所见即所得
@@ -378,7 +400,7 @@ class DataPanelItem(QGraphicsRectItem):
         # 预览显示终值：运动耗时/总耗时按元数据口径（与视频末帧一致）
         rows_all = [
             ("当前海拔", f"{elev:.0f} m",          QColor(200, 160, 255)),
-            ("当前坡度", f"{slope:+.1f}°",         QColor(255, 170, 200)),
+            ("当前坡度", f"{slope:+.0f}%",         QColor(255, 170, 200)),
             ("累计爬升", f"{ascent:.1f} m",         QColor(80, 220, 120)),
             ("已行里程", f"{dist_km:.2f} km",        QColor(255, 210, 90)),
             ("当前配速", format_pace(pace),          QColor(140, 255, 220)),
@@ -456,12 +478,14 @@ class MapPanelItem(QGraphicsRectItem):
         self._label.setPos(10, 10)
 
     def wheelEvent(self, event):
-        factor = 1.15 if event.delta() > 0 else 1 / 1.15
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self._s = max(0.3, min(6.0, self._s * factor))
         size = self.renderer.map_size * self._s
         self.setRect(0, 0, size, size)
         self.renderer.map_scale = self._s
         self.scene().update()
+        _notify_main_dirty(self)
+        _notify_main_scale(self, "map", self._s)
 
     def paint(self, painter, option, widget=None):
         """方形走默认绘制；圆形画椭圆占位（与视频输出形状一致）。"""
@@ -479,8 +503,10 @@ class MapPanelItem(QGraphicsRectItem):
     def _sync(self):
         pos = self.pos()
         self.renderer.map_pos = (pos.x(), pos.y())
+        self.renderer.map_scale = self._s
         self.scene().update()
         _notify_main_dirty(self)
+        _notify_main_scale(self, "map", self._s)
 
     def hoverEnterEvent(self, event):
         self.setPen(QPen(QColor(120, 200, 255, 240), 3))
@@ -493,9 +519,28 @@ class MapPanelItem(QGraphicsRectItem):
 
 # ─────────────────────── 动态坡度仪 Item ───────────────────────
 
+def _ui_font(px: int) -> QFont:
+    """GUI 预览字体（与视频端 msyh 一致，保证所见即所得）。"""
+    f = QFont("Microsoft YaHei")
+    f.setPixelSize(max(8, int(round(px))))
+    return f
+
+
+def _paint_outlined_text(painter, text, rect, color, font):
+    """黑边描边文字（Qt 无原生描边，用 8 方向偏移近似，与视频端 PIL 描边一致）。"""
+    painter.setFont(font)
+    painter.setPen(QColor(0, 0, 0, 255))
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                   (-1, -1), (-1, 1), (1, -1), (1, 1)):
+        painter.drawText(rect.translated(dx, dy), Qt.AlignCenter, text)
+    painter.setPen(color)
+    painter.drawText(rect, Qt.AlignCenter, text)
+
+
 class SlopeGaugeItem(QGraphicsRectItem):
-    """动态坡度仪的 GUI 预览：直角三角形（斜边倾角 = 当前坡度）+ 标签/数值。
-    可拖拽定位 + 滚轮调大小（与视频输出 WYSIWYG，布局同 renderer._draw_slope_gauge）。"""
+    """动态坡度仪的 GUI 预览：竖直色阶尺（5 档色阶 + 刻度 + 主滑标）+ 百分比数值。
+    可拖拽定位 + 滚轮调大小；布局与配色复用 renderer 模块级常量
+    （gauge_layout / gauge_y / gauge_*），与视频端 renderer._draw_slope_gauge WYSIWYG。"""
 
     def __init__(self, renderer: Renderer):
         size = renderer.slope_gauge_size
@@ -510,12 +555,14 @@ class SlopeGaugeItem(QGraphicsRectItem):
         self.setAcceptHoverEvents(True)
 
     def wheelEvent(self, event):
-        factor = 1.15 if event.delta() > 0 else 1 / 1.15
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         size = max(60.0, min(600.0, self.renderer.slope_gauge_size * factor))
         self.renderer.slope_gauge_size = size
         self.prepareGeometryChange()
         self.setRect(0, 0, size, size)
         self.scene().update()
+        _notify_main_dirty(self)
+        _notify_main_scale(self, "gauge", size)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
@@ -538,13 +585,14 @@ class SlopeGaugeItem(QGraphicsRectItem):
         super().hoverLeaveEvent(event)
 
     def paint(self, painter, option, widget=None):
-        # 透明底：直角三角形（斜边倾角=坡度）+ 标签/数值，与视频端布局一致
+        # 透明底：竖直色阶尺 + 数值，布局与视频端同构
         size = self.rect().width()
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        n = len(self.renderer.points)
-        angle = (max(-32.0, min(32.0, self.renderer.gauge_angle(n - 1)))
-                 if n else 0.0)
+        r = self.renderer
+        n = len(r.points)
+        idx = r.preview_index() if n else 0.0
+        pct = r.gauge_pct(idx) if n else 0.0
 
         # 选中/悬停时用虚线框标出命中区范围（不参与视频输出）
         if self.isSelected() or self._hover:
@@ -552,55 +600,85 @@ class SlopeGaugeItem(QGraphicsRectItem):
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.rect())
 
-        # 直角三角形：下边（水平基线）+ 右端竖直闭合边 + 斜边（倾角 = 坡度）
-        vx, vy = 0.10 * size, 0.40 * size
-        arm = 0.55 * size
-        h = arm * math.tan(math.radians(angle))
-        h_min = 0.02 * size
-        if abs(h) < h_min:
-            h = h_min if angle >= 0 else -h_min
-        x2, y2 = vx + arm, vy - h   # y 向下：正坡度 y2 在基线上方
+        L = gauge_layout(size)
+        cold, warm = r.gauge_edge_bottom_color, r.gauge_edge_top_color
+        colors = gauge_band_colors(cold, warm)
+        bar_x0, bar_x1 = L["bar_x0"], L["bar_x1"]
+        bar_top, bar_bot = L["bar_top"], L["bar_bot"]
 
-        # 内部填充（颜色/透明度与视频端一致）
-        r = self.renderer
-        fa = int(round(max(0.0, min(100.0, r.gauge_fill_alpha_pct)) * 255 / 100))
-        fc = r.gauge_fill_color
+        # 1) 色阶条：5 档分段填充（冷端→青→绿→橙→暖端，不透明度与视频端一致）
+        alpha = int(round(max(0.0, min(100.0, r.gauge_fill_alpha_pct)) * 255 / 100))
+        bounds = [(-SLOPE_LIMIT_PCT, -25.0), (-25.0, -10.0), (-10.0, 10.0),
+                  (10.0, 25.0), (25.0, SLOPE_LIMIT_PCT)]
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(fc[0], fc[1], fc[2], fa))
-        painter.drawPolygon(QPolygonF([QPointF(vx, vy), QPointF(x2, vy),
-                                       QPointF(x2, y2)]))
+        for (lo, hi), c in zip(bounds, colors):
+            y_hi = gauge_y(hi, bar_top, bar_bot)
+            y_lo = gauge_y(lo, bar_top, bar_bot)
+            painter.setBrush(QColor(c[0], c[1], c[2], alpha))
+            painter.drawRect(QRectF(bar_x0, y_hi, bar_x1 - bar_x0, y_lo - y_hi))
 
-        # 边线：下边 = 下边颜色；竖直闭合边 + 上边（斜边）= 上边颜色
-        tc, bc = r.gauge_edge_top_color, r.gauge_edge_bottom_color
-        painter.setPen(QPen(QColor(bc[0], bc[1], bc[2], 255), 2))
-        painter.drawLine(QPointF(vx, vy), QPointF(x2, vy))
-        painter.setPen(QPen(QColor(tc[0], tc[1], tc[2], 255), 2))
-        painter.drawLine(QPointF(x2, vy), QPointF(x2, y2))
-        painter.drawLine(QPointF(vx, vy), QPointF(x2, y2))
+        # 2) 刻度：主刻度带百分比文本 + 次刻度短线；0% 基线贯穿色阶条并加粗
+        tick_font = _ui_font(int(round(r.gauge_label_size
+                                       * L["tick_font_ratio"])))
+        fm_tick = QFontMetrics(tick_font)
+        tick_h = fm_tick.height()
+        show_minor = ((15.0 / (2 * SLOPE_LIMIT_PCT)) * (bar_bot - bar_top)
+                      >= 1.7 * tick_h)
+        labeled = ({60.0, 25.0, 10.0, 0.0, -10.0, -25.0, -60.0} if show_minor
+                   else {60.0, 25.0, 0.0, -25.0, -60.0})
+        for v in (60.0, 40.0, 25.0, 10.0, 0.0, -10.0, -25.0, -40.0, -60.0):
+            y = gauge_y(v, bar_top, bar_bot)
+            zero = abs(v) < 1e-6
+            major = v in labeled
+            if zero:
+                painter.setPen(QPen(QColor(255, 255, 255, 240), 2))
+                painter.drawLine(QPointF(bar_x0 - L["tick_len"] * 1.8, y),
+                                 QPointF(bar_x1, y))
+            else:
+                painter.setPen(QPen(QColor(255, 255, 255, 215 if major else 140),
+                                    2 if major else 1))
+                painter.drawLine(
+                    QPointF(bar_x0 - L["tick_len"] * (1.0 if major else 0.55), y),
+                    QPointF(bar_x0, y))
+            if major or zero:
+                txt = gauge_format_pct(v)
+                tw = fm_tick.horizontalAdvance(txt)
+                _paint_outlined_text(
+                    painter, txt,
+                    QRectF(L["tick_label_right"] - tw - 2, y - tick_h / 2,
+                           tw + 8, tick_h),
+                    QColor(255, 255, 255), tick_font)
+        painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(QRectF(bar_x0, bar_top, bar_x1 - bar_x0,
+                                bar_bot - bar_top))
 
-        # 文字：「坡度」标签 + 数值（各自字号/颜色，黑边描边，垂直居中对齐）
-        label, value = "坡度", f"{angle:+.1f}°"
-        lf = QFont("Microsoft YaHei")
-        lf.setPixelSize(max(8, int(round(r.gauge_label_size))))
-        vf = QFont("Microsoft YaHei")
-        vf.setPixelSize(max(8, int(round(r.gauge_value_size))))
-        fm_l, fm_v = QFontMetrics(lf), QFontMetrics(vf)
-        lwd, vwd = fm_l.horizontalAdvance(label), fm_v.horizontalAdvance(value)
-        gap = 0.05 * size
-        x0 = size / 2 - (lwd + gap + vwd) / 2
-        cy = size * 0.84
-        lc, vc = r.gauge_label_color, r.gauge_value_color
-        lrect = QRectF(x0, cy - fm_l.height() / 2, lwd + 8, fm_l.height() + 2)
-        vrect = QRectF(x0 + lwd + gap, cy - fm_v.height() / 2, vwd + 8,
-                       fm_v.height() + 2)
-        for rect, txt, col, fnt in [(lrect, label, lc, lf), (vrect, value, vc, vf)]:
-            painter.setFont(fnt)
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                painter.setPen(QColor(0, 0, 0, 255))
-                painter.drawText(rect.translated(dx, dy),
-                                 Qt.AlignLeft | Qt.AlignVCenter, txt)
-            painter.setPen(QColor(col[0], col[1], col[2], 255))
-            painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, txt)
+        # 3) 主滑标：贯穿色阶条的白色基准线 + 右侧实心三角（颜色 = 当前档位连续渐变色）
+        y_mark = gauge_y(pct, bar_top, bar_bot)
+        vc = gauge_value_color(pct, cold, warm)
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 1))
+        painter.drawLine(QPointF(bar_x0, y_mark), QPointF(bar_x1, y_mark))
+        mh = L["mark_half"]
+        painter.setPen(QPen(QColor(255, 255, 255, 255), 1))
+        painter.setBrush(QColor(vc[0], vc[1], vc[2], 255))
+        # 三角顶点朝左指向色阶（与视频端一致）
+        painter.drawPolygon(QPolygonF([QPointF(L["mark_base"], y_mark - mh),
+                                       QPointF(L["mark_base"], y_mark + mh),
+                                       QPointF(bar_x1, y_mark)]))
+
+        # 4) 数值（整数百分比，颜色连续渐变；超宽时等比收缩字号防越界）
+        value = gauge_format_pct(pct)
+        vfs = _fit_font_size(
+            lambda fs: QFontMetrics(_ui_font(fs)).horizontalAdvance(value),
+            int(round(r.gauge_value_size)), 0.90 * size)
+        vf = _ui_font(vfs)
+        fm_v = QFontMetrics(vf)
+        vw = fm_v.horizontalAdvance(value)
+        _paint_outlined_text(
+            painter, value,
+            QRectF(L["text_cx"] - vw / 2 - 4, L["value_cy"] - fm_v.height() / 2,
+                   vw + 8, fm_v.height()),
+            QColor(vc[0], vc[1], vc[2]), vf)
 
 
 # ─────────────────────── CanvasView ───────────────────────
@@ -788,56 +866,140 @@ class CutPointItem(QGraphicsEllipseItem):
         self.setToolTip(f"分割点 {num}（进度 {cut*100:.1f}%）——右键删除")
 
 
-class _DurSpin(QSpinBox):
-    """段时长输入框：禁用滚轮与键盘上下键调整（方向键留给轨迹预览平移用）。"""
+class _NoWheelSpin(QSpinBox):
+    """禁用滚轮与上下键的 spinbox（方向键留给轨迹预览平移用）。"""
 
     def wheelEvent(self, e):
-        e.ignore()   # 吞掉滚轮：不调整数值，避免误改分段截止时间
+        e.ignore()
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Up, Qt.Key_Down,
                        Qt.Key_PageUp, Qt.Key_PageDown):
-            return  # 吞掉：不调整数值
+            return
         super().keyPressEvent(e)
 
 
+class TimeFrameEdit(QWidget):
+    """时:分:秒:帧 组合输入框，内部以「帧数」为唯一数据模型。
+
+    帧数 = (h*3600 + m*60 + s) * fps + frame
+    改 fps 时帧数不变，仅刷新 4 个 spinbox 的显示与帧范围。
+    """
+
+    valueChanged = pyqtSignal(int)   # 参数：总帧数
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fps = 30
+        self._frames = 0
+        self._block = False
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+
+        self.sp_h = _NoWheelSpin(); self.sp_h.setRange(0, 23)
+        self.sp_m = _NoWheelSpin(); self.sp_m.setRange(0, 59)
+        self.sp_s = _NoWheelSpin(); self.sp_s.setRange(0, 59)
+        self.sp_f = _NoWheelSpin(); self.sp_f.setRange(0, self._fps - 1)
+
+        for sp in (self.sp_h, self.sp_m, self.sp_s, self.sp_f):
+            sp.setKeyboardTracking(False)
+            sp.setFixedWidth(42)
+            sp.setAlignment(Qt.AlignCenter)
+
+        lay.addWidget(self.sp_h)
+        lay.addWidget(QLabel(":"))
+        lay.addWidget(self.sp_m)
+        lay.addWidget(QLabel(":"))
+        lay.addWidget(self.sp_s)
+        lay.addWidget(QLabel(":"))
+        lay.addWidget(self.sp_f)
+
+        self.sp_h.valueChanged.connect(self._on_changed)
+        self.sp_m.valueChanged.connect(self._on_changed)
+        self.sp_s.valueChanged.connect(self._on_changed)
+        self.sp_f.valueChanged.connect(self._on_changed)
+
+    def set_fps(self, fps: int):
+        fps = max(1, int(fps))
+        if fps == self._fps:
+            return
+        self._fps = fps
+        self.sp_f.setRange(0, fps - 1)
+        # 帧数不变，刷新显示
+        self._update_spins_from_frames()
+
+    def total_frames(self) -> int:
+        h = self.sp_h.value()
+        m = self.sp_m.value()
+        s = self.sp_s.value()
+        f = self.sp_f.value()
+        return (h * 3600 + m * 60 + s) * self._fps + f
+
+    def set_total_frames(self, frames: int):
+        self._frames = max(0, int(frames))
+        self._update_spins_from_frames()
+
+    def _update_spins_from_frames(self):
+        self._block = True
+        fps = self._fps
+        total_s, f = divmod(self._frames, fps)
+        h, rem = divmod(total_s, 3600)
+        m, s = divmod(rem, 60)
+        self.sp_h.setValue(h)
+        self.sp_m.setValue(m)
+        self.sp_s.setValue(s)
+        self.sp_f.setValue(f)
+        self._block = False
+
+    def _on_changed(self):
+        if self._block:
+            return
+        self._frames = self.total_frames()
+        self.valueChanged.emit(self._frames)
+
+
 class SegmentDialog(QDialog):
-    """分段视频设置：每段填写「截止时间」，各段独立，互不联动。
+    """分段视频设置：每段填写「截止时间（时:分:秒:帧）」，各段独立，互不联动。
 
     输入模型：
-      - 数据模型 = end_times（每段在视频中的截止秒数，长度=段数），是唯一编辑对象。
-      - 表格「截止时间」列直接编辑 end_times[i]，其它段完全不受影响。
-      - 视频总长 = 最后一段的截止时间（自动）。
-      - 校验：截止时间必须严格递增；若不满足（如前段 > 后段），
+      - 数据模型 = end_frames（每段在视频中的截止帧数，int），是唯一编辑对象。
+      - 表格「截止时间」列（时:分:秒:帧）直接编辑 end_frames[i]，其它段完全不受影响。
+      - 视频总长（秒）= 末段截止帧数 / fps（自动）。
+      - 校验：截止帧数必须严格递增；若不满足（如前段 ≥ 后段），
         不自动修改任何值，仅标红并禁用「确定」，无法保存。
       - 轨迹进度（cuts）由轨迹预览点击决定，与时间独立。
+      - fps 可在对话框顶部修改；改 fps 时帧数不变，仅时分秒帧显示刷新。
     段内仍按真实节奏线性压缩；段与段拼接连续。
     """
 
-    def __init__(self, renderer: Renderer, default_duration: int, parent=None):
+    def __init__(self, renderer: Renderer, default_duration: int, fps: int, parent=None):
         super().__init__(parent)
         self.setWindowTitle("分段视频设置")
-        self.resize(1040, 760)
+        self.resize(1120, 760)
         self.renderer = renderer
-        # 数据模型：end_times = 每段截止秒数（唯一编辑对象，各段独立）
-        # durations / cut_times / total_time 由 end_times 推导。
+        self.fps = max(1, int(fps))
+        self._orig_fps = self.fps   # 用于确定时判断是否需要同步回主界面
+        # 数据模型：end_frames = 每段截止帧数（唯一编辑对象，各段独立）
+        # durations_frames / cut_frames / total_frames 由 end_frames 推导。
         if renderer.segments:
             self.cuts = [float(c) for c in renderer.segments[0]]
-            durs = [max(1, int(d)) for d in renderer.segments[1]]
-            # durations → end_times（累加）
-            self.end_times = []
+            durs = [max(1, float(d)) for d in renderer.segments[1]]   # 秒（可能是 float）
+            # durations(秒) → end_frames（累加）
+            self.end_frames = []
             acc = 0
             for d in durs:
-                acc += d
-                self.end_times.append(acc)
+                acc += max(1, int(round(d * self.fps)))
+                self.end_frames.append(acc)
         else:
             self.cuts = []
-            self.end_times = [max(1, default_duration)]
-        self._default_duration = max(1, default_duration)
+            self.end_frames = [max(1, int(round(default_duration * self.fps)))]
+        self._default_frames = max(1, int(round(default_duration * self.fps)))
         # 派生量
-        self.durations = []
-        self.cut_times = []
-        self.total_time = 0
+        self.durations_frames = []
+        self.cut_frames = []
+        self.total_frames = 0
         self._recompute()
 
         # 动态瓦片地图状态（_build_map_layer 初始化）
@@ -852,18 +1014,26 @@ class SegmentDialog(QDialog):
 
         lay = QVBoxLayout(self)
         tip = QLabel("滚轮缩放 · 方向键（↑↓←→）平移 · 左键点击轨迹添加分割点 · 右键删除\n"
-                     "「截止时间」逐段独立填写，互不影响；"
+                     "「截止时间」逐段独立填写（时:分:秒:帧），互不影响；"
                      "若前段截止时间 ≥ 后段，将标红并禁止保存")
         tip.setWordWrap(True)
         lay.addWidget(tip)
 
-        # 顶部：视频总长（只读 = 末段截止时间）
-        row_total = QHBoxLayout()
+        # 顶部：帧率设置 + 视频总长
+        row_top = QHBoxLayout()
+        row_top.addWidget(QLabel("帧率"))
+        self.spin_fps = QSpinBox()
+        self.spin_fps.setRange(1, 120)
+        self.spin_fps.setValue(self.fps)
+        self.spin_fps.setSuffix(" fps")
+        self.spin_fps.valueChanged.connect(self._on_fps_changed)
+        row_top.addWidget(self.spin_fps)
+        row_top.addSpacing(30)
         self.lbl_total_top = QLabel()
         self.lbl_total_top.setStyleSheet("font-weight: bold;")
-        row_total.addWidget(self.lbl_total_top)
-        row_total.addStretch()
-        lay.addLayout(row_total)
+        row_top.addWidget(self.lbl_total_top)
+        row_top.addStretch()
+        lay.addLayout(row_top)
 
         # 轨迹预览
         self.scene = QGraphicsScene()
@@ -877,8 +1047,9 @@ class SegmentDialog(QDialog):
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
-            ["段", "轨迹进度", "对应墙钟时间", "视频时间范围", "截止时间 (s)"])
+            ["段", "轨迹进度", "对应墙钟时间", "视频时间范围", "截止时间 (时:分:秒:帧)"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         lay.addWidget(self.table, 1)
@@ -907,21 +1078,34 @@ class SegmentDialog(QDialog):
         self._build_scene()
         self._refresh_table()
 
+    # ── 帧 ↔ 时:分:秒:帧 转换 ──
+
+    def _frames_to_hmsf(self, frames: int):
+        """帧数 → (h, m, s, f)。"""
+        total_s, f = divmod(max(0, int(frames)), self.fps)
+        h, rem = divmod(total_s, 3600)
+        m, s = divmod(rem, 60)
+        return h, m, s, f
+
+    def _fmt_hmsf(self, frames: int) -> str:
+        h, m, s, f = self._frames_to_hmsf(frames)
+        return f"{h:02d}:{m:02d}:{s:02d}:{f:02d}"
+
     def _recompute(self):
-        """由 end_times 推算 durations / cut_times / total_time（派生量）。"""
+        """由 end_frames 推算 durations_frames / cut_frames / total_frames（派生量）。"""
         prev = 0
-        self.durations = []
-        for t in self.end_times:
-            self.durations.append(max(1, t - prev))
+        self.durations_frames = []
+        for t in self.end_frames:
+            self.durations_frames.append(max(1, t - prev))
             prev = t
-        self.cut_times = list(self.end_times[:-1])
-        self.total_time = self.end_times[-1] if self.end_times else 0
+        self.cut_frames = list(self.end_frames[:-1])
+        self.total_frames = self.end_frames[-1] if self.end_frames else 0
 
     def _validate(self):
-        """校验 end_times 严格递增；返回 (ok, [非法行号...])。不修改任何值。"""
+        """校验 end_frames 严格递增；返回 (ok, [非法行号...])。不修改任何值。"""
         bad = []
-        for i, t in enumerate(self.end_times):
-            if t < 1 or (i > 0 and t <= self.end_times[i - 1]):
+        for i, t in enumerate(self.end_frames):
+            if t < 1 or (i > 0 and t <= self.end_frames[i - 1]):
                 bad.append(i)
         return (not bad, bad)
 
@@ -930,9 +1114,9 @@ class SegmentDialog(QDialog):
         ok, bad = self._validate()
         bad_set = set(bad)
         for i in range(self.table.rowCount()):
-            spin = self.table.cellWidget(i, 4)
-            if spin is not None:
-                spin.setStyleSheet(
+            w = self.table.cellWidget(i, 4)
+            if w is not None:
+                w.setStyleSheet(
                     "QSpinBox { border: 2px solid #ff5050; }"
                     if i in bad_set else "")
         if ok:
@@ -944,6 +1128,17 @@ class SegmentDialog(QDialog):
             self.lbl_warn.show()
         if self._btn_ok is not None:
             self._btn_ok.setEnabled(ok)
+
+    def _on_fps_changed(self, val: int):
+        """帧率变化：帧数不变，仅刷新所有 时:分:秒:帧 显示与帧范围。"""
+        self.fps = max(1, int(val))
+        for i in range(self.table.rowCount()):
+            w = self.table.cellWidget(i, 4)
+            if isinstance(w, TimeFrameEdit):
+                w.set_fps(self.fps)
+        # 帧数不变 → 时分秒帧显示刷新；时间范围列也需刷新（秒数 = 帧数/fps 变了）
+        self._refresh_time_cols()
+        self._update_total()
 
     def accept(self):
         """保存前最终校验：非法时阻止关闭（双保险，正常已被禁用确定）。"""
@@ -968,15 +1163,16 @@ class SegmentDialog(QDialog):
             else:
                 path.lineTo(x, y)
         pi = QGraphicsPathItem(path)
-        pen = QPen(QColor(180, 100, 255, 220), 3)
+        uc = r.unvisited_color
+        pen = QPen(QColor(uc[0], uc[1], uc[2], 220), 3)
         pen.setCosmetic(True)                    # 屏幕恒 3px，放大不变粗
         pi.setPen(pen)
         self.scene.addItem(pi)
         # 起终点
         self._end_items = []
         if len(r.base_projected) >= 2:
-            for (px, py), color in [(r.base_projected[0], (100, 240, 120)),
-                                     (r.base_projected[-1], (240, 80, 80))]:
+            for (px, py), color in [(r.base_projected[0], r.start_color),
+                                     (r.base_projected[-1], r.end_color)]:
                 it = QGraphicsEllipseItem(px - 10, py - 10, 20, 20)
                 it.setTransformOriginPoint(px, py)
                 it.setBrush(QBrush(QColor(*color)))
@@ -1116,8 +1312,13 @@ class SegmentDialog(QDialog):
                 sx1, sy1 = r._project(w_lon_r, w_lat_b)
                 item = QGraphicsPixmapItem(pix)
                 item.setPos(sx0, sy0)
-                # 均匀缩放：256px 瓦片 → (sx1-sx0) scene 宽度（局部小区域 y 非线性误差忽略）
-                item.setScale(max(sx1 - sx0, 1e-6) / 256.0)
+                # 非均匀缩放：墨卡托瓦片横向跨 Δlon、纵向只跨 Δlon·cos(lat)，
+                # 而场景投影是线性度数（横纵同比例）。必须横纵各自缩放到投影后
+                # 矩形，否则瓦片纵向被拉高 1/cos(lat)≈1.2 倍，相邻瓦片对不齐
+                tr = QTransform()
+                tr.scale(max(sx1 - sx0, 1e-6) / 256.0,
+                         max(sy1 - sy0, 1e-6) / 256.0)
+                item.setTransform(tr)
                 item.setZValue(-1)
                 self.scene.addItem(item)
                 self._map_tiles[key] = item
@@ -1161,10 +1362,10 @@ class SegmentDialog(QDialog):
         import bisect
         pos = bisect.bisect(self.cuts, c)
         self.cuts.insert(pos, c)
-        prev_end = self.end_times[pos - 1] if pos > 0 else 0
-        this_end = self.end_times[pos] if pos < len(self.end_times) else self._default_duration
+        prev_end = self.end_frames[pos - 1] if pos > 0 else 0
+        this_end = self.end_frames[pos] if pos < len(self.end_frames) else self._default_frames
         mid = max(prev_end + 1, (prev_end + this_end) // 2)
-        self.end_times.insert(pos, mid)   # 原段截止=mid，新段截止=原截止
+        self.end_frames.insert(pos, mid)   # 原段截止=mid，新段截止=原截止
         self._recompute()
         self._rebuild_cut_items()
         self._refresh_table()
@@ -1187,15 +1388,15 @@ class SegmentDialog(QDialog):
             pos = self.cuts.index(cut)
             self.cuts.pop(pos)
             # 合并段 pos 与 pos+1：删除前段的截止（保留后段截止）
-            if pos < len(self.end_times) - 1:
-                del self.end_times[pos]
+            if pos < len(self.end_frames) - 1:
+                del self.end_frames[pos]
             self._recompute()
             self._rebuild_cut_items()
             self._refresh_table()
 
     def _clear_all(self):
         self.cuts = []
-        self.end_times = [self._default_duration]
+        self.end_frames = [self._default_frames]
         self._recompute()
         self._rebuild_cut_items()
         self._refresh_table()
@@ -1219,9 +1420,9 @@ class SegmentDialog(QDialog):
         self.table.setRowCount(nseg)
         for i in range(nseg):
             a, b = bounds[i], bounds[i + 1]
-            # 段视频时间边界（cut_times 已由 durations 推导）
-            t_start = self.cut_times[i - 1] if i > 0 else 0
-            t_end = self.cut_times[i] if i < len(self.cut_times) else self.total_time
+            # 段视频帧边界（cut_frames 已由 durations_frames 推导）
+            f_start = self.cut_frames[i - 1] if i > 0 else 0
+            f_end = self.cut_frames[i] if i < len(self.cut_frames) else self.total_frames
 
             it = QTableWidgetItem(f"第 {i + 1} 段")
             it.setTextAlignment(Qt.AlignCenter)
@@ -1232,58 +1433,62 @@ class SegmentDialog(QDialog):
             it = QTableWidgetItem(f"{self._fmt_time(a)} → {self._fmt_time(b)}")
             it.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(i, 2, it)
-            it = QTableWidgetItem(f"{t_start}s → {t_end}s")
+            it = QTableWidgetItem(f"{self._fmt_hmsf(f_start)} → {self._fmt_hmsf(f_end)}")
             it.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(i, 3, it)
-            # 截止时间 spinbox：直接编辑 end_times[i]，各段独立，互不联动
-            spin = _DurSpin()
-            spin.setRange(1, 36000)
-            spin.setKeyboardTracking(False)   # 输入完按回车/失焦才生效，避免逐键刷新
-            spin.blockSignals(True)           # setValue 不触发回调
-            spin.setValue(self.end_times[i])
-            spin.blockSignals(False)
-            spin.setToolTip("该段在视频中截止的秒数；必须大于前一段，否则无法保存")
-            spin.valueChanged.connect(lambda v, idx=i: self._on_end_time_changed(idx, v))
-            self.table.setCellWidget(i, 4, spin)
+            # 截止时间 时:分:秒:帧 编辑器：直接编辑 end_frames[i]，各段独立
+            edit = TimeFrameEdit()
+            edit.set_fps(self.fps)
+            edit.set_total_frames(self.end_frames[i])
+            edit.setToolTip("该段在视频中截止的时:分:秒:帧；必须大于前一段，否则无法保存")
+            edit.valueChanged.connect(lambda v, idx=i: self._on_end_time_changed(idx, v))
+            self.table.setCellWidget(i, 4, edit)
         self._update_total()
         self._apply_validation()
 
     def _on_end_time_changed(self, idx: int, val: int):
-        """段idx截止时间变化：只改 end_times[idx]，其它段不受影响；校验并联动 UI。"""
-        if 0 <= idx < len(self.end_times):
-            self.end_times[idx] = int(val)
+        """段idx截止帧数变化：只改 end_frames[idx]，其它段不受影响；校验并联动 UI。"""
+        if 0 <= idx < len(self.end_frames):
+            self.end_frames[idx] = int(val)
         self._recompute()
-        # 只刷新时间范围/总长/校验，不重建 spinbox（避免打断继续输入）
+        # 只刷新时间范围/总长/校验，不重建输入框（避免打断继续输入）
         self._refresh_time_cols()
         self._apply_validation()
 
     def _refresh_time_cols(self):
         """只更新「视频时间范围」只读列与总长标签（不动输入框）。"""
         for i in range(self.table.rowCount()):
-            t_start = self.cut_times[i - 1] if i > 0 else 0
-            t_end = self.cut_times[i] if i < len(self.cut_times) else self.total_time
+            f_start = self.cut_frames[i - 1] if i > 0 else 0
+            f_end = self.cut_frames[i] if i < len(self.cut_frames) else self.total_frames
             it = self.table.item(i, 3)
             if it is not None:
-                it.setText(f"{t_start}s → {t_end}s")
+                it.setText(f"{self._fmt_hmsf(f_start)} → {self._fmt_hmsf(f_end)}")
         self._update_total()
 
     def _update_total(self):
         nseg = len(self.cuts) + 1
-        self.lbl_total.setText(f"共 {nseg} 段 · 视频总长 {self.total_time} s")
-        self.lbl_total_top.setText(f"视频总长： {self.total_time} s（= 末段截止时间）")
+        total_s = self.total_frames / self.fps
+        self.lbl_total.setText(
+            f"共 {nseg} 段 · 视频总长 {self._fmt_hmsf(self.total_frames)}（{total_s:.2f} s）")
+        self.lbl_total_top.setText(
+            f"视频总长： {self._fmt_hmsf(self.total_frames)}（= 末段截止时间，{total_s:.2f} s）")
 
     def result_segments(self):
         """返回 (cuts, durations) 供 Renderer 使用；cuts 为空表示未分段。
-        仅在 accept() 校验通过后调用（end_times 严格递增）。"""
+        durations 单位为秒（float，精度到帧 = 1/fps），renderer 端 round(dur*fps) 还原帧数。
+        仅在 accept() 校验通过后调用（end_frames 严格递增）。"""
         if not self.cuts:
             return None
-        # 由 end_times 推算每段时长
         durations = []
         prev = 0
-        for t in self.end_times:
-            durations.append(max(1, t - prev))
+        for t in self.end_frames:
+            durations.append(max(1, t - prev) / self.fps)
             prev = t
         return (list(self.cuts), durations)
+
+    def fps_changed(self) -> bool:
+        """对话框内帧率是否被修改过（确定时需同步回主界面）。"""
+        return self.fps != self._orig_fps
 
 
 # ─────────────────────── 关键节点编辑对话框 ───────────────────────
@@ -1470,15 +1675,53 @@ class NodeEditorDialog(QDialog):
             else:
                 path.lineTo(x, y)
         pi = QGraphicsPathItem(path)
-        pen = QPen(QColor(180, 100, 255, 220), 3)
+        uc = r.unvisited_color
+        pen = QPen(QColor(uc[0], uc[1], uc[2], 220), 3)
         pen.setCosmetic(True)
         pi.setPen(pen)
         self.scene.addItem(pi)
+        # 方向小箭头：沿轨迹等弧长分布，指示行进方向（仅编辑器预览）
+        self._arrow_items = []
+        pts = r.base_projected
+        if len(pts) >= 2:
+            seg_len = []
+            total = 0.0
+            for i in range(1, len(pts)):
+                d = math.hypot(pts[i][0] - pts[i - 1][0],
+                               pts[i][1] - pts[i - 1][1])
+                seg_len.append(d)
+                total += d
+            if total > 0:
+                interval = max(50.0, total / 120)  # 等弧长间隔，最多约120个
+                tri = QPolygonF([QPointF(6.0, 0.0), QPointF(-4.0, 3.8),
+                                 QPointF(-4.0, -3.8)])
+                target, acc = interval, 0.0
+                for i in range(1, len(pts)):
+                    x0, y0 = pts[i - 1]
+                    x1, y1 = pts[i]
+                    d = seg_len[i - 1]
+                    if d <= 0:
+                        continue
+                    while target <= acc + d and target < total - 1e-6:
+                        t = (target - acc) / d
+                        ar = QGraphicsPolygonItem(tri)
+                        ar.setPos(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+                        ar.setRotation(math.degrees(math.atan2(y1 - y0, x1 - x0)))
+                        ar.setBrush(QBrush(QColor(255, 255, 255, 235)))
+                        ap = QPen(QColor(0, 0, 0, 130), 1)
+                        ap.setCosmetic(True)
+                        ar.setPen(ap)
+                        ar.setZValue(5)
+                        ar.setAcceptedMouseButtons(Qt.NoButton)
+                        self.scene.addItem(ar)
+                        self._arrow_items.append(ar)
+                        target += interval
+                    acc += d
         # 起终点
         self._end_items = []
         if len(r.base_projected) >= 2:
-            for (px, py), color in [(r.base_projected[0], (100, 240, 120)),
-                                     (r.base_projected[-1], (240, 80, 80))]:
+            for (px, py), color in [(r.base_projected[0], r.start_color),
+                                     (r.base_projected[-1], r.end_color)]:
                 it = QGraphicsEllipseItem(px - 10, py - 10, 20, 20)
                 it.setTransformOriginPoint(px, py)
                 it.setBrush(QBrush(QColor(*color)))
@@ -1498,7 +1741,8 @@ class NodeEditorDialog(QDialog):
         """视图缩放时反向补偿标记（节点/起终点），保持屏幕尺寸不变。"""
         m = self.view.transform().m11()
         inv = 1.0 / m if m > 0 else 1.0
-        for it in self._node_items + getattr(self, "_end_items", []):
+        for it in (self._node_items + getattr(self, "_end_items", [])
+                   + getattr(self, "_arrow_items", [])):
             it.setScale(inv)
 
     # ── 地图层（复用 SegmentDialog 逻辑）──
@@ -1589,7 +1833,12 @@ class NodeEditorDialog(QDialog):
                 sx1, sy1 = r._project(w_lon_r, w_lat_b)
                 item = QGraphicsPixmapItem(pix)
                 item.setPos(sx0, sy0)
-                item.setScale(max(sx1 - sx0, 1e-6) / 256.0)
+                # 非均匀缩放（同 SegmentDialog）：纵向按投影后高度缩放，
+                # 否则瓦片纵向拉高 1/cos(lat) 倍导致相邻瓦片对不齐
+                tr = QTransform()
+                tr.scale(max(sx1 - sx0, 1e-6) / 256.0,
+                         max(sy1 - sy0, 1e-6) / 256.0)
+                item.setTransform(tr)
                 item.setZValue(-1)
                 self.scene.addItem(item)
                 self._map_tiles[key] = item
@@ -1930,6 +2179,15 @@ class MainWindow(QMainWindow):
         # 面板背景（半透明圆角条：宽度 / 外扩边距 / 不透明度 / 颜色）
         bg = QGroupBox("面板背景")
         bf = QFormLayout(bg)
+        self.spin_panel_scale = QSpinBox()
+        self.spin_panel_scale.setRange(50, 600)
+        self.spin_panel_scale.setSingleStep(5)
+        self.spin_panel_scale.setValue(100)
+        self.spin_panel_scale.setSuffix(" %")
+        self.spin_panel_scale.setToolTip(
+            "数据面板整体缩放（基准 100%）；也可在画布上对面板滚轮缩放")
+        self.spin_panel_scale.valueChanged.connect(self._on_panel_scale_changed)
+        bf.addRow("面板缩放", self.spin_panel_scale)
         self.spin_panel_bg_w = QSpinBox()
         self.spin_panel_bg_w.setRange(60, 1200)
         self.spin_panel_bg_w.setValue(320)
@@ -1965,14 +2223,21 @@ class MainWindow(QMainWindow):
         bf.addRow("背景颜色", self.btn_panel_bg_color)
         self._page_panel.addWidget(bg)
 
-        # 动态坡度仪（独立于数据面板的直角三角形，斜边倾角随坡度变化，可单独拖动/调大小）
+        # 动态坡度仪（竖直色阶尺：5 档色阶 + 刻度 + 主滑标，随坡度实时变化，可单独拖动/调大小）
         gg = QGroupBox("动态坡度仪")
         gf = QFormLayout(gg)
         self.chk_slope_gauge = QCheckBox("显示动态坡度仪")
         self.chk_slope_gauge.setChecked(bool(self.settings.get("show_slope_gauge", True)))
-        self.chk_slope_gauge.setToolTip("直角三角形坡度示意（斜边倾角 = 当前坡度，独立于数据面板，可单独拖动位置）")
+        self.chk_slope_gauge.setToolTip(
+            "竖直坡度色阶尺（滑标 + 百分比数值），独立于数据面板，可单独拖动位置")
         self.chk_slope_gauge.toggled.connect(self._on_slope_gauge_toggled)
         gf.addRow(self.chk_slope_gauge)
+        self.chk_gauge_preview = QCheckBox("画布预览播放（循环）")
+        self.chk_gauge_preview.setChecked(False)
+        self.chk_gauge_preview.setToolTip(
+            "让坡度仪在画布上循环播放整段轨迹的坡度变化，便于查看过渡效果（不影响视频输出）")
+        self.chk_gauge_preview.toggled.connect(self._on_gauge_preview_toggled)
+        gf.addRow(self.chk_gauge_preview)
         self.spin_gauge_size = QSpinBox()
         self.spin_gauge_size.setRange(60, 600)
         self.spin_gauge_size.setValue(_num(self.settings, "slope_gauge_size", 140))
@@ -1984,37 +2249,31 @@ class MainWindow(QMainWindow):
         self.spin_gauge_label_size.setRange(8, 60)
         self.spin_gauge_label_size.setValue(20)
         self.spin_gauge_label_size.setSuffix(" px")
-        self.spin_gauge_label_size.setToolTip("「坡度」标签文字的字号（基准 px）")
+        self.spin_gauge_label_size.setToolTip("刻度文字的字号（基准 px）")
         self.spin_gauge_label_size.valueChanged.connect(self._on_gauge_style_changed)
-        gf.addRow("标签字号", self.spin_gauge_label_size)
+        gf.addRow("刻度字号", self.spin_gauge_label_size)
         self.spin_gauge_value_size = QSpinBox()
         self.spin_gauge_value_size.setRange(8, 72)
         self.spin_gauge_value_size.setValue(24)
         self.spin_gauge_value_size.setSuffix(" px")
-        self.spin_gauge_value_size.setToolTip("坡度数值文字的字号（基准 px）")
+        self.spin_gauge_value_size.setToolTip("坡度百分比数值的字号（基准 px）")
         self.spin_gauge_value_size.valueChanged.connect(self._on_gauge_style_changed)
         gf.addRow("数值字号", self.spin_gauge_value_size)
         self.spin_gauge_alpha = QSpinBox()
         self.spin_gauge_alpha.setRange(0, 100)
-        self.spin_gauge_alpha.setValue(30)
+        self.spin_gauge_alpha.setValue(85)
         self.spin_gauge_alpha.setSuffix(" %")
-        self.spin_gauge_alpha.setToolTip("三角形内部填充不透明度：0 = 全透明，100 = 不透明")
+        self.spin_gauge_alpha.setToolTip("色阶条不透明度：0 = 全透明，100 = 不透明")
         self.spin_gauge_alpha.valueChanged.connect(self._on_gauge_style_changed)
-        gf.addRow("填充透明度", self.spin_gauge_alpha)
-        # 五个颜色配置：上边（斜边）/ 下边（基线）/ 内部填充 / 标签 / 数值
+        gf.addRow("色阶条不透明度", self.spin_gauge_alpha)
+        # 颜色配置：色阶冷端（下坡）/ 暖端（上坡）；数值颜色由 5 档色阶自动连续渐变
         self._gauge_colors = {
-            "edge_top": QColor(255, 170, 40),
-            "edge_bottom": QColor(255, 255, 255),
-            "fill": QColor(255, 170, 40),
-            "label": QColor(255, 255, 255),
-            "value": QColor(255, 255, 255),
+            "edge_top": QColor(*GAUGE_WARM_DEFAULT),
+            "edge_bottom": QColor(*GAUGE_COLD_DEFAULT),
         }
         self.btn_gauge_color = {}
-        for key, text in [("edge_top", "上边颜色"),
-                          ("edge_bottom", "下边颜色"),
-                          ("fill", "填充颜色"),
-                          ("label", "标签颜色"),
-                          ("value", "数值颜色")]:
+        for key, text in [("edge_top", "暖端颜色"),
+                          ("edge_bottom", "冷端颜色")]:
             btn = QPushButton(f"{text}…")
             btn.clicked.connect(lambda _, k=key: self._on_pick_gauge_color(k))
             self.btn_gauge_color[key] = btn
@@ -2029,9 +2288,37 @@ class MainWindow(QMainWindow):
         self.spin_line_width.setRange(2, 30)
         self.spin_line_width.setValue(_num(self.settings, "line_width", 16))
         self.spin_line_width.setSuffix(" px")
-        self.spin_line_width.setToolTip("轨迹基础线宽（紫色），已走过的红色会粗 1px")
+        self.spin_line_width.setToolTip("轨迹基础线宽（未走段），已走过段会粗 1px")
         self.spin_line_width.valueChanged.connect(self._on_line_width_changed)
         tf.addRow("轨迹粗细", self.spin_line_width)
+        # 轨迹缩放：与画布滚轮双向联动
+        self.spin_traj_scale = QSpinBox()
+        self.spin_traj_scale.setRange(10, 1000)
+        self.spin_traj_scale.setSingleStep(5)
+        self.spin_traj_scale.setValue(100)
+        self.spin_traj_scale.setSuffix(" %")
+        self.spin_traj_scale.setToolTip(
+            "轨迹整体缩放（基准 100%）；也可在画布上对轨迹滚轮缩放")
+        self.spin_traj_scale.valueChanged.connect(self._on_traj_scale_changed)
+        tf.addRow("轨迹缩放", self.spin_traj_scale)
+        # 轨迹颜色：未走 / 已走 / 起点 / 终点
+        self._traj_colors = {
+            "unvisited": QColor(180, 100, 255),
+            "visited": QColor(255, 70, 70),
+            "start": QColor(100, 240, 120),
+            "end": QColor(240, 80, 80),
+        }
+        self.btn_traj_color = {}
+        for key, text in [("unvisited", "未走轨迹颜色"),
+                          ("visited", "已走轨迹颜色"),
+                          ("start", "起点颜色"),
+                          ("end", "终点颜色")]:
+            btn = QPushButton(f"{text}…")
+            btn.setToolTip(f"{text}（起点/终点为带白边的圆点）")
+            btn.clicked.connect(lambda _, k=key: self._on_pick_traj_color(k))
+            self.btn_traj_color[key] = btn
+            tf.addRow(text, btn)
+        self._refresh_traj_color_btns()
         self._page_track.addWidget(tg)
 
         # 关键节点（设置窗口「轨迹与标注」页）
@@ -2070,6 +2357,29 @@ class MainWindow(QMainWindow):
         self.chk_map.setChecked(bool(self.settings.get("show_map", False)))
         self.chk_map.toggled.connect(self._on_map_toggled)
         mf.addRow(self.chk_map)
+        self.chk_map_traj = QCheckBox("在地图上显示轨迹")
+        self.chk_map_traj.setChecked(
+            bool(self.settings.get("map_show_trajectory", False)))
+        self.chk_map_traj.setToolTip(
+            "在地图导航面板上叠加轨迹折线（未走色 + 已走色）\n仅影响视频输出")
+        self.chk_map_traj.toggled.connect(self._on_map_traj_toggled)
+        mf.addRow(self.chk_map_traj)
+        # 轨迹前视距离：0 = 全部轨迹；>0 只显示当前位置前方该距离内的轨迹
+        self.spin_map_traj_ahead = QSpinBox()
+        self.spin_map_traj_ahead.setRange(0, 20000)
+        self.spin_map_traj_ahead.setSingleStep(10)
+        self.spin_map_traj_ahead.setSuffix(" 米")
+        self.spin_map_traj_ahead.setSpecialValueText("全部")
+        self.spin_map_traj_ahead.setValue(
+            int(_num(self.settings, "map_traj_ahead_m", 0)))
+        self.spin_map_traj_ahead.setToolTip(
+            "只显示当前位置前方多远内的轨迹\n"
+            "「全部」= 显示完整轨迹；填 50 = 只显示前方 50 米内的轨迹\n"
+            "仅影响视频输出")
+        self.spin_map_traj_ahead.setEnabled(self.chk_map_traj.isChecked())
+        self.spin_map_traj_ahead.valueChanged.connect(
+            self._on_map_traj_ahead_changed)
+        mf.addRow("轨迹显示距离", self.spin_map_traj_ahead)
         self.spin_map_zoom = QSpinBox()
         self.spin_map_zoom.setRange(3, 18)
         self.spin_map_zoom.setSingleStep(1)
@@ -2077,6 +2387,15 @@ class MainWindow(QMainWindow):
         self.spin_map_zoom.setToolTip("地图缩放级别（3=世界，18=街道）；越大越放大")
         self.spin_map_zoom.valueChanged.connect(self._on_map_zoom_changed)
         mf.addRow("缩放级别", self.spin_map_zoom)
+        self.spin_map_scale = QSpinBox()
+        self.spin_map_scale.setRange(30, 600)
+        self.spin_map_scale.setSingleStep(5)
+        self.spin_map_scale.setValue(100)
+        self.spin_map_scale.setSuffix(" %")
+        self.spin_map_scale.setToolTip(
+            "地图面板整体缩放（基准 100%）；也可在画布上对地图面板滚轮缩放")
+        self.spin_map_scale.valueChanged.connect(self._on_map_scale_changed)
+        mf.addRow("面板缩放", self.spin_map_scale)
         # 地图形状：方形 / 圆形
         self.combo_map_shape = QComboBox()
         self.combo_map_shape.addItems(["方形", "圆形"])
@@ -2216,7 +2535,7 @@ class MainWindow(QMainWindow):
 
     def _update_frames_label(self, *_):
         if self.renderer is not None and self.renderer.use_segments and self.renderer.segments:
-            total = sum(self.renderer.segments[1]) * self.spin_fps.value()
+            total = int(round(sum(self.renderer.segments[1]) * self.spin_fps.value()))
             self.lbl_frames.setText(f"总帧数: {total}（分段模式）")
         else:
             total = self.spin_duration.value() * self.spin_fps.value()
@@ -2251,8 +2570,12 @@ class MainWindow(QMainWindow):
         if self.renderer is None:
             QMessageBox.information(self, "提示", "请先加载 KML 轨迹")
             return
-        dlg = SegmentDialog(self.renderer, self.spin_duration.value(), self)
+        dlg = SegmentDialog(self.renderer, self.spin_duration.value(),
+                            self.spin_fps.value(), self)
         if dlg.exec_() == QDialog.Accepted:
+            # 若对话框内改了帧率，同步回主界面
+            if dlg.fps_changed():
+                self.spin_fps.setValue(dlg.fps)
             self.renderer.segments = dlg.result_segments()
             self._apply_segments_to_ui()
             self._save_current()   # 立即保存分段设置，防止崩溃丢失
@@ -2265,7 +2588,7 @@ class MainWindow(QMainWindow):
         if segs:
             total = sum(segs[1])
             self.lbl_seg_status.setText(
-                f"已分 {len(segs[1])} 段 · 共 {total} s"
+                f"已分 {len(segs[1])} 段 · 共 {total:.2f} s"
                 + ("" if use_seg else "（当前整段模式，分段数据已保留）"))
         else:
             self.lbl_seg_status.setText("未设置分段")
@@ -2282,6 +2605,51 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     # ── 面板背景 ──
+
+    def _on_preview_scaled(self, kind: str, value: float):
+        """画布组件被滚轮缩放 → 回写设置面板数值（屏蔽信号，避免回环）。"""
+        mapping = {"trajectory": ("spin_traj_scale", 100.0),
+                   "panel": ("spin_panel_scale", 100.0),
+                   "map": ("spin_map_scale", 100.0),
+                   "gauge": ("spin_gauge_size", 1.0)}
+        entry = mapping.get(kind)
+        if entry is None:
+            return
+        spin = getattr(self, entry[0], None)
+        if spin is None:
+            return
+        v = int(round(value * entry[1]))
+        v = max(spin.minimum(), min(spin.maximum(), v))
+        spin.blockSignals(True)
+        spin.setValue(v)
+        spin.blockSignals(False)
+
+    def _on_traj_scale_changed(self, *_):
+        """轨迹缩放设置项 → 同步画布上的轨迹 item。"""
+        if self.trajectory_item is not None:
+            self.trajectory_item.setScale(self.spin_traj_scale.value() / 100.0)
+            self.trajectory_item._sync()
+        self._mark_dirty()
+
+    def _on_panel_scale_changed(self, *_):
+        """面板缩放设置项 → 同步画布上的数据面板 item。"""
+        if self.panel_item is not None:
+            self.panel_item._s = self.spin_panel_scale.value() / 100.0
+            self.panel_item._apply_scale()
+            self.panel_item._sync()
+        self._mark_dirty()
+
+    def _on_map_scale_changed(self, *_):
+        """地图面板缩放设置项 → 同步 renderer 与画布地图 item。"""
+        if self.renderer is not None:
+            self.renderer.map_scale = self.spin_map_scale.value() / 100.0
+        if self.map_item is not None:
+            self.map_item._s = self.renderer.map_scale
+            size = self.renderer.map_size * self.map_item._s
+            self.map_item.setRect(0, 0, size, size)
+            self.map_item._sync()
+        self.scene.update()
+        self._mark_dirty()
 
     def _on_panel_bg_changed(self):
         """面板背景宽度/外扩边距/不透明度：同步 renderer 并刷新预览。"""
@@ -2348,6 +2716,49 @@ class MainWindow(QMainWindow):
             self._rebuild_node_items()
         self._mark_dirty()
 
+    def _refresh_traj_color_btns(self):
+        """轨迹颜色按钮背景 = 当前色（按钮即色块预览）。"""
+        for key, btn in self.btn_traj_color.items():
+            c = self._traj_colors[key]
+            txt = "#000" if (c.red() + c.green() + c.blue()) > 420 else "#fff"
+            btn.setStyleSheet(
+                f"background-color: {c.name()}; color: {txt};"
+                "border: 1px solid #666; padding: 3px 8px;")
+
+    def _on_pick_traj_color(self, key: str):
+        """轨迹/起终点颜色选择：同步 renderer 并即时刷新画布预览。"""
+        c = QColorDialog.getColor(self._traj_colors[key], self, "选择颜色")
+        if not c.isValid():
+            return
+        self._traj_colors[key] = c
+        self._refresh_traj_color_btns()
+        if self.renderer is not None:
+            rgb = (c.red(), c.green(), c.blue())
+            attr = {"unvisited": "unvisited_color",
+                    "visited": "visited_color",
+                    "start": "start_color",
+                    "end": "end_color"}[key]
+            setattr(self.renderer, attr, rgb)
+            # 未走轨迹颜色 → 刷新轨迹画笔；起点/终点颜色 → 刷新起终点圆点
+            if key == "unvisited" and self.trajectory_item is not None:
+                self.trajectory_item._apply_pen()
+            elif key in ("start", "end"):
+                self._refresh_start_end_dots()
+        self._mark_dirty()
+
+    def _refresh_start_end_dots(self):
+        """按 renderer.start_color/end_color 刷新画布上的起终点圆点刷色。"""
+        if self.renderer is None or self.trajectory_item is None:
+            return
+        dots = getattr(self, "_start_end_dots", None)
+        if not dots:
+            return
+        for (item, _which) in dots:
+            if _which == "start":
+                item.setBrush(QBrush(QColor(*self.renderer.start_color)))
+            else:
+                item.setBrush(QBrush(QColor(*self.renderer.end_color)))
+
     def _checked_fields(self):
         """当前勾选的数据项列表（保持固定顺序）。"""
         return [f for f in self.PANEL_FIELDS if self.panel_checks[f].isChecked()]
@@ -2368,8 +2779,11 @@ class MainWindow(QMainWindow):
             return
         self.renderer.show_map = on
         if on and self.map_item is None:
+            # 按设置项中的面板缩放创建，保证数值与画布一致
+            self.renderer.map_scale = self.spin_map_scale.value() / 100.0
             self.map_item = MapPanelItem(self.renderer)
             self.scene.addItem(self.map_item)
+            _notify_main_scale(self.map_item, "map", self.map_item._s)
         elif not on and self.map_item is not None:
             self.scene.removeItem(self.map_item)
             self.map_item = None
@@ -2400,10 +2814,7 @@ class MainWindow(QMainWindow):
         r.gauge_value_size = float(self.spin_gauge_value_size.value())
         r.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
         mapping = {"edge_top": "gauge_edge_top_color",
-                   "edge_bottom": "gauge_edge_bottom_color",
-                   "fill": "gauge_fill_color",
-                   "label": "gauge_label_color",
-                   "value": "gauge_value_color"}
+                   "edge_bottom": "gauge_edge_bottom_color"}
         for key, attr in mapping.items():
             c = self._gauge_colors[key]
             setattr(r, attr, (c.red(), c.green(), c.blue()))
@@ -2413,6 +2824,37 @@ class MainWindow(QMainWindow):
             self.gauge_item.update()
         self.scene.update()
         self._mark_dirty()
+
+    def _on_gauge_preview_toggled(self, on: bool):
+        """画布预览播放开关：定时循环推进轨迹索引，让坡度仪过渡效果可见。"""
+        if not hasattr(self, "_preview_timer"):
+            self._preview_timer = QTimer(self)
+            self._preview_timer.setInterval(60)
+            self._preview_timer.timeout.connect(self._on_preview_tick)
+        if on and self.renderer is not None:
+            self._preview_pos = 0.0
+            self._preview_timer.start()
+        else:
+            self._preview_timer.stop()
+            if self.renderer is not None:
+                self.renderer.preview_idx = -1.0
+            if self.gauge_item is not None:
+                self.gauge_item.update()
+            self.scene.update()
+
+    def _on_preview_tick(self):
+        """预览推进一帧：索引循环前进（约 5s 走完整段），刷新坡度仪。"""
+        if self.renderer is None:
+            return
+        n = len(self.renderer.points)
+        if n <= 0:
+            self._preview_timer.stop()
+            return
+        self._preview_pos = (getattr(self, "_preview_pos", 0.0)
+                             + max(0.25, n / 83.0)) % n
+        self.renderer.preview_idx = self._preview_pos
+        if self.gauge_item is not None:
+            self.gauge_item.update()
 
     def _on_pick_gauge_color(self, key: str):
         """坡度仪颜色按钮：调色板选择 → 写回 renderer。"""
@@ -2465,6 +2907,20 @@ class MainWindow(QMainWindow):
         """位置箭头大小变化 → 同步 renderer。"""
         if self.renderer is not None:
             self.renderer.map_arrow_size = self.spin_map_arrow.value()
+        self._mark_dirty()
+
+    def _on_map_traj_toggled(self, on: bool):
+        """地图上是否叠加轨迹 → 同步 renderer（仅影响视频输出）。"""
+        if self.renderer is not None:
+            self.renderer.map_show_trajectory = on
+        self.spin_map_traj_ahead.setEnabled(on)
+        self._mark_dirty()
+
+    def _on_map_traj_ahead_changed(self):
+        """轨迹前视距离（米）→ 同步 renderer；0 表示显示完整轨迹。"""
+        if self.renderer is not None:
+            self.renderer.map_traj_ahead_m = float(
+                self.spin_map_traj_ahead.value())
         self._mark_dirty()
 
     def _open_node_editor(self):
@@ -2556,13 +3012,16 @@ class MainWindow(QMainWindow):
                 self.scene.removeItem(child)
             sx, sy = projected[0]
             ex, ey = projected[-1]
-            for x, y, color in [(sx, sy, QColor(100, 240, 120)),
-                                (ex, ey, QColor(240, 80, 80))]:
+            self._start_end_dots = []
+            for x, y, which in [(sx, sy, "start"), (ex, ey, "end")]:
+                rgb = (self.renderer.start_color if which == "start"
+                       else self.renderer.end_color)
                 dot = QGraphicsEllipseItem(x - 14, y - 14, 28, 28, self.trajectory_item)
-                dot.setBrush(QBrush(color))
+                dot.setBrush(QBrush(QColor(*rgb)))
                 dot.setPen(QPen(QColor(255, 255, 255, 200), 2))
                 dot.setAcceptedMouseButtons(Qt.NoButton)
                 dot.setFlag(QGraphicsItem.ItemIsSelectable, False)
+                self._start_end_dots.append((dot, which))
 
             # 重建关键节点（投影已随尺寸变化）
             self._node_items = []   # 旧节点子项已随上面 childItems 循环移除
@@ -2687,6 +3146,20 @@ class MainWindow(QMainWindow):
                 self._refresh_node_color_btn()
             except (TypeError, ValueError, IndexError):
                 pass
+        # 轨迹与起终点颜色（未走 / 已走 / 起点 / 终点）
+        for key, default in [("unvisited", (180, 100, 255)),
+                             ("visited", (255, 70, 70)),
+                             ("start", (100, 240, 120)),
+                             ("end", (240, 80, 80))]:
+            c = s.get(f"{key}_color")
+            if c and len(c) >= 3:
+                try:
+                    self._traj_colors[key] = QColor(int(c[0]), int(c[1]), int(c[2]))
+                except (TypeError, ValueError, IndexError):
+                    self._traj_colors[key] = QColor(*default)
+            else:
+                self._traj_colors[key] = QColor(*default)
+        self._refresh_traj_color_btns()
         # 时长 / 帧率
         self.spin_duration.blockSignals(True)
         self.spin_fps.blockSignals(True)
@@ -2748,9 +3221,10 @@ class MainWindow(QMainWindow):
         self.spin_gauge_value_size.setValue(_num(s, "gauge_value_size", 24))
         self.spin_gauge_value_size.blockSignals(False)
         self.spin_gauge_alpha.blockSignals(True)
-        self.spin_gauge_alpha.setValue(_num(s, "gauge_fill_alpha_pct", 30))
+        self.spin_gauge_alpha.setValue(_num(s, "gauge_fill_alpha_pct", 85))
         self.spin_gauge_alpha.blockSignals(False)
-        for _gk in ("edge_top", "edge_bottom", "fill", "label", "value"):
+        # 色阶两端色（暖端/冷端）
+        for _gk in ("edge_top", "edge_bottom"):
             _gv = s.get(f"gauge_{_gk}_color")
             if _gv and len(_gv) >= 3:
                 try:
@@ -2758,7 +3232,14 @@ class MainWindow(QMainWindow):
                                                      int(_gv[2]))
                 except (TypeError, ValueError):
                     pass
+        # 旧工程色阶两端色（橙/白）自动迁移为新的暖端/冷端默认色
+        if (self._gauge_colors["edge_top"] == QColor(255, 170, 40)
+                and self._gauge_colors["edge_bottom"] == QColor(255, 255, 255)):
+            self._gauge_colors["edge_top"] = QColor(*GAUGE_WARM_DEFAULT)
+            self._gauge_colors["edge_bottom"] = QColor(*GAUGE_COLD_DEFAULT)
         self._refresh_gauge_color_btns()
+        if self.renderer is not None:
+            self.renderer.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
         # 关键节点（无文本框，仅写回 renderer）
         nodes = s.get("key_nodes")
         if nodes is not None and self.renderer is not None:
@@ -2792,6 +3273,14 @@ class MainWindow(QMainWindow):
         self.spin_map_arrow.blockSignals(True)
         self.spin_map_arrow.setValue(_num(s, "map_arrow_size", 14))
         self.spin_map_arrow.blockSignals(False)
+        self.chk_map_traj.blockSignals(True)
+        self.chk_map_traj.setChecked(bool(s.get("map_show_trajectory", False)))
+        self.chk_map_traj.blockSignals(False)
+        self.spin_map_traj_ahead.blockSignals(True)
+        self.spin_map_traj_ahead.setValue(
+            int(_num(s, "map_traj_ahead_m", 0)))
+        self.spin_map_traj_ahead.blockSignals(False)
+        self.spin_map_traj_ahead.setEnabled(self.chk_map_traj.isChecked())
         # 生成方式（整段/分段）
         use_seg = bool(s.get("use_segments", False))
         self.rb_uniform.blockSignals(True)
@@ -2965,6 +3454,13 @@ class MainWindow(QMainWindow):
         self.renderer.panel_fields = self._checked_fields()
         c = self._node_color
         self.renderer.node_color = (c.red(), c.green(), c.blue())
+        # 轨迹与起终点颜色
+        for key, attr in [("unvisited", "unvisited_color"),
+                          ("visited", "visited_color"),
+                          ("start", "start_color"),
+                          ("end", "end_color")]:
+            _tc = self._traj_colors[key]
+            setattr(self.renderer, attr, (_tc.red(), _tc.green(), _tc.blue()))
         # 地图导航设置（从 GUI 控件同步，确保 _load_kml 内能正确创建 map_item）
         self.renderer.show_map = self.chk_map.isChecked()
         self.renderer.map_zoom = self.spin_map_zoom.value()
@@ -2975,6 +3471,9 @@ class MainWindow(QMainWindow):
             self.combo_map_text.currentIndex()]
         self.renderer.map_arrow_size = self.spin_map_arrow.value()
         self.renderer.map_heading_up = (self.combo_map_orient.currentIndex() == 1)
+        self.renderer.map_show_trajectory = self.chk_map_traj.isChecked()
+        self.renderer.map_traj_ahead_m = float(
+            self.spin_map_traj_ahead.value())
         # 动态坡度仪设置（从 GUI 控件同步）
         self.renderer.show_slope_gauge = self.chk_slope_gauge.isChecked()
         self.renderer.slope_gauge_size = float(self.spin_gauge_size.value())
@@ -2982,13 +3481,11 @@ class MainWindow(QMainWindow):
         self.renderer.gauge_value_size = float(self.spin_gauge_value_size.value())
         self.renderer.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
         _gmap = {"edge_top": "gauge_edge_top_color",
-                 "edge_bottom": "gauge_edge_bottom_color",
-                 "fill": "gauge_fill_color",
-                 "label": "gauge_label_color",
-                 "value": "gauge_value_color"}
+                 "edge_bottom": "gauge_edge_bottom_color"}
         for _gk, _ga in _gmap.items():
             _gc = self._gauge_colors[_gk]
             setattr(self.renderer, _ga, (_gc.red(), _gc.green(), _gc.blue()))
+        self.renderer.preview_idx = -1.0
         # 分段生成模式（从 GUI 单选按钮同步）
         self.renderer.use_segments = self.rb_segments.isChecked()
 
@@ -3026,17 +3523,26 @@ class MainWindow(QMainWindow):
             self.gauge_item = SlopeGaugeItem(self.renderer)
             self.scene.addItem(self.gauge_item)
 
+        # 新建 item 的缩放值与设置项对齐（工程恢复时随后由 _apply_state_dict 覆盖）
+        self._on_preview_scaled("trajectory", self.trajectory_item.scale())
+        self._on_preview_scaled("panel", self.panel_item._s)
+        if self.map_item is not None:
+            self._on_preview_scaled("map", self.map_item._s)
+
         # 起/终点：作为轨迹的子项，拖拽/缩放自动跟随（放大到半径14）
         sx, sy = projected[0]
         ex, ey = projected[-1]
-        for x, y, color in [(sx, sy, QColor(100, 240, 120)),
-                            (ex, ey, QColor(240, 80, 80))]:
+        self._start_end_dots = []
+        for x, y, which in [(sx, sy, "start"), (ex, ey, "end")]:
+            rgb = (self.renderer.start_color if which == "start"
+                   else self.renderer.end_color)
             dot = QGraphicsEllipseItem(x - 14, y - 14, 28, 28, self.trajectory_item)
-            dot.setBrush(QBrush(color))
+            dot.setBrush(QBrush(QColor(*rgb)))
             dot.setPen(QPen(QColor(255, 255, 255, 200), 2))
             # 不拦截鼠标事件，滚轮/拖拽穿透到轨迹本身
             dot.setAcceptedMouseButtons(Qt.NoButton)
             dot.setFlag(QGraphicsItem.ItemIsSelectable, False)
+            self._start_end_dots.append((dot, which))
 
         # 关键节点（scene.clear 已移除旧图形，重置列表即可）
         self._node_items = []
@@ -3239,6 +3745,18 @@ class MainWindow(QMainWindow):
             "node_font_size": self.spin_node_font.value(),
             "node_color": [self._node_color.red(), self._node_color.green(),
                            self._node_color.blue()],
+            "unvisited_color": [self._traj_colors["unvisited"].red(),
+                                self._traj_colors["unvisited"].green(),
+                                self._traj_colors["unvisited"].blue()],
+            "visited_color": [self._traj_colors["visited"].red(),
+                              self._traj_colors["visited"].green(),
+                              self._traj_colors["visited"].blue()],
+            "start_color": [self._traj_colors["start"].red(),
+                            self._traj_colors["start"].green(),
+                            self._traj_colors["start"].blue()],
+            "end_color": [self._traj_colors["end"].red(),
+                          self._traj_colors["end"].green(),
+                          self._traj_colors["end"].blue()],
             "duration": self.spin_duration.value(),
             "fps": self.spin_fps.value(),
             "render_scale": (self.combo_render_scale.currentData() or 1),
@@ -3266,6 +3784,10 @@ class MainWindow(QMainWindow):
                                if self.renderer else 14),
             "map_heading_up": (self.renderer.map_heading_up
                                if self.renderer else False),
+            "map_show_trajectory": (self.renderer.map_show_trajectory
+                                    if self.renderer else False),
+            "map_traj_ahead_m": (self.renderer.map_traj_ahead_m
+                                 if self.renderer else 0.0),
             "show_slope_gauge": (self.renderer.show_slope_gauge
                                  if self.renderer else False),
             "slope_gauge_size": (self.renderer.slope_gauge_size
@@ -3277,17 +3799,11 @@ class MainWindow(QMainWindow):
             "gauge_value_size": (self.renderer.gauge_value_size
                                  if self.renderer else 24.0),
             "gauge_fill_alpha_pct": (self.renderer.gauge_fill_alpha_pct
-                                     if self.renderer else 30.0),
+                                     if self.renderer else 85.0),
             "gauge_edge_top_color": (list(self.renderer.gauge_edge_top_color)
-                                     if self.renderer else [255, 170, 40]),
+                                     if self.renderer else list(GAUGE_WARM_DEFAULT)),
             "gauge_edge_bottom_color": (list(self.renderer.gauge_edge_bottom_color)
-                                        if self.renderer else [255, 255, 255]),
-            "gauge_fill_color": (list(self.renderer.gauge_fill_color)
-                                 if self.renderer else [255, 170, 40]),
-            "gauge_label_color": (list(self.renderer.gauge_label_color)
-                                  if self.renderer else [255, 255, 255]),
-            "gauge_value_color": (list(self.renderer.gauge_value_color)
-                                  if self.renderer else [255, 255, 255]),
+                                        if self.renderer else list(GAUGE_COLD_DEFAULT)),
             "use_segments": (self.renderer.use_segments if self.renderer else False),
         }
         if self.trajectory_item is not None:

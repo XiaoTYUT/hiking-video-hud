@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import math
 import os
+import bisect
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 Point = Tuple[float, float, float, float]  # lon, lat, elev, rel_time
 
@@ -238,8 +239,13 @@ def smooth_elevation(points: List[Point], window: int = 7) -> List[Point]:
     if window < 2 or len(points) < window:
         return points
     elevs = np.array([p[2] for p in points])
+    # 边界按首尾值延拓后再做 valid 卷积：mode="same" 会在首尾按零补齐，
+    # 使开头海拔被压到真实值的 1/7 左右，进而让视频起始坡度严重失真。
+    left = (window - 1) // 2
+    right = window - 1 - left
+    padded = np.pad(elevs, (left, right), mode="edge")
     kernel = np.ones(window) / window
-    smoothed = np.convolve(elevs, kernel, mode="same")
+    smoothed = np.convolve(padded, kernel, mode="valid")
     return [(lon, lat, float(smoothed[i]), t) for i, (lon, lat, _, t) in enumerate(points)]
 
 
@@ -288,18 +294,18 @@ def _find_idx_float(cum_time: List[float], target: float) -> float:
 
 # ─────────────────────── 坡度 / 配速 ───────────────────────
 
-SLOPE_LIMIT_PCT = 60.0        # 坡度物理合理裁剪区间（±60% ≈ ±31°，覆盖野路台阶）
+SLOPE_LIMIT_PCT = 60.0        # 坡度物理合理裁剪区间（±60%，覆盖野路台阶）
 SLOPE_MIN_DIST_M = 5.0        # 窗口水平距离小于该值不计算坡度（防 GPS 噪声）
 PACE_MIN_SPEED = 0.3          # m/s，低于此视为停顿/无效（约 18 分钟/公里）
 
 
-def compute_slope_deg(points: List[Point], elevations: List[float],
+def compute_slope_pct(points: List[Point], elevations: List[float],
                       half: int = 3) -> List[float]:
-    """逐点坡度（角度，单位 °）：对称窗口内 arctan(海拔差 / 水平距离)。
+    """逐点坡度（百分比，单位 %）：对称窗口内 海拔差 ÷ 水平距离 × 100。
 
     - 使用平滑后的海拔，窗口 ±half 个点（徒步采样 1~6s → 跨度约 20~40m）
     - 距离 < 5m 时置 0（防除零与静止噪声）
-    - 先按百分比裁剪到 ±60%（≈ ±31°），再换算成角度（保留负坡=下坡）
+    - 裁剪到 ±60%（保留负坡 = 下坡）
     """
     n = len(points)
     out = [0.0] * n
@@ -312,9 +318,20 @@ def compute_slope_deg(points: List[Point], elevations: List[float],
         if dist < SLOPE_MIN_DIST_M:
             out[i] = 0.0
         else:
-            pct = max(-SLOPE_LIMIT_PCT,
-                      min(SLOPE_LIMIT_PCT, dh / dist * 100.0))
-            out[i] = math.degrees(math.atan(pct / 100.0))
+            out[i] = max(-SLOPE_LIMIT_PCT,
+                         min(SLOPE_LIMIT_PCT, dh / dist * 100.0))
+    return out
+
+
+def compute_slope_mask(points: List[Point], half: int = 3) -> List[bool]:
+    """逐点坡度是否有效：窗口水平距离 < 5m（静止）时坡度无意义，记为 False。"""
+    n = len(points)
+    out = [False] * n
+    for i in range(n):
+        a = max(0, i - half)
+        b = min(n - 1, i + half)
+        out[i] = _haversine(points[a][0], points[a][1],
+                            points[b][0], points[b][1]) >= SLOPE_MIN_DIST_M
     return out
 
 
@@ -355,6 +372,94 @@ def format_pace(sec_per_km: float | None) -> str:
         return "--'--\"/km"
     s = int(round(sec_per_km))
     return f"{s // 60}'{s % 60:02d}\"/km"
+
+
+# ─────────────── 坡度仪配色 / 布局（渲染端与 GUI 预览共用，保证 WYSIWYG） ───────────────
+
+GAUGE_COLD_DEFAULT = (70, 130, 255)   # 冷端（陡下坡，蓝）
+GAUGE_WARM_DEFAULT = (235, 70, 70)    # 暖端（陡上坡，红）
+GAUGE_CYAN = (60, 200, 220)
+GAUGE_GREEN = (50, 190, 110)
+GAUGE_ORANGE = (255, 170, 40)
+# 5 档色阶分界（%）：≤-25 冷端 / -25~-10 青 / -10~+10 绿 / +10~+25 橙 / ≥+25 暖端
+GAUGE_BAND_BOUNDS = (-25.0, -10.0, 10.0, 25.0)
+
+
+def gauge_band_colors(cold, warm) -> List[tuple]:
+    """5 档色阶颜色（冷端与暖端由用户配色，其余固定）。"""
+    return [tuple(cold), GAUGE_CYAN, GAUGE_GREEN, GAUGE_ORANGE, tuple(warm)]
+
+
+def gauge_band_index(pct: float) -> int:
+    b0, b1, b2, b3 = GAUGE_BAND_BOUNDS
+    if pct <= b0:
+        return 0
+    if pct <= b1:
+        return 1
+    if pct < b2:
+        return 2
+    if pct < b3:
+        return 3
+    return 4
+
+
+def gauge_value_color(pct: float, cold, warm) -> tuple:
+    """数值文字颜色：跨 5 档的连续线性插值（档位切换时颜色平滑过渡，无突跳）。"""
+    c0, c1, c2, c3, c4 = gauge_band_colors(cold, warm)
+    stops = [(-SLOPE_LIMIT_PCT, c0), (-25.0, c1), (-10.0, c2),
+             (10.0, c2), (25.0, c3), (SLOPE_LIMIT_PCT, c4)]
+    p = max(-SLOPE_LIMIT_PCT, min(SLOPE_LIMIT_PCT, float(pct)))
+    for i in range(len(stops) - 1):
+        x0, a = stops[i]
+        x1, b = stops[i + 1]
+        if p <= x1:
+            t = 0.0 if x1 <= x0 else (p - x0) / (x1 - x0)
+            t = max(0.0, min(1.0, t))
+            return tuple(int(round(a[k] + (b[k] - a[k]) * t)) for k in range(3))
+    return c4
+
+
+def gauge_format_pct(pct: float) -> str:
+    """百分比文本：整数带符号（+23% / -8% / 0%）。"""
+    v = int(round(pct))
+    return "0%" if v == 0 else f"{v:+d}%"
+
+
+def _fit_font_size(measure, base_size: int, max_w: float) -> int:
+    """按可用宽度等比收缩字号（防文字越界；渲染端与 GUI 预览共用同一规则）。
+
+    measure(font_px) → 该字号下的文本宽度。文字宽度与字号近似线性，
+    故一次测量后按比例收缩即可，无需逐级试探。
+    """
+    base_size = max(8, int(base_size))
+    w = measure(base_size)
+    if w <= max_w or w <= 0:
+        return base_size
+    return max(8, int(base_size * max_w / w))
+
+
+def gauge_layout(size: float) -> dict:
+    """坡度仪布局（全部为 size 的比例值；渲染端与 GUI 预览共用同一套常量）。"""
+    bar_x0, bar_x1 = 0.36 * size, 0.58 * size
+    return {
+        "bar_x0": bar_x0,                       # 色阶条左边界
+        "bar_x1": bar_x1,                       # 色阶条右边界
+        "bar_top": 0.05 * size,                 # 色阶条上边界（+60%）
+        "bar_bot": 0.64 * size,                 # 色阶条下边界（-60%）
+        "tick_len": 0.045 * size,               # 主刻度线长度
+        "tick_label_right": 0.32 * size,        # 刻度文字右端 x
+        "mark_base": bar_x1 + 0.10 * size,      # 主滑标三角底边 x（顶点朝左指向色阶）
+        "mark_half": 0.045 * size,              # 主滑标三角半高
+        "text_cx": 0.5 * size,                  # 数值水平中心
+        "value_cy": 0.72 * size,                # 数值行中心 y（紧凑靠上）
+        "tick_font_ratio": 0.62,                # 刻度字号 = 标签字号 × 该比例
+    }
+
+
+def gauge_y(pct: float, bar_top: float, bar_bot: float) -> float:
+    """坡度百分比 → 色阶条上的 y 坐标（+60% 在顶部，-60% 在底部）。"""
+    p = max(-SLOPE_LIMIT_PCT, min(SLOPE_LIMIT_PCT, float(pct)))
+    return bar_bot - (p + SLOPE_LIMIT_PCT) / (2 * SLOPE_LIMIT_PCT) * (bar_bot - bar_top)
 
 
 # ─────────────────────── 坐标投影 ───────────────────────
@@ -472,9 +577,11 @@ class Renderer:
         else:
             self.cum_dist = raw_dist
 
-        # 当前坡度（角度°，平滑海拔 + 对称窗口，物理裁剪 ±31°）
-        self.slope_deg = compute_slope_deg(
+        # 当前坡度（百分比 %，平滑海拔 + 对称窗口，物理裁剪 ±60%）
+        self.slope_pct = compute_slope_pct(
             points, [p[2] for p in self.points_smoothed])
+        # 静止段（窗口位移 <5m）坡度无意义：不参与坡度仪均值，避免起点被 0 拉平
+        self.slope_mask = compute_slope_mask(points)
         # 当前配速（优先 KML 瞬时速度，停顿点为 None）
         self.pace_s = compute_pace_s_per_km(points, list(meta.get("speeds", [])))
 
@@ -500,9 +607,14 @@ class Renderer:
         self.trajectory_offset = (0.0, 0.0)   # 画布坐标的平移
         self.trajectory_scale = 1.0            # 缩放（以中心为锚）
         self.trajectory_center = (width / 2, height / 2)
-        self.trajectory_width: int = 16         # 轨迹基础线宽（紫色；红色 = +1px）
+        self.trajectory_width: int = 16         # 轨迹基础线宽（未走段；已走段 = +1px）
         self.node_font_size: int = 41           # 关键节点名称字号（粗体）
         self.node_color: Tuple[int, int, int] = (255, 200, 60)  # 标注点颜色（默认黄）
+        # 轨迹与起终点颜色（用户可配）
+        self.start_color: Tuple[int, int, int] = (100, 240, 120)      # 起点颜色（默认绿）
+        self.end_color: Tuple[int, int, int] = (240, 80, 80)          # 终点颜色（默认红）
+        self.unvisited_color: Tuple[int, int, int] = (180, 100, 255)  # 未走轨迹颜色（默认紫）
+        self.visited_color: Tuple[int, int, int] = (255, 70, 70)      # 已走轨迹颜色（默认红）
 
         # 数据面板显示项（GUI 可勾选开关；空 = 不画面板）
         self.panel_fields: List[str] = ["当前海拔", "当前坡度", "累计爬升",
@@ -517,19 +629,17 @@ class Renderer:
         self.panel_bg_color: Tuple[int, int, int] = (128, 128, 128)
         self.panel_bg_alpha_pct: float = 45.0    # 不透明度 0-100%（45 ≈ 115/255）
 
-        # 动态坡度仪：独立的直角三角形，斜边倾角随当前坡度平滑变化（可单独拖动/调大小）
+        # 动态坡度仪：竖直色阶尺（5 档色阶 + 刻度 + 主滑标）随坡度实时变化（可单独拖动/调大小）
         self.show_slope_gauge: bool = True
         self.slope_gauge_pos: Tuple[float, float] = (40.0, float(height) - 200.0)
         self.slope_gauge_size: float = 140.0     # 示意区域边长（基准 px）
-        self.gauge_label_size: float = 20.0      # 「坡度」标签字号（px）
+        self.gauge_label_size: float = 20.0      # 刻度文字字号（px）
         self.gauge_value_size: float = 24.0      # 坡度数值字号（px）
-        self.gauge_edge_top_color: Tuple[int, int, int] = (255, 170, 40)     # 上边（斜边）
-        self.gauge_edge_bottom_color: Tuple[int, int, int] = (255, 255, 255)  # 下边（水平基线）
-        self.gauge_fill_color: Tuple[int, int, int] = (255, 170, 40)          # 内部填充
-        self.gauge_fill_alpha_pct: float = 30.0  # 填充不透明度 0-100%
-        self.gauge_label_color: Tuple[int, int, int] = (255, 255, 255)        # 标签颜色
-        self.gauge_value_color: Tuple[int, int, int] = (255, 255, 255)        # 数值颜色
-        self._gauge_series: List[float] = []   # 时间平滑后的角度序列（懒构建）
+        self.gauge_edge_top_color: Tuple[int, int, int] = GAUGE_WARM_DEFAULT  # 色阶暖端（上坡）
+        self.gauge_edge_bottom_color: Tuple[int, int, int] = GAUGE_COLD_DEFAULT  # 色阶冷端（下坡）
+        self.gauge_fill_alpha_pct: float = 85.0  # 色阶条不透明度 0-100%
+        self._gauge_series: List[float] = []     # 帧密度自适应平滑后的百分比序列（懒构建）
+        self.preview_idx: float = -1.0           # GUI 画布预览索引（-1 = 末点），渲染时不参与
 
         # 地图导航面板：以当前位置为中心的小地图，始终北朝上
         self.show_map = False                    # 是否显示
@@ -545,6 +655,9 @@ class Renderer:
         # 朝向模式：False=正北朝上（地图不转，箭头指运动方向）；
         #           True=运动方向朝上（地图旋转使行进方向朝屏幕上方，指北针指示真北）
         self.map_heading_up = False
+        self.map_show_trajectory = False       # 是否在地图上叠加轨迹折线
+        # 轨迹前视距离(米)：0 = 显示完整轨迹；>0 只显示当前位置前方该距离内的轨迹
+        self.map_traj_ahead_m = 0.0
 
         # 分段视频：None = 未设置分段；否则 (cut_points, durations)
         # cut_points = 轨迹进度分割点列表(0<c<1 升序)，durations = 各段视频秒数
@@ -662,16 +775,16 @@ class Renderer:
         w_purple = max(2, int(round(self.trajectory_width * ts * ss)))
         w_red = max(2, int(round((self.trajectory_width + 1) * ts * ss)))
 
-        # 1) 完整轨迹 — 紫色 = 未走
+        # 1) 完整轨迹 — 未走（颜色由用户配置，默认紫）
         if len(projected) >= 2:
             pts_rounded = [(int(x), int(y)) for x, y in projected]
-            d.line(pts_rounded, fill=(180, 100, 255, 200), width=w_purple)
+            d.line(pts_rounded, fill=self.unvisited_color + (200,), width=w_purple)
 
-        # 1b) 已走部分 — 红色叠加
+        # 1b) 已走部分 — 颜色由用户配置（默认红），叠加
         if idx > 0 and len(projected) >= 2:
             traveled = [(int(x), int(y)) for x, y in projected[:idx + 1]]
             if len(traveled) >= 2:
-                d.line(traveled, fill=(255, 70, 70, 230), width=w_red)
+                d.line(traveled, fill=self.visited_color + (230,), width=w_red)
 
         # 2) 当前位置标记
         if 0 <= idx < len(projected):
@@ -684,11 +797,11 @@ class Renderer:
             d.ellipse([cx - 4 * ss, cy - 4 * ss, cx + 4 * ss, cy + 4 * ss],
                       fill=(255, 60, 60, 255))
 
-        # 2b) 起点/终点标记（大圆点，带白边；半径随缩放）
+        # 2b) 起点/终点标记（大圆点，带白边；半径随缩放，颜色由用户配置）
         if len(projected) >= 2:
             r = max(5, int(round(14 * ts * ss)))
-            for (px, py), color in [(projected[0], (100, 240, 120)),
-                                     (projected[-1], (240, 80, 80))]:
+            for (px, py), color in [(projected[0], self.start_color),
+                                     (projected[-1], self.end_color)]:
                 d.ellipse([px - r, py - r, px + r, py + r],
                           outline=(255, 255, 255, 220), width=max(1, int(2 * ss)),
                           fill=color + (255,))
@@ -720,7 +833,7 @@ class Renderer:
         dist_km = self.cum_dist[idx] / 1000.0
         elapsed = self.cum_time[idx]
         elev = self.points_smoothed[idx][2]
-        slope = self.slope_deg[idx]
+        slope = self.slope_pct[idx]
         pace = self.pace_s[idx]
         self._draw_panel(d, ascent, dist_km, elapsed, elev, slope, pace)
 
@@ -767,7 +880,7 @@ class Renderer:
         wall_elapsed = self.total_wall_s * k
         all_rows = [
             ("当前海拔", f"{elev:.0f} m",          (200, 160, 255, 255)),
-            ("当前坡度", f"{slope:+.1f}°",         (255, 170, 200, 255)),
+            ("当前坡度", f"{slope:+.0f}%",         (255, 170, 200, 255)),
             ("累计爬升", f"{ascent:.1f} m",         (80, 220, 120, 255)),
             ("已行里程", f"{dist_km:.2f} km",        (255, 210,  90, 255)),
             ("当前配速", format_pace(pace),          (140, 255, 220, 255)),
@@ -793,34 +906,60 @@ class Renderer:
     # ── 动态坡度仪 ──
 
     def _build_gauge_series(self, half: int = 4) -> None:
-        """预计算坡度仪的平滑角度序列（±half 个点的滑动平均）。
+        """预计算坡度仪的平滑百分比序列（±half 个点的滑动平均）。
 
-        视频帧在多进程中独立渲染，角度必须是 idx 的纯函数（不能靠帧间状态
+        视频帧在多进程中独立渲染，坡度必须是 idx 的纯函数（不能靠帧间状态
         做缓动），因此对逐点坡度预先做滑动平均，帧序列自然连续无跳变。
         注：窗口按点数而非时间——两步路采样间隔约 4~6s/点，时间窗常只含 1 个点。
+        静止段（slope_mask=False，位移<5m）不参与均值：否则录表后先站着的
+        前若干点会被当作 0% 拉低，导致视频刚开始坡度显示 0%。
         """
         n = len(self.points)
         if n == 0:
             self._gauge_series = []
             return
         half = max(1, int(half))
-        s = self.slope_deg
-        # 前缀和 O(n) 滑动平均
+        s = self.slope_pct
+        mask = getattr(self, "slope_mask", None)
+        if not mask or len(mask) != n:
+            mask = [True] * n
+        # 前缀和（仅累计有效点）O(n)
         pref = [0.0] * (n + 1)
+        cnt = [0] * (n + 1)
         for i, v in enumerate(s):
-            pref[i + 1] = pref[i] + v
-        out = [0.0] * n
+            ok = mask[i]
+            pref[i + 1] = pref[i] + (v if ok else 0.0)
+            cnt[i + 1] = cnt[i] + (1 if ok else 0)
+        out = [None] * n
         for i in range(n):
             lo = max(0, i - half)
             hi = min(n, i + half + 1)
-            out[i] = (pref[hi] - pref[lo]) / (hi - lo)
+            c = cnt[hi] - cnt[lo]
+            if c > 0:
+                out[i] = (pref[hi] - pref[lo]) / c
+        # 整窗都是静止点：取最近的已知坡度（首帧/长停顿后不显示 0%）
+        valid_idx = [i for i in range(n) if out[i] is not None]
+        if valid_idx:
+            for i in range(n):
+                if out[i] is None:
+                    pos = bisect.bisect_left(valid_idx, i)
+                    cands = []
+                    if pos < len(valid_idx):
+                        cands.append(valid_idx[pos])
+                    if pos > 0:
+                        cands.append(valid_idx[pos - 1])
+                    j = min(cands, key=lambda k: abs(k - i))
+                    out[i] = out[j]
+        else:
+            # 全程静止（无有效坡度）：保持 0
+            out = [0.0] * n
         self._gauge_series = out
 
     def prepare_gauge_smoothing(self, total_frames: int) -> None:
         """按本次渲染的总帧数重建坡度平滑序列（渲染入口调用）。
 
         窗口半宽 ≈ 1.5×每帧跨越的点数：相邻帧窗口重叠 ≥50%，
-        角度逐帧渐变（实测 cat.kml 30fps 下每帧 ≤1°），三角不会瞬间跳转。
+        坡度逐帧渐变（滑标与颜色平滑移动，不会瞬间跳转）。
         """
         n = len(self.points)
         if n < 2 or total_frames < 1:
@@ -828,20 +967,37 @@ class Renderer:
         step = (n - 1) / total_frames
         self._build_gauge_series(half=max(4, int(math.ceil(step * 1.5))))
 
-    def gauge_angle(self, idx: int) -> float:
-        """坡度仪显示角度（°，时间平滑后；上坡正/下坡负）。"""
+    def gauge_pct(self, idx: float) -> float:
+        """坡度仪显示坡度（%，平滑后；上坡正 / 下坡负）。
+
+        idx 可为浮点（GUI 预览按帧推进），做线性插值保证连续。
+        """
         if not self._gauge_series:
             self._build_gauge_series()
         if not self._gauge_series:
             return 0.0
-        idx = max(0, min(len(self._gauge_series) - 1, int(idx)))
-        return self._gauge_series[idx]
+        idx = max(0.0, min(float(len(self._gauge_series) - 1), float(idx)))
+        j = int(idx)
+        f = idx - j
+        if j < len(self._gauge_series) - 1:
+            return self._gauge_series[j] + (self._gauge_series[j + 1]
+                                            - self._gauge_series[j]) * f
+        return self._gauge_series[j]
+
+    def preview_index(self) -> float:
+        """GUI 画布预览用的轨迹索引（-1 或越界 → 末点）。"""
+        n = len(self.points)
+        if n <= 0:
+            return 0.0
+        p = float(getattr(self, "preview_idx", -1.0))
+        return p if 0.0 <= p <= n - 1 else float(n - 1)
 
     def _draw_slope_gauge(self, d: ImageDraw.ImageDraw, idx: int) -> None:
-        """动态坡度仪：直角三角形（水平下边 + 竖直闭合边 + 斜边），斜边倾角 = 当前坡度。
+        """动态坡度仪：竖直色阶尺（5 档色阶 + 刻度 + 主滑标）+ 百分比数值。
 
-        上坡时斜边在基线上方、下坡在下方；角度取自 gauge_angle（帧密度自适应
-        平滑序列）。上边/下边颜色、内部填充色+透明度、标签/数值字号与颜色均可配。
+        坡度以百分比表达（±60% 裁剪）；数值颜色在 5 档色之间连续线性插值，
+        与帧密度自适应平滑序列共同构成「由高到低 / 由低到高」的过渡细节。
+        布局与配色常量来自模块级 gauge_layout / gauge_* 函数，GUI 预览端同构复用。
         独立于数据面板（panel_* 系列参数），有独立的 pos/size 与显示开关。
         """
         if not self.show_slope_gauge:
@@ -850,48 +1006,88 @@ class Renderer:
         gx, gy = self.slope_gauge_pos[0] * ss, self.slope_gauge_pos[1] * ss
         size = self.slope_gauge_size * ss
 
-        angle = max(-32.0, min(32.0, self.gauge_angle(idx)))  # 视觉限幅
+        pct = self.gauge_pct(idx)
+        L = gauge_layout(size)
+        cold, warm = self.gauge_edge_bottom_color, self.gauge_edge_top_color
+        colors = gauge_band_colors(cold, warm)
+
+        bar_x0 = gx + L["bar_x0"]
+        bar_x1 = gx + L["bar_x1"]
+        bar_top = gy + L["bar_top"]
+        bar_bot = gy + L["bar_bot"]
         lw = max(1, int(round(2 * ss)))
-
-        # 直角三角形：下边（水平基线）+ 右端竖直闭合边 + 斜边（倾角 = 坡度）
-        vx, vy = gx + 0.10 * size, gy + 0.40 * size
-        arm = 0.55 * size
-        h = arm * math.tan(math.radians(angle))
-        h_min = 0.02 * size   # 近水平时保留最小可见高度
-        if abs(h) < h_min:
-            h = h_min if angle >= 0 else -h_min
-        x2, y2 = vx + arm, vy - h   # y 向下：正坡度 y2 在基线上方
-
-        # 内部填充（颜色/透明度可调）
-        fa = int(round(max(0.0, min(100.0, self.gauge_fill_alpha_pct)) * 255 / 100))
-        fc = self.gauge_fill_color
-        d.polygon([(vx, vy), (x2, vy), (x2, y2)],
-                  fill=(fc[0], fc[1], fc[2], fa))
-
-        # 边线：下边（水平基线）= 下边颜色；竖直闭合边 + 上边（斜边）= 上边颜色
-        tc = self.gauge_edge_top_color
-        bc = self.gauge_edge_bottom_color
-        d.line((vx, vy, x2, vy), fill=(bc[0], bc[1], bc[2], 255), width=lw)
-        d.line((x2, vy, x2, y2), fill=(tc[0], tc[1], tc[2], 255), width=lw)
-        d.line((vx, vy, x2, y2), fill=(tc[0], tc[1], tc[2], 255), width=lw)
-
-        # 文字：「坡度」标签 + 数值（各自字号/颜色，黑边描边，垂直居中对齐）
-        label, value = "坡度", f"{angle:+.1f}°"
-        lf = load_font(max(8, int(round(self.gauge_label_size * ss))))
-        vf = load_font(max(8, int(round(self.gauge_value_size * ss))))
-        lb = d.textbbox((0, 0), label, font=lf)
-        vb = d.textbbox((0, 0), value, font=vf)
-        lw_, vw_ = lb[2] - lb[0], vb[2] - vb[0]
-        gap = 0.05 * size
-        x0 = gx + size / 2 - (lw_ + gap + vw_) / 2
-        cy = gy + size * 0.84
         stroke = max(1, int(round(ss)))
-        lc, vc = self.gauge_label_color, self.gauge_value_color
-        d.text((x0 - lb[0], cy - (lb[3] - lb[1]) / 2 - lb[1]), label,
-               fill=(lc[0], lc[1], lc[2], 255), font=lf,
-               stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
-        d.text((x0 + lw_ + gap - vb[0], cy - (vb[3] - vb[1]) / 2 - vb[1]), value,
-               fill=(vc[0], vc[1], vc[2], 255), font=vf,
+
+        # 1) 色阶条：5 档分段填充（冷端→青→绿→橙→暖端，不透明度可调）
+        alpha = int(round(max(0.0, min(100.0, self.gauge_fill_alpha_pct)) * 255 / 100))
+        bounds = [(-SLOPE_LIMIT_PCT, -25.0), (-25.0, -10.0), (-10.0, 10.0),
+                  (10.0, 25.0), (25.0, SLOPE_LIMIT_PCT)]
+        for (lo, hi), c in zip(bounds, colors):
+            d.rectangle([bar_x0, gauge_y(hi, bar_top, bar_bot),
+                         bar_x1, gauge_y(lo, bar_top, bar_bot)],
+                        fill=(c[0], c[1], c[2], alpha))
+
+        # 2) 刻度：主刻度带百分比文本 + 次刻度短线；0% 基线贯穿色阶条并加粗
+        tick_font = load_font(max(8, int(round(self.gauge_label_size
+                                               * L["tick_font_ratio"] * ss))))
+        tb = d.textbbox((0, 0), "-60%", font=tick_font)
+        tick_h = tb[3] - tb[1]
+        bar_h = bar_bot - bar_top
+        # 档距 15% 的像素间距足够时，才显示 ±10% 的文字（避免刻度文字互相重叠）
+        show_minor = (15.0 / (2 * SLOPE_LIMIT_PCT)) * bar_h >= 1.7 * tick_h
+        labeled = ({60.0, 25.0, 10.0, 0.0, -10.0, -25.0, -60.0} if show_minor
+                   else {60.0, 25.0, 0.0, -25.0, -60.0})
+        for v in (60.0, 40.0, 25.0, 10.0, 0.0, -10.0, -25.0, -40.0, -60.0):
+            y = gauge_y(v, bar_top, bar_bot)
+            zero = abs(v) < 1e-6
+            major = v in labeled
+            if zero:
+                d.line((bar_x0 - L["tick_len"] * 1.8, y, bar_x1, y),
+                       fill=(255, 255, 255, 240), width=lw)
+            else:
+                x0 = bar_x0 - L["tick_len"] * (1.0 if major else 0.55)
+                d.line((x0, y, bar_x0, y),
+                       fill=(255, 255, 255, 215 if major else 140),
+                       width=lw - 1 if major else max(1, lw - 2))
+            if major or zero:
+                txt = gauge_format_pct(v)
+                tw = d.textbbox((0, 0), txt, font=tick_font)[2]
+                d.text((gx + L["tick_label_right"] - tw,
+                        y - tick_h / 2 - tb[1]), txt,
+                       fill=(255, 255, 255, 255), font=tick_font,
+                       stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+        d.rectangle([bar_x0, bar_top, bar_x1, bar_bot],
+                    outline=(255, 255, 255, 200), width=stroke)
+
+        # 3) 主滑标：贯穿色阶条的白色基准线 + 右侧实心三角（顶点朝左指向色阶，
+        #    颜色 = 当前档位的连续渐变色）
+        y_mark = gauge_y(pct, bar_top, bar_bot)
+        vc = gauge_value_color(pct, cold, warm)
+        d.line((bar_x0, y_mark, bar_x1, y_mark), fill=(255, 255, 255, 230),
+               width=stroke)
+        mh = L["mark_half"]
+        base_x = gx + L["mark_base"]
+        d.polygon([(base_x, y_mark - mh), (base_x, y_mark + mh), (bar_x1, y_mark)],
+                  fill=(vc[0], vc[1], vc[2], 255))
+        # 白描边（polygon 的 width 参数依赖新版 Pillow，改用手绘三边更稳妥）
+        d.line((base_x, y_mark - mh, bar_x1, y_mark),
+               fill=(255, 255, 255, 255), width=stroke)
+        d.line((bar_x1, y_mark, base_x, y_mark + mh),
+               fill=(255, 255, 255, 255), width=stroke)
+        d.line((base_x, y_mark + mh, base_x, y_mark - mh),
+               fill=(255, 255, 255, 255), width=stroke)
+
+        # 4) 数值（整数百分比，颜色连续渐变；超宽时等比收缩字号防越界）
+        value = gauge_format_pct(pct)
+        vfs = _fit_font_size(
+            lambda fs: d.textbbox((0, 0), value, font=load_font(fs))[2],
+            int(round(self.gauge_value_size * ss)), 0.90 * size)
+        vf = load_font(vfs)
+        vb = d.textbbox((0, 0), value, font=vf)
+        vw, vh = vb[2] - vb[0], vb[3] - vb[1]
+        cx = gx + L["text_cx"]
+        d.text((cx - vw / 2 - vb[0], gy + L["value_cy"] - vh / 2 - vb[1]),
+               value, fill=(vc[0], vc[1], vc[2], 255), font=vf,
                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
 
     def _get_tile(self, z: int, x: int, y: int):
@@ -945,6 +1141,24 @@ class Renderer:
         x1, y1 = _lonlat_to_webmerc_px(*_wgs84_to_gcj02(lon1, lat1), zf)
         dx, dy = x1 - x0, y1 - y0
         return dx, dy, math.sqrt(dx * dx + dy * dy)
+
+    def _map_traj_px(self, zf: int):
+        """轨迹全部点在 zf 级墨卡托像素坐标（已做 WGS-84→GCJ-02 校正）。
+
+        懒构建并缓存：WGS→GCJ 与瓦片 zoom 无关只算一次；像素坐标随 zf 变化，
+        zf 改变时重建。逐帧复用，避免对每个点重复三角运算。
+        """
+        cache = getattr(self, "_map_traj_cache", None)
+        n = len(self.points)
+        if cache is not None and cache[0] == zf and cache[2] == n:
+            return cache[1]
+        gcj = getattr(self, "_map_traj_gcj", None)
+        if gcj is None or len(gcj) != n:
+            gcj = [_wgs84_to_gcj02(p[0], p[1]) for p in self.points]
+            self._map_traj_gcj = gcj
+        px = [_lonlat_to_webmerc_px(glon, glat, zf) for glon, glat in gcj]
+        self._map_traj_cache = (zf, px, n)
+        return px
 
     def _prefetch_map_tiles(self, idx_list: list):
         """预取视频所需的所有地图瓦片，避免逐帧网络请求。"""
@@ -1007,6 +1221,10 @@ class Renderer:
         heading_up = bool(self.map_heading_up) and mlen > 0.001
         expand = math.sqrt(2.0) if heading_up else 1.0
         half = span / 2 * expand
+        # 航向角：真北顺时针（0=北，90=东）；PIL rotate 正角=逆时针，
+        # 东行时把地图逆时针转 90° → 东到屏幕上方，即航向朝上
+        bearing = math.degrees(math.atan2(mvx, -mvy))
+        big = max(panel, int(round(panel * math.sqrt(2.0))))
 
         # 需要的瓦片范围
         tx0 = int((cx_g - half) // 256)
@@ -1032,10 +1250,6 @@ class Renderer:
         cropped = composite.crop((ox, oy, ox + crop_span, oy + crop_span))
 
         if heading_up:
-            # 航向角：真北顺时针（0=北，90=东）；PIL rotate 正角=逆时针，
-            # 东行时把地图逆时针转 90° → 东到屏幕上方，即航向朝上
-            bearing = math.degrees(math.atan2(mvx, -mvy))
-            big = max(panel, int(round(panel * math.sqrt(2.0))))
             if cropped.size != (big, big):
                 cropped = cropped.resize((big, big), Image.LANCZOS)
             rotated = cropped.rotate(bearing, resample=Image.BICUBIC)
@@ -1046,12 +1260,69 @@ class Renderer:
             cropped = cropped.resize((panel, panel), Image.LANCZOS)
 
         # 贴到视频帧上（圆形用 alpha 遮罩，保持圆外区域透明）
-        if self.map_shape == "circle":
+        circle = self.map_shape == "circle"
+        if circle:
             mask = Image.new("L", (panel, panel), 0)
             ImageDraw.Draw(mask).ellipse([0, 0, panel - 1, panel - 1], fill=255)
             img.paste(cropped, (mx, my), mask)
         else:
             img.paste(cropped, (mx, my))
+
+        # 轨迹叠加（可选）：与瓦片同一套投影/裁剪/旋转，保证与地图像素级对齐。
+        # 紫色=未走 / 红色=已走，配色与主画布轨迹一致。
+        # map_traj_ahead_m>0 时只绘制当前位置前方该距离内的轨迹（前视窗口）
+        if getattr(self, "map_show_trajectory", False) and len(self.points) >= 2:
+            k = (panel if not heading_up else big) / max(1.0, float(crop_span))
+            ca, sa = 0.0, 0.0
+            if heading_up:
+                ca, sa = math.cos(math.radians(bearing)), math.sin(
+                    math.radians(bearing))
+            ox_c, oy_c = mx + panel / 2.0, my + panel / 2.0
+            traj_px = self._map_traj_px(zf)
+            n_px = len(traj_px)
+            cut = int(idx_f)
+            ahead_m = float(getattr(self, "map_traj_ahead_m", 0.0) or 0.0)
+            i0, i1 = 0, n_px - 1
+            if ahead_m > 0.0:
+                # 从当前位置起，取累计里程差 ≤ ahead_m 的连续点；至少保留一段
+                i0 = max(0, min(n_px - 1, cut))
+                d0 = self.cum_dist[i0]
+                i1 = i0
+                while i1 + 1 < n_px and self.cum_dist[i1 + 1] - d0 <= ahead_m:
+                    i1 += 1
+                if i1 == i0 and i0 + 1 < n_px:
+                    i1 = i0 + 1
+            line_pts = []
+            for i in range(i0, i1 + 1):
+                gx, gy = traj_px[i]
+                dx = (gx - cx_g) * k
+                dy = (gy - cy_g) * k
+                if heading_up:      # 与地图同向旋转，纬度轴仍向下
+                    dx, dy = dx * ca + dy * sa, -dx * sa + dy * ca
+                line_pts.append((int(round(ox_c + dx - mx)),
+                                 int(round(oy_c + dy - my))))
+            layer = Image.new("RGBA", (panel, panel), (0, 0, 0, 0))
+            ld = ImageDraw.Draw(layer)
+            w_p = max(3, int(round(6 * self.map_scale * ss)))
+            w_r = w_p + max(1, int(round(1 * ss)))
+            # 深色描边提升浅色地图上的可读性（轨迹较短时尤其重要）。
+            # 全部用不透明色：半透明色会经 paste 混色把地图区域的 alpha 拉低，
+            # 在带透明通道的成片里留下半透明斑块
+            if len(line_pts) >= 2:
+                ld.line(line_pts, fill=(45, 45, 55, 255),
+                        width=w_p + max(2, int(round(2 * ss))))
+                ld.line(line_pts, fill=self.unvisited_color + (255,), width=w_p)
+                # 前视窗口模式全部是未走轨迹，无需再叠已走色
+                if ahead_m <= 0.0 and cut > i0:
+                    ld.line(line_pts[:cut + 1 - i0],
+                            fill=self.visited_color + (255,), width=w_r)
+            # 圆形容器：把图层 alpha 裁到圆内再用作 mask。
+            # 不能直接把椭圆 L 遮罩当 paste 的 mask —— 那样 PIL 会用源像素整体
+            # 覆盖目标，把圆内已贴好的地图底图一并盖成透明
+            la = layer.getchannel("A")
+            if circle:
+                la = ImageChops.multiply(la, mask)
+            img.paste(layer, (mx, my), la)
 
         # 当前位置标记（带运动方向箭头）
         cx_panel = mx + panel // 2
@@ -1095,7 +1366,6 @@ class Renderer:
                       fill=(100, 240, 120, 255))
 
         # 边框（方形=矩形描边，圆形=圆环描边）
-        circle = self.map_shape == "circle"
         bw = max(1, int(2 * ss))
         if circle:
             d.ellipse([mx, my, mx + panel - 1, my + panel - 1],

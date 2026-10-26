@@ -144,7 +144,7 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 - 标签 20px 粗体白字黑边（PIL stroke），值各带彩色；值紧跟标签（gap = 10×panel_scale，左流式）
 - 高度 = 18 + (n-1)×32 + 26 + 30（n=5 → 202）
 - 可选字段：当前海拔（实时）、累计爬升、已行里程、当前坡度、当前配速、运动耗时、总耗时
-- 当前坡度（renderer.py ~282-308，`compute_slope_deg`）：单位**角度°**（2026-10-16 由 % 改为 °），对称窗口 ±3 点 arctan(高差 ÷ 水平距)，15 点平滑海拔，先按 ±60% 裁剪再转角度（≈ ±31°），显示 1 位小数 `+5.7°`；Renderer 属性 `slope_deg`（旧名 slope_pct 已废弃）
+- 当前坡度（renderer.py ~289-309，`compute_slope_pct`）：单位**百分比 %**（2026-10-20 由角度°改回 %），对称窗口 ±3 点（高差 ÷ 水平距 × 100），15 点平滑海拔，裁剪 ±60%，显示整数带符号 `+23%` / `0%`；Renderer 属性 `slope_pct`（旧名 slope_deg 已废弃）
 - 当前配速（~286-322）：优先 KML 逐点速度（GxTrackExtendedData），窗口时间回退；<0.3m/s 显示 `--'--"/km`
 
 ## 11. GUI 架构要点
@@ -213,14 +213,17 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 10. 基准测试必须先预热瓦片缓存（首次运行会被网络下载污染，401ms/帧 vs 真实 88ms/帧）
 11. PowerShell 不支持 `&&`，用 `;` 分隔
 
-## 10a. 动态坡度仪（2026-10-19 新增）
+## 10a. 动态坡度仪（2026-10-20 改版：竖直色阶尺 + 百分比）
 
-- 独立可拖动**直角三角形**坡度示意，与数据面板完全解耦（2026-10-19 三版定稿：用户先后否决旋转三角、几何角，最终要求直角三角形）；水平下边 + 右端竖直闭合边 + 斜边（倾角 = 当前坡度，上坡在基线上方），h = arm·tan(角度)（±32° 视觉限幅，近水平保留最小高度 0.02×size 防退化消失）；顶点在左 (0.10, 0.40)×size，臂长 0.55×size。
-- **样式全可配**（Renderer 属性 → GUI「动态坡度仪」组 → .kmlproj 持久化）：`gauge_edge_top_color` 上边（斜边，竖直闭合边同色）、`gauge_edge_bottom_color` 下边（基线）、`gauge_fill_color`+`gauge_fill_alpha_pct` 内部填充色/不透明度 0-100%、`gauge_label_size`/`gauge_label_color`「坡度」标签字号与颜色、`gauge_value_size`/`gauge_value_color` 数值字号与颜色；文字白/彩字黑边，垂直居中并排于 0.84×size 处；GUI 用 `self._gauge_colors` dict + 5 个色块按钮（`_on_pick_gauge_color`/`_refresh_gauge_color_btns`，样式表背景即预览），样式统一经 `_on_gauge_style_changed` 同步。
-- **平滑方案**：渲染前按帧密度重建点数滑动平均序列，`half = max(4, ceil(1.5 × step))`（step = 每帧跨越轨迹点数）。相邻帧窗口重叠 ≥50%，30fps/30s 下每帧角度变化均值 ~1.5°，逐帧渐进无跳变。GUI 预览用默认 half=4。
-- Renderer：`show_slope_gauge`（bool，默认 True）、`slope_gauge_pos`（Tuple）、`slope_gauge_size`（float，默认 140px，范围 60-600）。方法 `_build_gauge_series(half)`、`prepare_gauge_smoothing(total_frames)`、`gauge_angle(idx)`、`_draw_slope_gauge(d, idx)`。
-- app.py：`SlopeGaugeItem(QGraphicsRectItem)`：rect 作拖拽命中区，paint 完全自绘（透明底 + QPolygonF 填充三角 + 三条边线 + 黑边描边文字），滚轮调大小，hover/selected 虚线框指示边界。控件组在「数据面板」页，handlers `_on_slope_gauge_toggled` / `_on_gauge_style_changed` / `_on_pick_gauge_color`。
-- 持久化：工程文件含 `show_slope_gauge`、`slope_gauge_size`、`slope_gauge_pos` 及 gauge_* 样式 8 键；_load_kml 自动创建/移除；_apply_state_to_gui 恢复控件，_apply_state_dict 恢复位置大小。
+- 独立可拖动**竖直色阶尺**，与数据面板完全解耦。坡度以**百分比**表达（±60% 裁剪，滑标随坡度上下移动）。
+- 组成：① 色阶条（5 档：≤-25 冷端蓝 / -25~-10 青 / -10~+10 绿 / +10~+25 橙 / ≥+25 暖端红，段内填充，不透明度 `gauge_fill_alpha_pct`）；② 左侧百分比刻度（+60/+25/0/-25/-60，档距足够时自动补 ±10 文字，另加 ±40/±10 次刻度短线；0% 基线贯穿色阶条并加粗）；③ 主滑标（贯穿色阶条的白色基准线 + 右侧实心三角，颜色 = 当前值的连续渐变色）；④ 数值大字 `+23%`/`0%`。（状态词与趋势箭头已于 2026-10-20 按要求全部删除）
+- **过渡细节**（无状态依赖，纯 idx 函数）：帧密度自适应滑动平均序列（`half = max(4, ceil(1.5×step))`）+ 数值颜色在 5 档色之间**连续线性插值**。
+- **样式全可配**（Renderer 属性 → GUI「动态坡度仪」组 → .kmlproj 持久化）：`gauge_edge_top_color` 暖端（上坡）、`gauge_edge_bottom_color` 冷端（下坡）、`gauge_label_size` 刻度字号、`gauge_value_size` 数值字号（数值颜色由色阶自动渐变，不可配）、`gauge_fill_alpha_pct` 色阶条不透明度。旧工程的橙/白端色会自动迁移为暖红/冷蓝。
+- **排版**：布局与配色常量集中在 renderer 模块级 `gauge_layout(size)` / `gauge_y(pct,...)` / `gauge_band_colors` / `gauge_value_color` / `gauge_format_pct` / `_fit_font_size`，渲染端与 GUI 预览共用 → WYSIWYG。数值/刻度文字超宽时按宽度等比收缩字号，避免小尺寸越界。
+- Renderer：`show_slope_gauge`（默认 True）、`slope_gauge_pos`、`slope_gauge_size`（默认 140px，60-600）、`preview_idx`（GUI 预览索引，-1 = 末点）。方法 `_build_gauge_series(half)`、`prepare_gauge_smoothing(total_frames)`、`gauge_pct(idx)`（支持浮点插值）、`preview_index()`、`_draw_slope_gauge(d, idx)`。
+- app.py：`SlopeGaugeItem(QGraphicsRectItem)`：rect 作拖拽命中区，paint 完全自绘（色阶条 + 刻度 + 滑标 + 黑边描边文字），滚轮调大小，hover/selected 虚线框指示边界。控件组在「数据面板」页：显示开关 / **画布预览播放（循环，QTimer 60ms 推进 `renderer.preview_idx`，不影响视频输出）** / 仪表大小 / 刻度字号 / 数值字号 / 色阶条不透明度 / 暖端·冷端两色块；handlers `_on_slope_gauge_toggled` / `_on_gauge_style_changed` / `_on_gauge_preview_toggled` / `_on_preview_tick` / `_on_pick_gauge_color`。
+- **平滑方案**：渲染前按帧密度重建点数滑动平均序列，`half = max(4, ceil(1.5 × step))`。GUI 预览用默认 half=4。
+- 持久化：工程文件含 `show_slope_gauge`、`slope_gauge_size`、`slope_gauge_pos` 及 gauge_* 样式键；_load_kml 自动创建/移除；_apply_state_to_gui 恢复控件，_apply_state_dict 恢复位置大小。
 
 ## 16. 当前状态与待办（2026-10-19）
 
@@ -228,7 +231,7 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 - [x] app.py 取消分支注释已还原
 - [x] 右侧面板重构完成（QScrollArea + 非模态三页对话框），387px 高
 - [x] 面板背景 4 参数完成（宽度独立可调 / 外扩边距 / 颜色 / 不透明度）
-- [x] 动态坡度仪完成（独立拖动三角 + 自适应帧密度平滑 + 持久化）
+- [x] 动态坡度仪改版完成（2026-10-20：直角三角形 → 竖直 5 档色阶尺 + 百分比数值 + 画布预览播放；状态词/趋势箭头已全部删除）
 - [ ] 用户原始诉求"不降帧率提速"的最终答案 = compression_level 1（封装减半）+ 用户可对不重要的视频手动用低倍率（1×）渲染；管道方案已实测否决
 - [ ] 临时文件可清理：`%TEMP%\_bench_e2e.py`、`%TEMP%\_bench_ffmpeg.py`、`%TEMP%\_verify_rawpipe.py`
 
