@@ -36,14 +36,9 @@ from renderer import (Renderer, format_duration, format_pace,
                       _fetch_tile, _wgs84_to_gcj02, _lonlat_to_webmerc_px,
                       _webmerc_px_to_lonlat,
                       GAUGE_COLD_DEFAULT, GAUGE_WARM_DEFAULT,
-                      gauge_footprint, gauge_arc_layout, gauge_card_layout,
-                      gauge_profile_layout, gauge_gradient_stops,
-                      GAUGE_LABEL_RATIO,
-                      gauge_value_color, gauge_format_pct,
-                      _fit_font_size, SLOPE_LIMIT_PCT,
-                      ELEV_BG, ELEV_BORDER, ELEV_PROGRESS, ELEV_LINE,
-                      ELEV_AREA_TOP, ELEV_AREA_BOTTOM,
+                      gauge_footprint,
                       ring_footprint, RING_PROGRESS_DEFAULT)
+from gauge_paint import paint_gauge
 
 # ─────────────────────── 工程文件 & 全局设置 持久化 ───────────────────────
 # 全局 settings.json 存放在系统用户配置目录（Windows: %APPDATA%\KmlPath），
@@ -626,31 +621,13 @@ class MapPanelItem(QGraphicsRectItem):
 
 # ─────────────────────── 动态坡度仪 Item ───────────────────────
 
-def _ui_font(px: int) -> QFont:
-    """GUI 预览字体（与视频端 msyh 一致，保证所见即所得）。"""
-    f = QFont("Microsoft YaHei")
-    f.setPixelSize(max(8, int(round(px))))
-    return f
-
-
-def _paint_outlined_text(painter, text, rect, color, font):
-    """黑边描边文字（Qt 无原生描边，用 8 方向偏移近似，与视频端 PIL 描边一致）。"""
-    painter.setFont(font)
-    painter.setPen(QColor(0, 0, 0, 255))
-    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1),
-                   (-1, -1), (-1, 1), (1, -1), (1, 1)):
-        painter.drawText(rect.translated(dx, dy), Qt.AlignCenter, text)
-    painter.setPen(color)
-    painter.drawText(rect, Qt.AlignCenter, text)
-
-
 class SlopeGaugeItem(QGraphicsRectItem):
     """动态坡度仪的 GUI 预览：样式二选一（renderer.gauge_style）。
     - "profile" 方案A 坡度剖面卡：海拔计同款底 + 大字 + 全程坡度剖面曲线
     - "arc"  方案B 半圆弧仪表：暗色轨道 + 渐变刻度弧 + 当前进度弧 + 光点 + 数值
     - "card" 方案D HUD 深色卡片：圆角卡片 + 大号数值 + 渐变指示条 + 白色游标
-    可拖拽定位 + 滚轮调大小；布局复用 renderer 模块级 gauge_* 布局函数，
-    与视频端 renderer._draw_slope_gauge / _paint_gauge_* WYSIWYG。"""
+    可拖拽定位 + 滚轮调大小；绘制调用 gauge_paint.paint_gauge 共享函数，
+    与视频端 renderer._draw_slope_gauge 完全同一份 QPainter 代码（WYSIWYG）。"""
 
     def __init__(self, renderer: Renderer):
         fw, fh = gauge_footprint(renderer.gauge_style,
@@ -706,19 +683,13 @@ class SlopeGaugeItem(QGraphicsRectItem):
         super().hoverLeaveEvent(event)
 
     def paint(self, painter, option, widget=None):
-        # 透明底：按样式自绘（与视频端同构）
+        # 透明底：按样式自绘（与视频端共用 gauge_paint.paint_gauge，WYSIWYG）
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         r = self.renderer
         n = len(r.points)
         idx = r.preview_index() if n else 0.0
         pct = r.gauge_pct(idx) if n else 0.0
-        size = r.slope_gauge_size
-        a = max(0.0, min(100.0, r.gauge_fill_alpha_pct)) / 100.0
-        cold, warm = r.gauge_edge_bottom_color, r.gauge_edge_top_color
-        vc = gauge_value_color(pct, cold, warm)
-        vcol = QColor(vc[0], vc[1], vc[2])
-        value = gauge_format_pct(pct)
 
         # 选中/悬停时用虚线框标出命中区范围（不参与视频输出）
         if self.isSelected() or self._hover:
@@ -726,259 +697,8 @@ class SlopeGaugeItem(QGraphicsRectItem):
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.rect())
 
-        if r.gauge_style == "card":
-            self._paint_card(painter, size, pct, a, cold, warm, vcol, value)
-        elif r.gauge_style == "profile":
-            self._paint_profile(painter, size, pct, a, value, idx)
-        else:
-            self._paint_arc(painter, size, pct, a, cold, warm, vcol, value)
-
-    def _paint_profile(self, painter, size, pct, a, value, idx):
-        """方案A 坡度剖面卡（与 renderer._paint_gauge_profile 同构）。"""
-        r = self.renderer
-        L = gauge_profile_layout(size)
-        w, h, rx = L["w"], L["h"], L["rx"]
-
-        # 1) 卡片底（海拔计同款）
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, w, h), rx, rx)
-        painter.fillPath(path, QColor(
-            ELEV_BG[0], ELEV_BG[1], ELEV_BG[2],
-            int(round(ELEV_BG[3] * a))))
-        painter.setPen(QPen(QColor(
-            ELEV_BORDER[0], ELEV_BORDER[1], ELEV_BORDER[2],
-            int(round(ELEV_BORDER[3] * a))), 1))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawPath(path)
-
-        # 2) 右上「坡度」标签（沿用 gauge_label_size / gauge_label_dy）
-        lfs = max(8, int(round(r.gauge_label_size * GAUGE_LABEL_RATIO)))
-        lf = _ui_font(lfs)
-        fm_l = QFontMetrics(lf)
-        lw = fm_l.horizontalAdvance("坡度")
-        _paint_outlined_text(
-            painter, "坡度",
-            QRectF(w - L["pad_x"] - lw - 4,
-                   L["label_cy"] + r.gauge_label_dy - fm_l.height() / 2,
-                   lw + 8, fm_l.height()),
-            QColor(230, 236, 244, 184), lf)
-
-        # 3) 左上大字数值（暖黄粗体，沿用 gauge_value_size / gauge_value_dy）
-        max_tw = max(20.0, w - 2 * L["pad_x"] - lw - 8)
-        vfs = _fit_font_size(
-            lambda fs: QFontMetrics(_ui_font(fs)).horizontalAdvance(value),
-            int(round(r.gauge_value_size)), max_tw)
-        vfs = min(vfs, max(8, int(round(
-            (L["plot_y0"] - L["value_y"]) * 1.1))))   # 高度上限：不压到剖面区
-        vf = _ui_font(vfs)
-        vf.setBold(True)
-        fm_v = QFontMetrics(vf)
-        _paint_outlined_text(
-            painter, value,
-            QRectF(L["pad_x"] - 4,
-                   L["value_y"] + r.gauge_value_dy,
-                   fm_v.horizontalAdvance(value) + 8, fm_v.height()),
-            QColor(ELEV_PROGRESS[0], ELEV_PROGRESS[1], ELEV_PROGRESS[2]), vf)
-
-        # 4) 全程坡度剖面迷你曲线
-        series = r._gauge_series
-        if len(series) >= 2:
-            x0, x1 = L["plot_x0"], L["plot_x1"]
-            y0, y1 = L["plot_y0"], L["plot_y1"]
-            mid = (y0 + y1) / 2.0
-            amp = (y1 - y0) / 2.0
-            n = len(series)
-            # 显示降采样（与渲染端一致：每 2px 一个桶取均值）
-            buckets = max(24, int(round((x1 - x0) / 2.0)))
-            pts = []
-            for b in range(buckets):
-                i0 = int(b * n / buckets)
-                i1 = max(i0 + 1, int((b + 1) * n / buckets))
-                seg = series[i0:i1]
-                vv = max(-60.0, min(60.0, sum(seg) / len(seg)))
-                pts.append(QPointF(x0 + (x1 - x0) * (b + 0.5) / buckets,
-                                   mid - vv / 60.0 * amp))
-
-            # 4a) 渐变面积（曲线与 0% 基线围成区域，暖橙→紫蓝）
-            poly = QPolygonF(pts + [QPointF(x1, mid), QPointF(x0, mid)])
-            grad = QLinearGradient(0, y0, 0, y1)
-            ga = int(round(0.88 * a * 255))
-            grad.setColorAt(0.0, QColor(ELEV_AREA_TOP[0], ELEV_AREA_TOP[1],
-                                        ELEV_AREA_TOP[2], ga))
-            grad.setColorAt(1.0, QColor(ELEV_AREA_BOTTOM[0],
-                                        ELEV_AREA_BOTTOM[1],
-                                        ELEV_AREA_BOTTOM[2], ga))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(grad)
-            painter.drawPolygon(poly)
-
-            # 4b) 0% 基线（虚线）
-            painter.setPen(QPen(QColor(255, 255, 255, 46), 1, Qt.DashLine))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawLine(QPointF(x0, mid), QPointF(x1, mid))
-
-            # 4c) 白色曲线
-            cpath = QPainterPath(pts[0])
-            for p in pts[1:]:
-                cpath.lineTo(p)
-            painter.setPen(QPen(QColor(
-                ELEV_LINE[0], ELEV_LINE[1], ELEV_LINE[2], ELEV_LINE[3]),
-                1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.drawPath(cpath)
-
-            # 4d) 当前位置圆点（白圈 + 暖黄芯，随预览进度移动）
-            frac = max(0.0, min(1.0, idx / max(1, n - 1)))
-            cur_x = x0 + (x1 - x0) * frac
-            cur_y = mid - max(-60.0, min(60.0, pct)) / 60.0 * amp
-            ro = L["dot_r"] * 1.5
-            ri = L["dot_r"] * 0.82
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(255, 255, 255, 245))
-            painter.drawEllipse(QPointF(cur_x, cur_y), ro, ro)
-            painter.setBrush(QColor(ELEV_PROGRESS[0], ELEV_PROGRESS[1],
-                                    ELEV_PROGRESS[2]))
-            painter.drawEllipse(QPointF(cur_x, cur_y), ri, ri)
-
-    def _paint_arc(self, painter, size, pct, a, cold, warm, vcol, value):
-        """方案B 半圆弧仪表（与 renderer._paint_gauge_arc 同构）。"""
-        L = gauge_arc_layout(size)
-        cx, cy, R, W = L["cx"], L["cy"], L["R"], L["W"]
-        rect = QRectF(cx - R, cy - R, 2 * R, 2 * R)
-
-        # 1) 暗色轨道（半圆，圆头端点；透明度随 a）
-        painter.setPen(QPen(QColor(16, 22, 35, int(round(0.55 * a * 255))),
-                            W, Qt.SolidLine, Qt.RoundCap))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawArc(rect, 180 * 16, 180 * 16)
-
-        # 2) 彩色刻度弧：48 段小弧拼成连续渐变（左=冷端 → 顶=绿 → 右=暖端）
-        seg_pen = QPen()
-        seg_pen.setWidthF(W)
-        seg_pen.setCapStyle(Qt.FlatCap)
-        seg = 180.0 / 48
-        for i in range(48):
-            fa = 180 + i * seg
-            mid = math.radians(fa + seg / 2)
-            o = (1 + math.cos(mid)) / 2          # 0=左端 → 1=右端
-            c = gauge_value_color(o * 120 - 60, cold, warm)
-            seg_pen.setColor(QColor(c[0], c[1], c[2], int(round(0.35 * a * 255))))
-            painter.setPen(seg_pen)
-            # PIL 角 φ（顺时针，y 向下）→ Qt 角 = 360 − φ（逆时针）
-            painter.drawArc(rect, int(round((360 - fa - seg) * 16)) - 32,
-                            int(round(seg * 16)) + 64)
-        painter.setPen(Qt.NoPen)
-        for ex, o in ((cx - R, -60.0), (cx + R, 60.0)):
-            c = gauge_value_color(o, cold, warm)
-            painter.setBrush(QColor(c[0], c[1], c[2], int(round(0.35 * a * 255))))
-            painter.drawEllipse(QPointF(ex, cy), W / 2, W / 2)
-
-        # 3) 当前进度弧：从顶部 0% 展开到当前坡度（平头笔 + 手动圆帽，与 PIL 一致）
-        painter.setBrush(Qt.NoBrush)
-        pg = QPen(vcol, W, Qt.SolidLine, Qt.FlatCap)
-        painter.setPen(pg)
-        if pct >= 0.75:
-            mdeg = 90 * (1 - pct / 60.0)
-            painter.drawArc(rect, int(round(mdeg * 16)),
-                            int(round((90 - mdeg) * 16)))
-        elif pct <= -0.75:
-            mdeg = 90 * (1 + abs(pct) / 60.0)
-            painter.drawArc(rect, 90 * 16, int(round((mdeg - 90) * 16)))
-        else:
-            mdeg = 90.0
-        tip = QPointF(cx + R * math.cos(math.radians(mdeg)),
-                      cy - R * math.sin(math.radians(mdeg)))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(vcol)
-        painter.drawEllipse(QPointF(cx, cy - R), W / 2, W / 2)   # 顶部 0% 圆帽
-        painter.drawEllipse(tip, W / 2, W / 2)                   # 弧端圆帽
-        gr, dr = L["glow_r"], L["dot_r"]
-        painter.setBrush(QColor(vcol.red(), vcol.green(), vcol.blue(), 90))
-        painter.drawEllipse(tip, gr, gr)
-        painter.setPen(QPen(QColor(0, 0, 0, 110), 1))
-        painter.setBrush(QColor(255, 255, 255))
-        painter.drawEllipse(tip, dr, dr)
-
-        # 4) 数值 + 「坡度」标签（居中，均在弧内空白区）
-        vfs = _fit_font_size(
-            lambda fs: QFontMetrics(_ui_font(fs)).horizontalAdvance(value),
-            int(round(self.renderer.gauge_value_size)), 0.56 * size)
-        vf = _ui_font(vfs)
-        fm_v = QFontMetrics(vf)
-        vw = fm_v.horizontalAdvance(value)
-        _paint_outlined_text(
-            painter, value,
-            QRectF(cx - vw / 2 - 4,
-                   L["value_cy"] + self.renderer.gauge_value_dy
-                   - fm_v.height() / 2,
-                   vw + 8, fm_v.height()), vcol, vf)
-        lf = _ui_font(int(round(self.renderer.gauge_label_size
-                                * GAUGE_LABEL_RATIO)))
-        fm_l = QFontMetrics(lf)
-        lw = fm_l.horizontalAdvance("坡度")
-        _paint_outlined_text(
-            painter, "坡度",
-            QRectF(cx - lw / 2 - 4,
-                   L["label_cy"] + self.renderer.gauge_label_dy
-                   - fm_l.height() / 2,
-                   lw + 8, fm_l.height()), QColor(230, 236, 244, 210), lf)
-
-    def _paint_card(self, painter, size, pct, a, cold, warm, vcol, value):
-        """方案D HUD 深色卡片（与 renderer._paint_gauge_card 同构）。"""
-        L = gauge_card_layout(size)
-        w, h, pad, rx = L["w"], L["h"], L["pad"], L["rx"]
-
-        # 1) 卡片底：深色半透明圆角矩形 + 细白边
-        painter.setPen(QPen(QColor(255, 255, 255, 46), 1))
-        painter.setBrush(QColor(13, 17, 26, int(round(0.62 * a * 255))))
-        painter.drawRoundedRect(QRectF(0, 0, w, h), rx, rx)
-
-        # 2) 渐变指示条：横向胶囊（左=冷端 → 中=绿 → 右=暖端）
-        strip_h = L["strip_h"]
-        sy0 = L["strip_cy"] - strip_h / 2
-        sx0, sx1 = pad, w - pad
-        grad = QLinearGradient(sx0, 0, sx1, 0)
-        for off, c in gauge_gradient_stops(cold, warm):
-            grad.setColorAt(off, QColor(c[0], c[1], c[2],
-                                        int(round(a * 255))))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(grad)
-        painter.drawRoundedRect(QRectF(sx0, sy0, sx1 - sx0, strip_h),
-                                strip_h / 2, strip_h / 2)
-
-        # 3) 游标：深色晕圈 + 白色圆点
-        mx = sx0 + (max(-SLOPE_LIMIT_PCT, min(SLOPE_LIMIT_PCT, pct)) + 60) \
-            / 120 * (sx1 - sx0)
-        my = L["strip_cy"]
-        hr, dr = L["halo_r"], L["dot_r"]
-        painter.setBrush(QColor(0, 0, 0, 115))
-        painter.drawEllipse(QPointF(mx, my), hr, hr)
-        painter.setBrush(QColor(255, 255, 255))
-        painter.drawEllipse(QPointF(mx, my), dr, dr)
-
-        # 4) 文本：左侧灰色「坡度」标签 + 右对齐大号彩色数值
-        lf = _ui_font(int(round(self.renderer.gauge_label_size
-                                * GAUGE_LABEL_RATIO)))
-        fm_l = QFontMetrics(lf)
-        lw = fm_l.horizontalAdvance("坡度")
-        _paint_outlined_text(
-            painter, "坡度",
-            QRectF(pad - 4,
-                   L["label_cy"] + self.renderer.gauge_label_dy
-                   - fm_l.height() / 2,
-                   lw + 8, fm_l.height()), QColor(169, 180, 196), lf)
-        max_w = max(20.0, (w - 2 * pad) - lw - 8)
-        vfs = _fit_font_size(
-            lambda fs: QFontMetrics(_ui_font(fs)).horizontalAdvance(value),
-            int(round(self.renderer.gauge_value_size)), max_w)
-        vf = _ui_font(vfs)
-        fm_v = QFontMetrics(vf)
-        vw = fm_v.horizontalAdvance(value)
-        _paint_outlined_text(
-            painter, value,
-            QRectF(w - pad - vw - 4,
-                   L["value_cy"] + self.renderer.gauge_value_dy
-                   - fm_v.height() / 2,
-                   vw + 8, fm_v.height()), vcol, vf)
+        # 预览无超采样：ss=1，尺寸用基准值（共享函数内部统一处理换算）
+        paint_gauge(painter, r, r.slope_gauge_size, pct, idx, 1.0)
 
 
 # ─────────────────────── 海拔一览图 Item ───────────────────────

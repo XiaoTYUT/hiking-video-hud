@@ -1189,295 +1189,32 @@ class Renderer:
         return p if 0.0 <= p <= n - 1 else float(n - 1)
 
     def _draw_slope_gauge(self, img: Image.Image, idx: int) -> None:
-        """动态坡度仪：在独立 RGBA 图层上绘制后整体 alpha 合成到帧（保证半透明
-        元素正确叠加）。样式二选一：
+        """动态坡度仪：与 GUI 预览共用 gauge_paint 的 QPainter 绘制代码（WYSIWYG），
+        在离屏 QImage 上绘制后转 PIL RGBA 图层整体 alpha 合成到帧（保证半透明
+        元素正确叠加）。样式三选一：
         - "arc"  方案B 半圆弧仪表：暗色轨道 + 渐变刻度弧 + 当前进度弧 + 光点 + 数值
         - "card" 方案D HUD 深色卡片：圆角卡片 + 大号数值 + 渐变指示条 + 白色游标
         - "profile" 方案A 坡度剖面卡：海拔计同款底 + 大字 + 全程坡度剖面迷你曲线
         坡度以百分比表达（±60% 裁剪），数值颜色沿 5 档连续线性插值；
-        布局常量来自模块级 gauge_arc_layout / gauge_card_layout，GUI 预览端同构复用。
+        布局常量来自模块级 gauge_*_layout，QPainter 需要 QGuiApplication
+        （GUI 进程已有；worker/CLI 进程由 ensure_qapp 懒创建 offscreen 实例）。
         """
         if not self.show_slope_gauge:
             return
+        from gauge_paint import ensure_qapp, render_gauge_layer
+        ensure_qapp()
         ss = int(getattr(self, "_ss", 1) or 1)
         gx = int(round(self.slope_gauge_pos[0] * ss))
         gy = int(round(self.slope_gauge_pos[1] * ss))
         s = self.slope_gauge_size * ss
         pct = self.gauge_pct(idx)
-        a = max(0.0, min(100.0, self.gauge_fill_alpha_pct)) / 100.0
 
-        fw, fh = gauge_footprint(self.gauge_style, s)
-        layer = Image.new("RGBA", (max(2, int(round(fw))),
-                                   max(2, int(round(fh)))), (0, 0, 0, 0))
-        if self.gauge_style == "card":
-            self._paint_gauge_card(layer, s, pct, a, ss)
-        elif self.gauge_style == "profile":
-            self._paint_gauge_profile(layer, s, pct, a, ss, idx)
-        else:
-            self._paint_gauge_arc(layer, s, pct, a, ss)
+        layer = render_gauge_layer(self, s, pct, idx, ss)
         if gx < 0 or gy < 0 or gx + layer.width > img.width \
                 or gy + layer.height > img.height:
             img.paste(layer, (gx, gy), layer)     # 越界时退化为带掩膜 paste
         else:
             img.alpha_composite(layer, (gx, gy))
-
-    def _paint_gauge_arc(self, layer: Image.Image, s: float,
-                         pct: float, a: float, ss: int) -> None:
-        """方案B 半圆弧仪表（绘制到尺寸 s×s 图层，坐标原点=占位框左上角）。"""
-        ld = ImageDraw.Draw(layer)
-        L = gauge_arc_layout(s)
-        cx, cy, R, W = L["cx"], L["cy"], L["R"], L["W"]
-        cold, warm = self.gauge_edge_bottom_color, self.gauge_edge_top_color
-        bbox = [cx - R, cy - R, cx + R, cy + R]
-        w_i = max(1, int(round(W)))
-        stroke = max(1, int(round(getattr(self, "_ss", 1) or 1)))
-
-        # 1) 暗色轨道（左→顶→右半圆，圆头端点；透明度随 a）
-        ta = int(round(0.55 * a * 255))
-        tcol = (16, 22, 35, ta)
-        ld.arc(bbox, start=180, end=360, fill=tcol, width=w_i)
-        ld.ellipse([cx - R - W / 2, cy - W / 2, cx - R + W / 2, cy + W / 2],
-                   fill=tcol)
-        ld.ellipse([cx + R - W / 2, cy - W / 2, cx + R + W / 2, cy + W / 2],
-                   fill=tcol)
-
-        # 2) 彩色刻度弧：48 段小弧拼成连续渐变（左=冷端 → 顶=绿 → 右=暖端）
-        ga = int(round(0.35 * a * 255))
-        seg = 180.0 / 48
-        ld.ellipse([cx - R - W / 2, cy - W / 2, cx - R + W / 2, cy + W / 2],
-                   fill=gauge_value_color(-60.0, cold, warm) + (ga,))
-        for i in range(48):
-            fa = 180 + i * seg
-            mid = math.radians(fa + seg / 2)
-            o = (1 + math.cos(mid)) / 2          # 0=左端 → 1=右端
-            col = gauge_value_color(o * 120 - 60, cold, warm)
-            ld.arc(bbox, start=fa, end=min(360.0, fa + seg + 0.6),
-                   fill=col + (ga,), width=w_i)
-        ld.ellipse([cx + R - W / 2, cy - W / 2, cx + R + W / 2, cy + W / 2],
-                   fill=gauge_value_color(60.0, cold, warm) + (ga,))
-
-        # 3) 当前进度弧：从顶部 0% 展开到当前坡度（圆头 + 弧端光点）
-        vc = gauge_value_color(pct, cold, warm)
-        if pct >= 0.75:
-            mdeg = 90 * (1 - pct / 60.0)         # 数学角（0=右端）
-            ld.arc(bbox, start=270, end=360 - mdeg, fill=vc + (255,), width=w_i)
-        elif pct <= -0.75:
-            mdeg = 90 * (1 + abs(pct) / 60.0)    # 数学角（90..180=左端）
-            ld.arc(bbox, start=360 - mdeg, end=270, fill=vc + (255,), width=w_i)
-        else:
-            mdeg = 90.0
-        tip = (cx + R * math.cos(math.radians(mdeg)),
-               cy - R * math.sin(math.radians(mdeg)))
-        # 顶部 0% 原点圆帽 + 弧端光点（晕圈 + 白点带深色描边）
-        ld.ellipse([cx - W / 2, cy - R - W / 2, cx + W / 2, cy - R + W / 2],
-                   fill=vc + (255,))
-        gr, dr = L["glow_r"], L["dot_r"]
-        ld.ellipse([tip[0] - gr, tip[1] - gr, tip[0] + gr, tip[1] + gr],
-                   fill=vc + (int(round(0.35 * 255)),))
-        ld.ellipse([tip[0] - dr, tip[1] - dr, tip[0] + dr, tip[1] + dr],
-                   fill=(255, 255, 255, 255), outline=(0, 0, 0, 110),
-                   width=stroke)
-
-        # 4) 数值 + 「坡度」标签（居中；数值超宽时等比收缩，限制在弧内空白宽度内）
-        value = gauge_format_pct(pct)
-        vfs = _fit_font_size(
-            lambda fs: ld.textbbox((0, 0), value, font=load_font(fs))[2],
-            int(round(self.gauge_value_size * ss)), 0.56 * s)
-        vf = load_font(vfs)
-        vb = ld.textbbox((0, 0), value, font=vf)
-        vw, vh = vb[2] - vb[0], vb[3] - vb[1]
-        ld.text((cx - vw / 2 - vb[0],
-                 L["value_cy"] + self.gauge_value_dy * ss - vh / 2 - vb[1]),
-                value, fill=vc + (255,), font=vf,
-                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
-        lfs = max(8, int(round(self.gauge_label_size * GAUGE_LABEL_RATIO * ss)))
-        lf = load_font(lfs)
-        lb = ld.textbbox((0, 0), "坡度", font=lf)
-        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
-        ld.text((cx - lw / 2 - lb[0],
-                 L["label_cy"] + self.gauge_label_dy * ss - lh / 2 - lb[1]),
-                "坡度", fill=(230, 236, 244, 210), font=lf,
-                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
-
-    def _paint_gauge_card(self, layer: Image.Image, s: float,
-                          pct: float, a: float, ss: int) -> None:
-        """方案D HUD 深色卡片（footprint = 1.2571s × 0.6286s，原点=左上角）。"""
-        ld = ImageDraw.Draw(layer)
-        L = gauge_card_layout(s)
-        w, h, pad, rx = L["w"], L["h"], L["pad"], L["rx"]
-        cold, warm = self.gauge_edge_bottom_color, self.gauge_edge_top_color
-        stroke = max(1, int(round(ss)))
-        vc = gauge_value_color(pct, cold, warm)
-
-        # 1) 卡片底：深色半透明圆角矩形 + 细白边
-        ld.rounded_rectangle([0, 0, w, h], radius=rx,
-                             fill=(13, 17, 26, int(round(0.62 * a * 255))),
-                             outline=(255, 255, 255, 46), width=stroke)
-
-        # 2) 渐变指示条：横向胶囊（左=冷端 → 中=绿 → 右=暖端），透明度随 a；
-        #    中段逐列渐变矩形 + 两端半圆端帽，直接绘制在图层上保证 alpha 正确
-        strip_h = L["strip_h"]
-        sy0 = L["strip_cy"] - strip_h / 2
-        sy1 = L["strip_cy"] + strip_h / 2
-        sx0, sx1 = pad, w - pad
-        cap_r = strip_h / 2
-        gx0, gx1 = sx0 + cap_r, sx1 - cap_r     # 渐变中段范围
-        ga = int(round(a * 255))
-        n = max(8, int(round(gx1 - gx0)))
-        for i in range(n):
-            x = gx0 + (gx1 - gx0) * i / n
-            o = (x - sx0) / max(1.0, sx1 - sx0)
-            c = gauge_value_color(o * 120 - 60, cold, warm)
-            ld.rectangle([x, sy0, x + (gx1 - gx0) / n + 0.6, sy1],
-                         fill=c + (ga,))
-        ld.pieslice([sx0, sy0, sx0 + 2 * cap_r, sy1], 90, 270,
-                    fill=gauge_value_color(-60.0, cold, warm) + (ga,))
-        ld.pieslice([sx1 - 2 * cap_r, sy0, sx1, sy1], 270, 90,
-                    fill=gauge_value_color(60.0, cold, warm) + (ga,))
-
-        # 3) 游标：深色晕圈 + 白色圆点（位置 = 当前坡度映射到条上）
-        mx = sx0 + (max(-SLOPE_LIMIT_PCT, min(SLOPE_LIMIT_PCT, pct)) + 60) \
-            / 120 * (sx1 - sx0)
-        my = L["strip_cy"]
-        hr, dr = L["halo_r"], L["dot_r"]
-        ld.ellipse([mx - hr, my - hr, mx + hr, my + hr], fill=(0, 0, 0, 115))
-        ld.ellipse([mx - dr, my - dr, mx + dr, my + dr],
-                   fill=(255, 255, 255, 255))
-
-        # 4) 文本：左侧灰色「坡度」标签 + 右对齐大号彩色数值
-        lfs = max(8, int(round(self.gauge_label_size * GAUGE_LABEL_RATIO * ss)))
-        lf = load_font(lfs)
-        lb = ld.textbbox((0, 0), "坡度", font=lf)
-        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
-        ld.text((pad - lb[0],
-                 L["label_cy"] + self.gauge_label_dy * ss - lh / 2 - lb[1]), "坡度",
-                fill=(169, 180, 196, 255), font=lf,
-                stroke_width=stroke, stroke_fill=(0, 0, 0, 160))
-        value = gauge_format_pct(pct)
-        max_w = max(20.0, (w - 2 * pad) - lw - 8)
-        vfs = _fit_font_size(
-            lambda fs: ld.textbbox((0, 0), value, font=load_font(fs))[2],
-            int(round(self.gauge_value_size * ss)), max_w)
-        vf = load_font(vfs)
-        vb = ld.textbbox((0, 0), value, font=vf)
-        vw, vh = vb[2] - vb[0], vb[3] - vb[1]
-        ld.text((w - pad - vw - vb[0],
-                 L["value_cy"] + self.gauge_value_dy * ss - vh / 2 - vb[1]),
-                value, fill=vc + (255,), font=vf,
-                stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
-
-    def _paint_gauge_profile(self, layer: Image.Image, s: float,
-                             pct: float, a: float, ss: int, idx: int) -> None:
-        """方案A 坡度剖面卡：海拔一览图同款深色卡片底 + 左上大字数值 +
-        右上「坡度」标签 + 全程坡度剖面迷你曲线（渐变面积 + 白线 + 当前点）。
-        数据用 _gauge_series 整条序列（帧密度平滑、±60% 截断），与海拔计
-        「全路线剖面 + 当前位置」语义一致。"""
-        ld = ImageDraw.Draw(layer)
-        L = gauge_profile_layout(s)
-        w, h, rx = L["w"], L["h"], L["rx"]
-        stroke = max(1, int(round(ss)))
-
-        # 1) 卡片底（海拔计同款：半透明深色 + 细白边框）
-        ld.rounded_rectangle(
-            [0, 0, w - 1, h - 1], radius=max(2, int(round(rx))),
-            fill=ELEV_BG[:3] + (int(round(ELEV_BG[3] * a)),),
-            outline=ELEV_BORDER[:3] + (int(round(ELEV_BORDER[3] * a)),),
-            width=stroke)
-
-        # 2) 右上「坡度」标签（沿用 gauge_label_size / gauge_label_dy）
-        label = "坡度"
-        lfs = max(8, int(round(self.gauge_label_size
-                               * GAUGE_LABEL_RATIO * ss)))
-        lf = load_font(lfs)
-        lb = ld.textbbox((0, 0), label, font=lf)
-        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
-        ld.text((w - L["pad_x"] - lw - lb[0],
-                 L["label_cy"] + self.gauge_label_dy * ss - lh / 2 - lb[1]),
-                label, fill=(230, 236, 244, int(round(0.72 * 255))),
-                font=lf,
-                stroke_width=stroke, stroke_fill=(0, 0, 0, 160))
-
-        # 3) 左上大字数值（暖黄粗体，沿用 gauge_value_size / gauge_value_dy；
-        #    超宽时收缩避开右上标签）
-        value = gauge_format_pct(pct)
-        max_tw = max(20.0, w - 2 * L["pad_x"] - lw - 8 * ss)
-        vfs = _fit_font_size(
-            lambda fs: ld.textbbox((0, 0), value,
-                                   font=load_font(fs, bold=True))[2],
-            int(round(self.gauge_value_size * ss)), max_tw)
-        vfs = min(vfs, max(8, int(round(
-            (L["plot_y0"] - L["value_y"]) * 1.1))))   # 高度上限：不压到剖面区
-        vf = load_font(vfs, bold=True)
-        vb = ld.textbbox((0, 0), value, font=vf)
-        ld.text((L["pad_x"] - vb[0],
-                 L["value_y"] + self.gauge_value_dy * ss - vb[1]),
-                value, fill=ELEV_PROGRESS, font=vf,
-                stroke_width=stroke, stroke_fill=(0, 0, 0, 200))
-
-        # 4) 全程坡度剖面迷你曲线
-        series = self._gauge_series
-        if len(series) >= 2:
-            x0, x1 = L["plot_x0"], L["plot_x1"]
-            y0, y1 = L["plot_y0"], L["plot_y1"]
-            mid = (y0 + y1) / 2.0            # 0% 基线
-            amp = (y1 - y0) / 2.0            # ±60% 对应半高
-            n = len(series)
-            # 显示降采样：序列常达数千点，直接画会在 ~200px 内糊成噪声。
-            # 按 x 像素桶取均值，目标 ~每 2px 一个显示点，曲线平滑可读。
-            buckets = max(24, int(round((x1 - x0) / (2.0 * ss))))
-            pts = []
-            for b in range(buckets):
-                i0 = int(b * n / buckets)
-                i1 = max(i0 + 1, int((b + 1) * n / buckets))
-                seg = series[i0:i1]
-                vv = max(-60.0, min(60.0, sum(seg) / len(seg)))
-                pts.append((x0 + (x1 - x0) * (b + 0.5) / buckets,
-                            mid - vv / 60.0 * amp))
-
-            # 4a) 渐变面积：曲线与 0% 基线围成区域，暖橙→紫蓝（海拔计同款）
-            plot_w = max(2, int(round(x1 - x0)))
-            plot_h = max(2, int(round(y1 - y0)))
-            top_c, bot_c = ELEV_AREA_TOP, ELEV_AREA_BOTTOM
-            grad_alpha = int(round(0.88 * a * 255))
-            grad = Image.new("RGBA", (plot_w, plot_h))
-            gd = grad.load()
-            for yy in range(plot_h):
-                t = yy / max(1, plot_h - 1)
-                r = int(round(top_c[0] + (bot_c[0] - top_c[0]) * t))
-                g = int(round(top_c[1] + (bot_c[1] - top_c[1]) * t))
-                b = int(round(top_c[2] + (bot_c[2] - top_c[2]) * t))
-                for xx in range(plot_w):
-                    gd[xx, yy] = (r, g, b, grad_alpha)
-            mask = Image.new("L", (plot_w, plot_h), 0)
-            md = ImageDraw.Draw(mask)
-            poly = [(px - x0, py - y0) for px, py in pts]
-            poly += [(x1 - x0, mid - y0), (0, mid - y0)]
-            md.polygon(poly, fill=255)
-            layer.paste(grad, (int(round(x0)), int(round(y0))), mask)
-
-            # 4b) 0% 基线（虚线）
-            step = max(3.0, 4.0 * ss)
-            xx = x0
-            while xx < x1:
-                ld.line((xx, mid, min(xx + step, x1), mid),
-                        fill=(255, 255, 255, int(round(0.18 * 255))),
-                        width=stroke)
-                xx += step * 2
-
-            # 4c) 白色曲线
-            ld.line(pts, fill=ELEV_LINE, width=max(1, int(round(1.6 * ss))),
-                    joint="curve")
-
-            # 4d) 当前位置圆点（白圈 + 暖黄芯，随进度在剖面上移动）
-            frac = max(0.0, min(1.0, idx / max(1, n - 1)))
-            cur_x = x0 + (x1 - x0) * frac
-            cur_y = mid - max(-60.0, min(60.0, pct)) / 60.0 * amp
-            ro = L["dot_r"] * 1.5
-            ri = L["dot_r"] * 0.82
-            ld.ellipse([cur_x - ro, cur_y - ro, cur_x + ro, cur_y + ro],
-                       fill=(255, 255, 255, 245))
-            ld.ellipse([cur_x - ri, cur_y - ri, cur_x + ri, cur_y + ri],
-                       fill=ELEV_PROGRESS)
 
     # ── 进度环 ──
 
@@ -2389,6 +2126,9 @@ def _worker_init(renderer: Renderer, frames_dir: Path):
     global _WORKER_RENDERER, _WORKER_FRAMES_DIR
     _WORKER_RENDERER = renderer
     _WORKER_FRAMES_DIR = frames_dir
+    # 坡度仪走 QPainter 绘制：worker 进程懒创建 offscreen QGuiApplication（QFont 依赖）
+    from gauge_paint import ensure_qapp
+    ensure_qapp()
 
 
 def _worker_render_one(task) -> int:
