@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>坡度仪重设计提案</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #12151c; color: #dde3ec;
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    padding: 32px 24px 64px; max-width: 1180px; margin: 0 auto;
+  }
+  h1 { font-size: 26px; margin-bottom: 8px; }
+  .sub { color: #93a0b4; font-size: 14px; line-height: 1.7; margin-bottom: 28px; }
+  .sub b { color: #cdd6e4; }
+  .card {
+    background: #1a1f2a; border: 1px solid #2a3242; border-radius: 14px;
+    padding: 20px 22px; margin-bottom: 22px;
+  }
+  .card h2 { font-size: 18px; display: flex; align-items: center; gap: 10px; }
+  .pill {
+    font-size: 11px; font-weight: 700; letter-spacing: .5px;
+    padding: 3px 11px; border-radius: 20px;
+  }
+  .pill.a { background: #274067; color: #9cc4ff; }
+  .pill.b { background: #4a2f63; color: #d3b0ff; }
+  .pill.c { background: #1f4a3d; color: #8ee6c3; }
+  .pill.d { background: #55361f; color: #ffc38e; }
+  .pill.cur { background: #3a3f4a; color: #aab2bf; }
+  .desc { color: #98a4b8; font-size: 13.5px; line-height: 1.75; margin: 8px 0 16px; }
+  .desc b { color: #ccd5e2; }
+  .tiles { display: flex; flex-wrap: wrap; gap: 14px; }
+  .tile {
+    position: relative; border-radius: 10px; overflow: hidden; flex: none;
+    background: #263042 url('assets/gauge_preview_bg.jpg') center/cover;
+    box-shadow: inset 0 0 0 1px #ffffff22;
+  }
+  .tile svg { position: absolute; left: 12px; bottom: 12px; }
+  .tile .cap {
+    position: absolute; right: 8px; top: 6px; font-size: 11px; font-weight: 700;
+    color: #fff; text-shadow: 0 1px 3px #000; letter-spacing: .5px;
+  }
+  .playground {
+    background: #1a1f2a; border: 1px solid #2a3242; border-radius: 14px;
+    padding: 20px 22px;
+  }
+  .stage {
+    position: relative; border-radius: 12px; overflow: hidden;
+    background: #263042 url('assets/gauge_preview_bg.jpg') center/cover;
+    min-height: 230px; box-shadow: inset 0 0 0 1px #ffffff22;
+    display: flex; align-items: flex-end; gap: 26px; padding: 16px 18px; flex-wrap: wrap;
+  }
+  .stage .slot { position: relative; flex: none; }
+  .stage .slot .nm {
+    position: absolute; left: 2px; top: -18px; font-size: 11px; font-weight: 700;
+    color: #fff; text-shadow: 0 1px 3px #000; white-space: nowrap;
+  }
+  .controls { display: flex; align-items: center; gap: 16px; margin-top: 16px; }
+  input[type=range] { flex: 1; accent-color: #ffb347; height: 4px; }
+  .pctval {
+    font-variant-numeric: tabular-nums; font-weight: 800; font-size: 18px;
+    width: 76px; text-align: right; text-shadow: 0 1px 2px #000;
+  }
+  button {
+    background: #2c3648; color: #dfe6f0; border: 1px solid #3d4a60;
+    border-radius: 8px; padding: 7px 18px; font-size: 13px; cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { background: #36425a; }
+  button.on { background: #4a5d2c; border-color: #6d8a3f; }
+  .note { color: #7d8a9e; font-size: 12.5px; margin-top: 14px; line-height: 1.7; }
+</style>
+</head>
+<body>
+
+<h1>动态坡度仪 · 重设计提案</h1>
+<div class="sub">
+  坡度<b>计算逻辑完全不变</b>（±60% 裁剪、帧密度自适应平滑、连续配色插值、字号/颜色/透明度可配置），
+  仅重绘<b>外观</b>。以下 4 个新方案叠加在真实徒步画面上展示，页面底部可拖动滑块或点击「自动演示」查看动态效果。
+</div>
+
+<div id="rows"></div>
+
+<div class="playground">
+  <h2 style="font-size:17px; margin-bottom:14px;">动态效果演示</h2>
+  <div class="stage" id="stage"></div>
+  <div class="controls">
+    <button id="playBtn" onclick="togglePlay()">▶ 自动演示</button>
+    <input type="range" id="slider" min="-60" max="60" step="1" value="23" oninput="setPct(+this.value)">
+    <div class="pctval" id="pctval">+23%</div>
+  </div>
+  <div class="note">
+    提示：视频输出为透明背景 MOV，方案 A / B 为无底板设计（直接叠在画面上）；
+    方案 C / D 自带半透明底板，与数据面板、海拔一览图风格更统一。
+    选定方案后我再实现到 renderer 与 GUI 预览。
+  </div>
+</div>
+
+<script>
+/* ───────── 基础：与 renderer.py 完全一致的配色逻辑 ───────── */
+const COLD=[70,130,255], CYAN=[60,200,220], GREEN=[50,190,110],
+      ORANGE=[255,170,40], WARM=[235,70,70];
+const STOPS=[[-60,COLD],[-25,CYAN],[-10,GREEN],[10,GREEN],[25,ORANGE],[60,WARM]];
+function slopeColor(p){
+  p=Math.max(-60,Math.min(60,p));
+  for(let i=0;i<STOPS.length-1;i++){
+    const [x0,a]=STOPS[i],[x1,b]=STOPS[i+1];
+    if(p<=x1){
+      const t=x1<=x0?0:Math.max(0,Math.min(1,(p-x0)/(x1-x0)));
+      return [0,1,2].map(k=>Math.round(a[k]+(b[k]-a[k])*t));
+    }
+  }
+  return WARM;
+}
+const rgb=c=>`rgb(${c[0]},${c[1]},${c[2]})`;
+const fmt=p=>{const v=Math.round(p);return v===0?'0%':(v>0?'+':'')+v+'%';};
+const FONT=`"Microsoft YaHei","PingFang SC",sans-serif`;
+function txt(x,y,s,size,fill,weight,sw,anchor='middle',op=1){
+  return `<text x="${x}" y="${y}" font-family='${FONT}' font-size="${size}" font-weight="${weight}" fill="${fill}" fill-opacity="${op}" text-anchor="${anchor}" dominant-baseline="central" paint-order="stroke" stroke="#000" stroke-width="${sw}" stroke-linejoin="round">${s}</text>`;
+}
+
+/* ───────── 当前方案（对照） ───────── */
+function drawCur(p,uid){
+  const bx0=50.4,bx1=81.2,bt=7,bb=89.6;
+  const y=q=>bb-(q+60)/120*(bb-bt);
+  const cols=[COLD,CYAN,GREEN,ORANGE,WARM];
+  const bounds=[[-60,-25],[-25,-10],[-10,10],[10,25],[25,60]];
+  let s=`<svg viewBox="0 0 140 140" width="140" height="140" xmlns="http://www.w3.org/2000/svg">`;
+  bounds.forEach((b,i)=>{ s+=`<rect x="${bx0}" y="${y(b[1])}" width="${bx1-bx0}" height="${y(b[0])-y(b[1])}" fill="${rgb(cols[i])}" fill-opacity="0.85"/>`; });
+  const tickF=12.5, labeled={60:1,25:1,10:1,0:1,'-10':1,'-25':1,'-60':1};
+  [60,40,25,10,0,-10,-25,-40,-60].forEach(v=>{
+    const yy=y(v), major=labeled[v], zero=v===0;
+    if(zero){ s+=`<line x1="${bx0-11.3}" y1="${yy}" x2="${bx1}" y2="${yy}" stroke="rgba(255,255,255,.94)" stroke-width="2"/>`; }
+    else{
+      const x0=major?bx0-6.3:bx0-3.5;
+      s+=`<line x1="${x0}" y1="${yy}" x2="${bx0}" y2="${yy}" stroke="rgba(255,255,255,${major?.84:.5})" stroke-width="${major?1.5:1}"/>`;
+    }
+    if(major||zero){ s+=txt(44.8,yy,fmt(v),tickF,'#fff',400,2.5,'end'); }
+  });
+  s+=`<rect x="${bx0}" y="${bt}" width="${bx1-bx0}" height="${bb-bt}" fill="none" stroke="rgba(255,255,255,.78)" stroke-width="1"/>`;
+  const ym=y(p), vc=rgb(slopeColor(p));
+  s+=`<line x1="${bx0}" y1="${ym}" x2="${bx1}" y2="${ym}" stroke="rgba(255,255,255,.9)" stroke-width="1"/>`;
+  s+=`<polygon points="95.2,${ym-6.3} 95.2,${ym+6.3} ${bx1},${ym}" fill="${vc}" stroke="#fff" stroke-width="1.2" stroke-linejoin="round"/>`;
+  s+=txt(70,100.8,fmt(p),24,vc,700,3);
+  return s+`</svg>`;
+}
+
+/* ───────── 方案 A：极简竖条 + 光点旋钮 ───────── */
+function drawA(p,uid){
+  const bx=40,bw=22,bt=8,bb=132,cx=bx+bw/2;
+  const y=q=>bb-(q+60)/120*(bb-bt);
+  const vc=rgb(slopeColor(p));
+  const stops=[0,.2917,.4167,.5833,.7083,1].map((o,i)=>
+    `<stop offset="${o}" stop-color="${rgb([WARM,ORANGE,GREEN,GREEN,CYAN,COLD][i])}"/>`).join('');
+  return `<svg viewBox="0 0 140 140" width="140" height="140" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="gA${uid}" x1="0" y1="0" x2="0" y2="1">${stops}</linearGradient></defs>
+  <rect x="${bx}" y="${bt}" width="${bw}" height="${bb-bt}" rx="11" fill="url(#gA${uid})" fill-opacity="0.92"/>
+  <rect x="${bx}" y="${bt}" width="${bw}" height="${bb-bt}" rx="11" fill="none" stroke="rgba(255,255,255,.4)" stroke-width="1"/>
+  <circle cx="${cx}" cy="${y(p)}" r="12" fill="${vc}" fill-opacity="0.38"/>
+  <circle cx="${cx}" cy="${y(p)}" r="6.8" fill="#fff" stroke="rgba(0,0,0,.45)" stroke-width="1.6"/>
+  ${txt(103,32,'坡度',12,'rgba(255,255,255,.85)',600,3)}
+  ${txt(103,66,fmt(p),29,vc,700,4)}
+</svg>`;
+}
+
+/* ───────── 方案 B：半圆弧仪表 ───────── */
+function drawB(p,uid){
+  const cx=70,cy=84,R=47,W=14;
+  const pt=a=>[cx+R*Math.cos(a*Math.PI/180), cy-R*Math.sin(a*Math.PI/180)];
+  const [lx,ly]=pt(180),[rx2,ry2]=pt(0),[tx,ty]=pt(90);
+  const th=90*(1-Math.max(-60,Math.min(60,p))/60);
+  const [ex,ey]=pt(th);
+  const vc=rgb(slopeColor(p));
+  const gstops=[0,.2917,.4167,.5833,.7083,1].map((o,i)=>
+    `<stop offset="${o}" stop-color="${rgb([COLD,CYAN,GREEN,GREEN,ORANGE,WARM][i])}"/>`).join('');
+  let arc='';
+  if(Math.abs(p)>=1){
+    const sweep=p>0?1:0;
+    arc=`<path d="M ${tx} ${ty} A ${R} ${R} 0 0 ${sweep} ${ex} ${ey}" fill="none" stroke="${vc}" stroke-width="${W}" stroke-linecap="round"/>`;
+  }
+  return `<svg viewBox="0 0 140 140" width="140" height="140" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="gB${uid}" x1="0" y1="0" x2="1" y2="0">${gstops}</linearGradient></defs>
+  <path d="M ${lx} ${ly} A ${R} ${R} 0 0 1 ${rx2} ${ry2}" fill="none" stroke="#101623" stroke-opacity="0.5" stroke-width="${W}" stroke-linecap="round"/>
+  <path d="M ${lx} ${ly} A ${R} ${R} 0 0 1 ${rx2} ${ry2}" fill="none" stroke="url(#gB${uid})" stroke-opacity="0.32" stroke-width="${W}" stroke-linecap="round"/>
+  ${arc}
+  <circle cx="${ex}" cy="${ey}" r="10" fill="${vc}" fill-opacity="0.35"/>
+  <circle cx="${ex}" cy="${ey}" r="5.2" fill="#fff" stroke="rgba(0,0,0,.4)" stroke-width="1.4"/>
+  ${txt(cx,cy+30,fmt(p),30,vc,700,4)}
+  ${txt(cx,cy+49,'坡度',11.5,'rgba(230,236,244,.82)',500,2.5)}
+</svg>`;
+}
+
+/* ───────── 方案 C：横向中零坡度条 ───────── */
+function drawC(p,uid){
+  const w=200,h=76,bx0=12,bx1=188,cyz=56,bh=13,cm=(bx0+bx1)/2;
+  const vc=rgb(slopeColor(p));
+  const mx=cm+p/60*(bx1-cm);
+  const gstops=[0,.2917,.4167,.5833,.7083,1].map((o,i)=>
+    `<stop offset="${o}" stop-color="${rgb([COLD,CYAN,GREEN,GREEN,ORANGE,WARM][i])}"/>`).join('');
+  let fill='';
+  if(Math.abs(p)>=1.5){
+    fill=`<line x1="${cm}" y1="${cyz}" x2="${mx}" y2="${cyz}" stroke="${vc}" stroke-width="${bh}" stroke-linecap="round" stroke-opacity="0.95"/>`;
+  }
+  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="gC${uid}" x1="0" y1="0" x2="1" y2="0">${gstops}</linearGradient></defs>
+  ${txt(12,25,'坡度',13,'rgba(255,255,255,.75)',600,3,'start')}
+  ${txt(bx1,26,fmt(p),28,vc,700,4,'end')}
+  <rect x="${bx0}" y="${cyz-bh/2}" width="${bx1-bx0}" height="${bh}" rx="6.5" fill="url(#gC${uid})" fill-opacity="0.92"/>
+  <rect x="${bx0}" y="${cyz-bh/2}" width="${bx1-bx0}" height="${bh}" rx="6.5" fill="none" stroke="rgba(255,255,255,.35)" stroke-width="1"/>
+  ${fill}
+  <line x1="${cm}" y1="${cyz-bh/2-3}" x2="${cm}" y2="${cyz+bh/2+3}" stroke="rgba(255,255,255,.9)" stroke-width="2"/>
+  <circle cx="${mx}" cy="${cyz}" r="9.5" fill="${vc}" fill-opacity="0.35"/>
+  <circle cx="${mx}" cy="${cyz}" r="5" fill="#fff" stroke="rgba(0,0,0,.4)" stroke-width="1.4"/>
+</svg>`;
+}
+
+/* ───────── 方案 D：HUD 深色卡片 ───────── */
+function drawD(p,uid){
+  const w=176,h=88,sx0=18,sx1=158,sy=58,sh=7;
+  const vc=rgb(slopeColor(p));
+  const mx=sx0+(p+60)/120*(sx1-sx0);
+  const gstops=[0,.2917,.4167,.5833,.7083,1].map((o,i)=>
+    `<stop offset="${o}" stop-color="${rgb([COLD,CYAN,GREEN,GREEN,ORANGE,WARM][i])}"/>`).join('');
+  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="gD${uid}" x1="0" y1="0" x2="1" y2="0">${gstops}</linearGradient></defs>
+  <rect x="0.5" y="0.5" width="${w-1}" height="${h-1}" rx="18" fill="rgba(13,17,26,0.6)" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+  ${txt(sx0,33,'坡度',13,'#a9b4c4',600,2.5,'start')}
+  ${txt(sx1,35,fmt(p),32,vc,700,4,'end')}
+  <rect x="${sx0}" y="${sy-sh/2}" width="${sx1-sx0}" height="${sh}" rx="3.5" fill="url(#gD${uid})" fill-opacity="0.95"/>
+  <circle cx="${mx}" cy="${sy}" r="6.2" fill="rgba(0,0,0,0.45)"/>
+  <circle cx="${mx}" cy="${sy}" r="4.2" fill="#fff"/>
+</svg>`;
+}
+
+/* ───────── 渲染静态对比行 ───────── */
+const DESIGNS=[
+  {id:'cur', pill:'cur', pillTxt:'当前方案', name:'当前：竖直色阶尺（对照）',
+   desc:'保留在此便于对比：5 档色阶条 + 双侧刻度文字 + 三角滑标 + 下方数值，元素较多、仪器感重。',
+   size:[164,164], draw:drawCur},
+  {id:'a', pill:'a', pillTxt:'方案 A', name:'极简竖条 · 光点旋钮',
+   desc:'一条竖直<b>连续渐变胶囊</b>（蓝→绿→红），去掉全部刻度与文字，只用一枚<b>白色光点旋钮</b>指示当前位置，右侧大号彩色数值。最干净、最不遮挡画面，运动 HUD 风格。',
+   size:[164,164], draw:drawA},
+  {id:'b', pill:'b', pillTxt:'方案 B', name:'半圆弧仪表',
+   desc:'<b>半圆弧</b>从左（陡下）扫到右（陡上），常态为暗色轨道 + 微弱彩色刻度，当前坡度用<b>亮色圆头弧段</b>从顶部 0% 展开，弧端带光点，弧心下方为大号数值。仪表感强、一眼读数。',
+   size:[164,164], draw:drawB},
+  {id:'c', pill:'c', pillTxt:'方案 C', name:'横向中零坡度条',
+   desc:'<b>横向胶囊条，中心为 0%</b>：向右亮起红色表示上坡、向左亮起蓝色表示下坡，亮段长度即坡度大小，端点带光点；数值在条上方。<b>扁宽造型</b>适合放在画面底边，与字幕区域融为一体。',
+   size:[224,100], draw:drawC},
+  {id:'d', pill:'d', pillTxt:'方案 D', name:'HUD 深色卡片',
+   desc:'与<b>海拔一览图同风格</b>的深色圆角卡片：左侧灰色「坡度」小标签、右侧大号彩色数值，下方一条细渐变指示条 + 白色游标。信息层级清晰，和现有面板体系最统一。',
+   size:[200,112], draw:drawD},
+];
+const PCTS=[32,12,0,-18,-45];
+const rowsEl=document.getElementById('rows');
+let uidSeq=0;
+DESIGNS.forEach(dz=>{
+  const card=document.createElement('div');
+  card.className='card';
+  let tiles='';
+  PCTS.forEach(p=>{
+    tiles+=`<div class="tile" style="width:${dz.size[0]}px;height:${dz.size[1]}px">
+      <span class="cap">${fmt(p)}</span>${dz.draw(p,++uidSeq)}</div>`;
+  });
+  card.innerHTML=`<h2><span class="pill ${dz.pill}">${dz.pillTxt}</span>${dz.name}</h2>
+    <div class="desc">${dz.desc}</div><div class="tiles">${tiles}</div>`;
+  rowsEl.appendChild(card);
+});
+
+/* ───────── 动态演示 ───────── */
+const stage=document.getElementById('stage');
+const slots=[];
+DESIGNS.forEach(dz=>{
+  const s=document.createElement('div');
+  s.className='slot';
+  s.style.width=dz.size[0]+'px'; s.style.height=dz.size[1]+'px';
+  s.innerHTML=`<div class="nm">${dz.pillTxt.replace('（对照）','')}</div>`;
+  stage.appendChild(s);
+  slots.push({el:s, draw:dz.draw});
+});
+let curPct=23, playing=false, dir=1, rafId=null, uid=10000;
+function renderAll(){
+  slots.forEach(o=>{ o.el.innerHTML=o.el.querySelector('.nm').outerHTML+o.draw(curPct,++uid); });
+  const el=document.getElementById('pctval');
+  el.textContent=fmt(curPct);
+  el.style.color=rgb(slopeColor(curPct));
+  document.getElementById('slider').value=curPct;
+}
+function setPct(v){ curPct=v; renderAll(); }
+function tick(){
+  curPct+=dir*1.6;
+  if(curPct>=60){curPct=60;dir=-1;}
+  if(curPct<=-60){curPct=-60;dir=1;}
+  renderAll();
+  rafId=setTimeout(tick,40);
+}
+function togglePlay(){
+  playing=!playing;
+  const btn=document.getElementById('playBtn');
+  if(playing){ btn.textContent='⏸ 暂停'; btn.classList.add('on'); tick(); }
+  else{ btn.textContent='▶ 自动演示'; btn.classList.remove('on'); clearTimeout(rafId); }
+}
+renderAll();
+</script>
+</body>
+</html>
