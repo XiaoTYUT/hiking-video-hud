@@ -977,18 +977,7 @@ class Renderer:
             if len(traveled) >= 2:
                 d.line(traveled, fill=self.visited_color + (230,), width=w_red)
 
-        # 2) 当前位置标记
-        if 0 <= idx < len(projected):
-            cx, cy = projected[idx]
-            for r, a in [(22 * ss, 60), (16 * ss, 120), (10 * ss, 180)]:
-                d.ellipse([cx - r, cy - r, cx + r, cy + r],
-                          fill=(255, 80, 80, a))
-            d.ellipse([cx - 6 * ss, cy - 6 * ss, cx + 6 * ss, cy + 6 * ss],
-                      fill=(255, 255, 255, 255))
-            d.ellipse([cx - 4 * ss, cy - 4 * ss, cx + 4 * ss, cy + 4 * ss],
-                      fill=(255, 60, 60, 255))
-
-        # 2b) 起点/终点标记（大圆点，带白边；半径随缩放，颜色由用户配置）
+        # 2) 起点/终点标记（大圆点，带白边；半径随缩放，颜色由用户配置）
         if len(projected) >= 2:
             r = max(5, int(round(14 * ts * ss)))
             for (px, py), color in [(projected[0], self.start_color),
@@ -997,7 +986,7 @@ class Renderer:
                           outline=(255, 255, 255, 220), width=max(1, int(2 * ss)),
                           fill=color + (255,))
 
-        # 2c) 关键节点（彩色圆点 + 半透明黑底条白字标签，随轨迹缩放）
+        # 2b) 关键节点（彩色圆点 + 半透明黑底条白字标签，随轨迹缩放）
         if self.key_nodes:
             node_r = max(3, int(round(8 * ts * ss)))
             node_font = load_font(max(9, int(round(self.node_font_size * ts * ss))))
@@ -1018,6 +1007,18 @@ class Renderer:
                                     fill=(0, 0, 0, 115))
                 d.text((tx, ty), name, fill=(255, 255, 255, 255),
                        font=node_font)
+
+        # 2c) 当前位置标记（最后绘制 = 层级最高：盖住关键节点标签与起终点，
+        #     运动到任何位置时实时位置始终可见）
+        if 0 <= idx < len(projected):
+            cx, cy = projected[idx]
+            for r, a in [(22 * ss, 60), (16 * ss, 120), (10 * ss, 180)]:
+                d.ellipse([cx - r, cy - r, cx + r, cy + r],
+                          fill=(255, 80, 80, a))
+            d.ellipse([cx - 6 * ss, cy - 6 * ss, cx + 6 * ss, cy + 6 * ss],
+                      fill=(255, 255, 255, 255))
+            d.ellipse([cx - 4 * ss, cy - 4 * ss, cx + 4 * ss, cy + 4 * ss],
+                      fill=(255, 60, 60, 255))
 
         # 3) 数据面板（带用户平移缩放）
         ascent = self.cum_ascent[idx]
