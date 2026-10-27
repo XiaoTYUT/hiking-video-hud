@@ -75,7 +75,7 @@ def _outlined_text(painter, text, rect, color, font, o: int = 1,
 # ─────────────────────── 入口分发 ───────────────────────
 
 def paint_gauge(painter, r, s: float, pct: float, idx: float, ss: float = 1.0):
-    """按 r.gauge_style 分发给三种样式绘制函数。
+    """按 r.gauge_style 分发给三种样式绘制函数，最后统一压暗。
 
     painter 坐标原点 = 坡度仪占位框左上角；s = slope_gauge_size × ss。
     """
@@ -85,6 +85,24 @@ def paint_gauge(painter, r, s: float, pct: float, idx: float, ss: float = 1.0):
         paint_gauge_profile(painter, r, s, pct, idx, ss)
     else:
         paint_gauge_arc(painter, r, s, pct, ss)
+    _apply_brightness(painter, r, s)
+
+
+def _apply_brightness(painter, r, s: float) -> None:
+    """整体亮度：SourceAtop 叠一层黑色，RGB 按比例变暗、alpha 原样保留
+    （透明区域不受影响）。两种预览/成片路径都经过这里，效果一致。"""
+    from PyQt5.QtCore import Qt, QRectF
+    from PyQt5.QtGui import QColor
+    b = max(0.0, min(100.0, getattr(r, "gauge_brightness_pct", 100.0))) / 100.0
+    if b >= 0.999:
+        return
+    fw, fh = gauge_footprint(r.gauge_style, s)
+    painter.save()
+    painter.setCompositionMode(painter.CompositionMode_SourceAtop)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(0, 0, 0, int(round((1.0 - b) * 255))))
+    painter.drawRect(QRectF(0, 0, fw, fh))
+    painter.restore()
 
 
 def render_gauge_layer(r, s: float, pct: float, idx: float,

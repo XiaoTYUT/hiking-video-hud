@@ -776,6 +776,7 @@ class Renderer:
         self.gauge_edge_top_color: Tuple[int, int, int] = GAUGE_WARM_DEFAULT  # 色阶暖端（上坡）
         self.gauge_edge_bottom_color: Tuple[int, int, int] = GAUGE_COLD_DEFAULT  # 色阶冷端（下坡）
         self.gauge_fill_alpha_pct: float = 85.0  # 色阶条不透明度 0-100%
+        self.gauge_brightness_pct: float = 82.0  # 整体亮度 0-100%（100 = 原色）
         self._gauge_series: List[float] = []     # 帧密度自适应平滑后的百分比序列（懒构建）
         self.preview_idx: float = -1.0           # GUI 画布预览索引（-1 = 末点），渲染时不参与
 
@@ -872,6 +873,7 @@ class Renderer:
         self.gauge_style = getattr(self, "gauge_style", "arc")
         self.gauge_label_dy = getattr(self, "gauge_label_dy", 0.0)
         self.gauge_value_dy = getattr(self, "gauge_value_dy", 0.0)
+        self.gauge_brightness_pct = getattr(self, "gauge_brightness_pct", 82.0)
         # 兼容旧快照：补齐海拔一览图属性
         self.show_elev_profile = getattr(self, "show_elev_profile", True)
         self.elev_profile_w = getattr(self, "elev_profile_w", 360.0)

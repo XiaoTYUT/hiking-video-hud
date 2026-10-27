@@ -165,8 +165,11 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 - **问题**：原来 7 个分组约 28 行 ≈ 950~1000px 高、无滚动条，小屏会被直接裁掉
 - **外层套 `QScrollArea`**（widgetResizable、NoFrame）兜底；进度条 + ⛔终止 放在滚动区**外面**的底部，始终可见
 - **外侧只留常用项**（现约 387px 高）：输出规格（宽度/高度）、时长 & 帧率（生成方式/时长/帧率/输出倍率/输出尺寸/总帧数）、🎨 外观与标注设置… 按钮
-- **不常用项收进非模态窗口**「外观与标注设置」（`QDialog`，`_build_appearance_dialog()` 建，窗口隐藏待用；`_open_appearance_dialog()` 显示/前置），分 3 页 `QTabWidget`：
-  - 数据面板 → `self._page_panel`：数据项显示（`fg`）+ 面板背景（`bg`）
+- **不常用项收进非模态窗口**「外观与标注设置」（`QDialog`，`_build_appearance_dialog()` 建，窗口隐藏待用；`_open_appearance_dialog()` 显示/前置），分 3 页 `QTabWidget`，**每页内容再套 `QScrollArea`**（小窗口也不会裁掉底部条目）：
+  - 数据面板（二级 `QTabWidget` 分块，避免一页 30+ 行控件）：
+    - 「面板与背景」→ `self._page_panel`：数据项显示（`fg`）+ 面板背景（`bg`）
+    - 「坡度仪」→ `self._page_panel_gauge`：动态坡度仪（`gg`）
+    - 「海拔图 & 进度环」→ `self._page_panel_extra`：海拔一览图（`eg`）+ 进度环（`rg`）
   - 地图导航 → `self._page_map`：`mg`
   - 轨迹与标注 → `self._page_track`：轨迹（`tg`，轨迹粗细）+ 关键节点（`kg`）
 - 各页 layout 用 `setAlignment(Qt.AlignTop)`（**不要**用 addStretch，分组是后加的会被挤到 stretch 之后）
@@ -222,11 +225,12 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 - **共享绘制（2026-10-26 起）**：三样式绘制代码集中在 `gauge_paint.py`（`paint_gauge`/`paint_gauge_arc`/`paint_gauge_card`/`paint_gauge_profile`，QPainter），GUI 预览（SlopeGaugeItem.paint，ss=1）与视频端（`render_gauge_layer` 离屏渲染）调同一函数 → 像素级 WYSIWYG（已测三样式逐像素 diff=0）。旧 PIL 手绘 `_paint_gauge_*` 已删除。ss 约定：布局函数接收已乘 ss 的尺寸，字体/dy 偏移/线宽在共享函数内乘 ss。
 - **QPainter 依赖 QGuiApplication**：worker/CLI 进程由 `gauge_paint.ensure_qapp()` 懒创建（`_worker_init` 调用；GUI 进程复用已有 QApplication）。**坑：offscreen 平台字体数据库为空（families()=0），drawText 静默失败** → Windows 上用 windows 平台建 QGuiApplication（不建窗口即不弹窗），其他平台回退 offscreen。
 - **排版**：布局常量集中在 renderer 模块级 `gauge_footprint(style,size)`（arc=正方形；card=1.2571×0.6286 倍）、`gauge_arc_layout(size)`、`gauge_card_layout(size)`、`gauge_gradient_stops(cold,warm)`（横向渐变锚点）、`GAUGE_LABEL_RATIO`（标签字号比例）、`gauge_value_color` / `gauge_format_pct` / `_fit_font_size`，gauge_paint 复用。PIL arc 顺时针（0=3点钟）与 Qt drawArc（1/16 度逆时针）换算：**Qt角 = 360 − PILφ**。图层右/下 +1px 余量（卡片 1px 边框以 w/h 为路径中心，右/底缘 0.5px 溢出防裁）。
-- **样式全可配**（Renderer 属性 → GUI「动态坡度仪」组 → .kmlproj 持久化）：`gauge_edge_top_color` 暖端（上坡）、`gauge_edge_bottom_color` 冷端（下坡）、`gauge_label_size` 标签字号、`gauge_value_size` 数值字号、`gauge_fill_alpha_pct` 彩色不透明度、`gauge_style` 样式。
+- **样式全可配**（Renderer 属性 → GUI「动态坡度仪」组 → .kmlproj 持久化）：`gauge_edge_top_color` 暖端（上坡）、`gauge_edge_bottom_color` 冷端（下坡）、`gauge_label_size` 标签字号、`gauge_value_size` 数值字号、`gauge_fill_alpha_pct` 彩色不透明度、`gauge_brightness_pct` 整体亮度（默认 82%，100 = 原色）、`gauge_style` 样式。
+- **整体亮度**：`gauge_paint._apply_brightness` 在 paint_gauge 末尾用 `CompositionMode_SourceAtop` 叠一层黑色（alpha = 1−亮度），RGB 按比例变暗、alpha 原样保留、透明区不受影响；GUI 预览与视频端共用 → 效果一致。
 - Renderer：`show_slope_gauge`（默认 True）、`slope_gauge_pos`、`slope_gauge_size`（默认 140px）、`preview_idx`（GUI 预览索引，-1 = 末点）。方法 `_build_gauge_series(half)`、`prepare_gauge_smoothing(total_frames)`、`gauge_pct(idx)`（支持浮点插值）、`preview_index()`、`_draw_slope_gauge(img, idx)`（ensure_qapp → `gauge_paint.render_gauge_layer` 离屏 QPainter 绘制 → PIL 图层合成）。
-- app.py：`SlopeGaugeItem(QGraphicsRectItem)`：rect 用 `gauge_footprint` 设置（拖拽命中区），paint 调 `gauge_paint.paint_gauge`（与视频端同一函数），滚轮调大小，hover/selected 虚线框。控件组在「数据面板」页：显示开关 / **画布预览播放（QTimer 60ms 推进 `renderer.preview_idx`）** / 样式下拉框（半圆弧仪表·方案B / HUD 深色卡片·方案D） / 仪表大小 / 标签字号 / 数值字号 / 彩色不透明度 / 暖端·冷端两色块。
+- app.py：`SlopeGaugeItem(QGraphicsRectItem)`：rect 用 `gauge_footprint` 设置（拖拽命中区），paint 调 `gauge_paint.paint_gauge`（与视频端同一函数），滚轮调大小，hover/selected 虚线框。控件组在「数据面板 → 坡度仪」页：显示开关 / **画布预览播放（QTimer 60ms 推进 `renderer.preview_idx`）** / 样式下拉框（坡度剖面卡·A / 半圆弧仪表·B / HUD 深色卡片·D） / 仪表大小 / 标签字号 / 数值字号 / 数值高度 / 标签高度 / 彩色不透明度 / 亮度 / 暖端·冷端两色块。
 - **平滑方案**：渲染前按帧密度重建点数滑动平均序列，`half = max(4, ceil(1.5 × step))`。GUI 预览用默认 half=4。
-- 持久化：工程文件含 `show_slope_gauge`、`slope_gauge_size`、`slope_gauge_pos`、`gauge_style` 及 gauge_* 样式键；__setstate__ 对旧快照 `getattr(self,"gauge_style","arc")` 兜底。
+- 持久化：工程文件含 `show_slope_gauge`、`slope_gauge_size`、`slope_gauge_pos`、`gauge_style` 及 gauge_* 样式键（含 `gauge_brightness_pct`）；__setstate__ 对旧快照 `getattr(..., 82.0)` 兜底。
 
 ## 16. 当前状态与待办（2026-10-19）
 

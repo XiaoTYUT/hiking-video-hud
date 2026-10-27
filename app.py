@@ -2382,26 +2382,43 @@ class MainWindow(QMainWindow):
 
         非模态才能边调边看主画布实时预览；各页排版容器存到
         self._page_*，由 _build_dock 在创建分组时按页挂载。
+        每个页签内容都套 QScrollArea：窗口再矮也不会把底部设置项裁掉。
+        数据面板设置项较多，再按「面板与背景 / 坡度仪 / 海拔图 & 进度环」
+        拆成三个子页签，避免一页堆 30+ 行控件。
         """
         dlg = QDialog(self)
         dlg.setWindowTitle("外观与标注设置")
         dlg.setModal(False)
-        dlg.setMinimumSize(460, 430)
+        dlg.setMinimumSize(520, 540)
+
+        def _scroll_page():
+            """一页 = 滚动区 + 靠上排版的内容容器。"""
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setFrameShape(QFrame.NoFrame)
+            inner = QWidget()
+            lay = QVBoxLayout(inner)
+            lay.setContentsMargins(8, 8, 8, 8)
+            lay.setSpacing(10)
+            lay.setAlignment(Qt.AlignTop)   # 控件始终靠上，不随高度拉伸
+            sc.setWidget(inner)
+            return sc, lay
 
         tabs = QTabWidget()
 
-        p1 = QWidget()
-        l1 = QVBoxLayout(p1)
-        l1.setAlignment(Qt.AlignTop)       # 控件始终靠上，不随窗口高度拉伸
-        p2 = QWidget()
-        l2 = QVBoxLayout(p2)
-        l2.setAlignment(Qt.AlignTop)
-        p3 = QWidget()
-        l3 = QVBoxLayout(p3)
-        l3.setAlignment(Qt.AlignTop)
+        # 数据面板：二级页签分块
+        panel_tabs = QTabWidget()
+        p1a, l1a = _scroll_page()
+        p1b, l1b = _scroll_page()
+        p1c, l1c = _scroll_page()
+        panel_tabs.addTab(p1a, "面板与背景")
+        panel_tabs.addTab(p1b, "坡度仪")
+        panel_tabs.addTab(p1c, "海拔图 & 进度环")
+        tabs.addTab(panel_tabs, "数据面板")
 
-        tabs.addTab(p1, "数据面板")
+        p2, l2 = _scroll_page()
         tabs.addTab(p2, "地图导航")
+        p3, l3 = _scroll_page()
         tabs.addTab(p3, "轨迹与标注")
 
         v = QVBoxLayout(dlg)
@@ -2410,7 +2427,9 @@ class MainWindow(QMainWindow):
         bb.rejected.connect(dlg.hide)
         v.addWidget(bb)
 
-        self._page_panel, self._page_map, self._page_track = l1, l2, l3
+        self._page_panel, self._page_panel_gauge, self._page_panel_extra = \
+            l1a, l1b, l1c
+        self._page_map, self._page_track = l2, l3
         self.appearance_dlg = dlg
 
     def _open_appearance_dialog(self):
@@ -2532,7 +2551,7 @@ class MainWindow(QMainWindow):
         self.chk_gauge_preview.toggled.connect(self._on_gauge_preview_toggled)
         gf.addRow(self.chk_gauge_preview)
         self.combo_gauge_style = QComboBox()
-        self.combo_gauge_style.addItem("坡度剖面卡（方案A · 海拔计同款）", "profile")
+        self.combo_gauge_style.addItem("坡度剖面卡（方案A）", "profile")
         self.combo_gauge_style.addItem("半圆弧仪表（方案B）", "arc")
         self.combo_gauge_style.addItem("HUD 深色卡片（方案D）", "card")
         self.combo_gauge_style.setToolTip(
@@ -2583,6 +2602,16 @@ class MainWindow(QMainWindow):
             "彩色刻度弧 / 渐变指示条 / 卡片底的不透明度：0 = 全透明，100 = 不透明")
         self.spin_gauge_alpha.valueChanged.connect(self._on_gauge_style_changed)
         gf.addRow("彩色不透明度", self.spin_gauge_alpha)
+        # 整体亮度：100% = 原色，越低越暗（不影响透明度）
+        self.spin_gauge_brightness = QSpinBox()
+        self.spin_gauge_brightness.setRange(20, 100)
+        self.spin_gauge_brightness.setValue(82)
+        self.spin_gauge_brightness.setSuffix(" %")
+        self.spin_gauge_brightness.setToolTip(
+            "坡度仪整体亮度：100 = 原色，越低越暗（数值/刻度/卡片底同步变暗）")
+        self.spin_gauge_brightness.valueChanged.connect(
+            self._on_gauge_style_changed)
+        gf.addRow("亮度", self.spin_gauge_brightness)
         # 颜色配置：色阶冷端（下坡）/ 暖端（上坡）；数值颜色由 5 档色阶自动连续渐变
         self._gauge_colors = {
             "edge_top": QColor(*GAUGE_WARM_DEFAULT),
@@ -2596,7 +2625,7 @@ class MainWindow(QMainWindow):
             self.btn_gauge_color[key] = btn
             gf.addRow(text, btn)
         self._refresh_gauge_color_btns()
-        self._page_panel.addWidget(gg)
+        self._page_panel_gauge.addWidget(gg)
 
         # 海拔一览图（整条路线海拔剖面 + 跟随视频位置移动的标记）
         eg = QGroupBox("海拔一览图")
@@ -2637,7 +2666,7 @@ class MainWindow(QMainWindow):
             sp.valueChanged.connect(self._on_elev_profile_style_changed)
             ef.addRow(_label, sp)
             self._elev_scale_spins[_key] = sp
-        self._page_panel.addWidget(eg)
+        self._page_panel_extra.addWidget(eg)
 
         # 进度环（当前里程 / 全程里程；样式：经典满环 / 紧凑胶囊）
         rg = QGroupBox("进度环")
@@ -2673,7 +2702,7 @@ class MainWindow(QMainWindow):
         self.btn_ring_color.clicked.connect(self._on_pick_ring_color)
         rf.addRow("进度颜色", self.btn_ring_color)
         self._refresh_ring_color_btn()
-        self._page_panel.addWidget(rg)
+        self._page_panel_extra.addWidget(rg)
 
         # 轨迹（设置窗口「轨迹与标注」页）
         tg = QGroupBox("轨迹")
@@ -3329,6 +3358,7 @@ class MainWindow(QMainWindow):
         r.gauge_value_dy = float(self.spin_gauge_value_dy.value())
         r.gauge_label_dy = float(self.spin_gauge_label_dy.value())
         r.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
+        r.gauge_brightness_pct = float(self.spin_gauge_brightness.value())
         mapping = {"edge_top": "gauge_edge_top_color",
                    "edge_bottom": "gauge_edge_bottom_color"}
         for key, attr in mapping.items():
@@ -3784,6 +3814,9 @@ class MainWindow(QMainWindow):
         self.spin_gauge_alpha.blockSignals(True)
         self.spin_gauge_alpha.setValue(_num(s, "gauge_fill_alpha_pct", 85))
         self.spin_gauge_alpha.blockSignals(False)
+        self.spin_gauge_brightness.blockSignals(True)
+        self.spin_gauge_brightness.setValue(_num(s, "gauge_brightness_pct", 82))
+        self.spin_gauge_brightness.blockSignals(False)
         # 仪表样式（arc 半圆弧 / card HUD卡片；旧工程无此键 → 默认半圆弧）
         self.combo_gauge_style.blockSignals(True)
         _gsi = self.combo_gauge_style.findData(str(s.get("gauge_style", "arc")))
@@ -3806,6 +3839,8 @@ class MainWindow(QMainWindow):
         self._refresh_gauge_color_btns()
         if self.renderer is not None:
             self.renderer.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
+            self.renderer.gauge_brightness_pct = float(
+                self.spin_gauge_brightness.value())
         # 海拔一览图控件
         self.chk_elev_profile.blockSignals(True)
         self.chk_elev_profile.setChecked(
@@ -4136,6 +4171,8 @@ class MainWindow(QMainWindow):
         self.renderer.gauge_value_dy = float(self.spin_gauge_value_dy.value())
         self.renderer.gauge_label_dy = float(self.spin_gauge_label_dy.value())
         self.renderer.gauge_fill_alpha_pct = float(self.spin_gauge_alpha.value())
+        self.renderer.gauge_brightness_pct = float(
+            self.spin_gauge_brightness.value())
         self.renderer.gauge_style = (self.combo_gauge_style.currentData()
                                      or "arc")
         _gmap = {"edge_top": "gauge_edge_top_color",
@@ -4495,6 +4532,8 @@ class MainWindow(QMainWindow):
                                if self.renderer else 0.0),
             "gauge_fill_alpha_pct": (self.renderer.gauge_fill_alpha_pct
                                      if self.renderer else 85.0),
+            "gauge_brightness_pct": (self.renderer.gauge_brightness_pct
+                                     if self.renderer else 82.0),
             "gauge_edge_top_color": (list(self.renderer.gauge_edge_top_color)
                                      if self.renderer else list(GAUGE_WARM_DEFAULT)),
             "gauge_edge_bottom_color": (list(self.renderer.gauge_edge_bottom_color)
