@@ -150,11 +150,14 @@ def paint_gauge_arc(painter, r, s: float, pct: float, ss: float = 1.0):
     cx, cy, R, W = L["cx"], L["cy"], L["R"], L["W"]
     rect = QRectF(cx - R, cy - R, 2 * R, 2 * R)
 
-    # 1) 暗色轨道（半圆，圆头端点；透明度随 a）
+    # 1) 暗色轨道（左→顶→右半圆，圆头端点；透明度随 a）
+    #    注意 Qt drawArc：0°=3点钟、正角逆时针（y 向下）→ 0..180 才是上半圆。
+    #    旧 PIL 版 ld.arc(start=180,end=360) 画的也是上半圆；
+    #    迁移时若写成 180..360 会画到下半圆，裸露成一条灰带（已修正）。
     painter.setPen(QPen(_c(r, (16, 22, 35), int(round(0.55 * a * 255))),
                         W, Qt.SolidLine, Qt.RoundCap))
     painter.setBrush(Qt.NoBrush)
-    painter.drawArc(rect, 180 * 16, 180 * 16)
+    painter.drawArc(rect, 0, 180 * 16)
 
     # 2) 彩色刻度弧：48 段小弧拼成连续渐变（左=冷端 → 顶=绿 → 右=暖端）
     seg_pen = QPen()
