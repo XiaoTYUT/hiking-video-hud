@@ -860,6 +860,17 @@ class Renderer:
         state["_elev_cache"] = None      # 静态底图缓存不随快照传输，子进程懒构建
         return state
 
+    def __copy__(self):
+        """浅拷贝（只复制属性字典，共享 points/投影闭包等只读数据）。
+
+        GUI 预览绘制时需要临时改写 elev_profile_pos / map_pos / _ss（把面板摆到
+        临时图片左上角），若直接改共享实例，渲染线程会读到 (1,1) 把面板偶发画到
+        画布左上角。预览端改用本副本改写即可彻底隔离。
+        """
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(self.__dict__)
+        return new
+
     def __setstate__(self, state):
         self.__dict__.update(state)
         # 兼容旧快照：补齐超采样相关属性

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -534,15 +535,11 @@ class MapPanelItem(QGraphicsRectItem):
         pad = ss                                    # 四周留 1px（×ss）给边框描边
         img = Image.new("RGBA", (panel + 2 * pad, panel + 2 * pad), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        saved_pos = r.map_pos
-        saved_ss = int(getattr(r, "_ss", 1) or 1)
-        r._ss = ss
-        r.map_pos = (1.0, 1.0)                      # _draw_map 内部会 ×ss
-        try:
-            r._draw_map(img, d, 0)                  # 视频首帧 = 轨迹索引 0
-        finally:
-            r.map_pos = saved_pos
-            r._ss = saved_ss
+        # 浅拷贝承载临时改写：避免与渲染线程竞态（否则成片会偶发把地图摆到左上角）
+        prev = copy.copy(r)
+        prev._ss = ss
+        prev.map_pos = (1.0, 1.0)                   # _draw_map 内部会 ×ss
+        prev._draw_map(img, d, 0)                   # 视频首帧 = 轨迹索引 0
         buf = BytesIO()
         img.save(buf, format="PNG")
         pix = QPixmap()
@@ -713,6 +710,7 @@ class ElevProfileItem(QGraphicsRectItem):
         super().__init__(0, 0, w, h)
         self.renderer = renderer
         self._hover = False
+        self._base_cache = None              # 静态底图缓存（本 item 私有，不写回共享 renderer）
         self.setPos(renderer.elev_profile_pos[0], renderer.elev_profile_pos[1])
         self.setBrush(QBrush(Qt.NoBrush))
         self.setPen(QPen(Qt.NoPen))
@@ -735,27 +733,26 @@ class ElevProfileItem(QGraphicsRectItem):
 
     def refresh_preview(self):
         """用视频同一套 _draw_elev_profile 渲染当前预览索引的一帧。"""
-        r = self.renderer
-        if r is None or self.scene() is None or len(r.points) < 2:
+        base = self.renderer
+        if base is None or self.scene() is None or len(base.points) < 2:
             return
         ss = self._preview_ss()
-        w = max(40.0, float(r.elev_profile_w))
-        h = max(24.0, float(r.elev_profile_h))
+        w = max(40.0, float(base.elev_profile_w))
+        h = max(24.0, float(base.elev_profile_h))
         pad = ss
         img = Image.new(
             "RGBA",
             (int(round(w * ss)) + 2 * pad, int(round(h * ss)) + 2 * pad),
             (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        saved_pos = r.elev_profile_pos
-        saved_ss = int(getattr(r, "_ss", 1) or 1)
+        # 用浅拷贝承载临时改写：直接改共享 renderer 会与渲染线程竞态，
+        # 让某几帧把海拔图画到画布左上角（(1,1)）
+        r = copy.copy(base)
         r._ss = ss
         r.elev_profile_pos = (1.0, 1.0)      # _draw_elev_profile 内部 ×ss → 1px 留白
-        try:
-            r._draw_elev_profile(img, d, r.preview_index())
-        finally:
-            r.elev_profile_pos = saved_pos
-            r._ss = saved_ss
+        r._elev_cache = self._base_cache     # 复用本 item 私有底图缓存（避免每帧重建）
+        r._draw_elev_profile(img, d, base.preview_index())
+        self._base_cache = r._elev_cache
         buf = BytesIO()
         img.save(buf, format="PNG")
         pix = QPixmap()
@@ -873,24 +870,20 @@ class ProgressRingItem(QGraphicsRectItem):
 
     def refresh_preview(self):
         """用视频同一套 _draw_progress_ring 渲染当前预览索引的一帧。"""
-        r = self.renderer
-        if r is None or self.scene() is None or len(r.points) < 2:
+        base = self.renderer
+        if base is None or self.scene() is None or len(base.points) < 2:
             return
         ss = self._preview_ss()
-        s = float(r.progress_ring_size) * ss
-        fw, fh = ring_footprint(r.progress_ring_style, s)
+        s = float(base.progress_ring_size) * ss
+        fw, fh = ring_footprint(base.progress_ring_style, s)
         pad = max(2, int(round(0.06 * s)))     # 与渲染端一致的环帽余量
         img = Image.new("RGBA", (int(round(fw)) + 2 * pad,
                                  int(round(fh)) + 2 * pad), (0, 0, 0, 0))
-        saved_pos = r.progress_ring_pos
-        saved_ss = int(getattr(r, "_ss", 1) or 1)
+        # 浅拷贝承载临时改写：避免与渲染线程竞态
+        r = copy.copy(base)
         r._ss = ss
         r.progress_ring_pos = (pad / ss, pad / ss)   # 绘制内部 ×ss → 留 pad 边
-        try:
-            r._draw_progress_ring(img, int(round(r.preview_index())))
-        finally:
-            r.progress_ring_pos = saved_pos
-            r._ss = saved_ss
+        r._draw_progress_ring(img, int(round(base.preview_index())))
         buf = BytesIO()
         img.save(buf, format="PNG")
         pix = QPixmap()
