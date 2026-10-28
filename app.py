@@ -50,7 +50,7 @@ from gauge_paint import paint_gauge
 _PROJECT_FIELDS = (
     "kml_path", "canvas", "line_width", "node_font_size", "node_color",
     "unvisited_color", "visited_color", "start_color", "end_color",
-    "duration", "fps", "seg_fps", "panel_fields", "key_nodes",
+    "duration", "fps", "seg_fps", "seg_traj_style", "panel_fields", "key_nodes",
     "use_segments", "segments",
     "trajectory", "panel", "map",
     "show_map", "map_zoom", "map_shape", "map_text_delta",
@@ -1131,6 +1131,220 @@ class SegmentView(QGraphicsView):
             super().mousePressEvent(ev)
 
 
+# ── 分段对话框轨迹配色：按播放进度着色，便于分辨贴在一起的前后两段 ──
+
+# 全轨迹渐变：起点深绿 → 中段青 → 终点珊瑚
+_TRAJ_GRAD_STOPS = ((2, 116, 59), (39, 210, 191), (248, 116, 84))
+# 单向色阶：暗蓝 → 亮蓝（只变明暗，不换色相）
+_TRAJ_MONO_STOPS = ((24, 52, 86), (80, 145, 205), (176, 224, 255))
+# 每段独立渐变：循环色相（段内由暗到亮）
+_TRAJ_SEG_PALETTE = ((232, 93, 68), (241, 171, 58), (126, 199, 96),
+                     (66, 186, 214), (140, 130, 235), (226, 108, 181))
+
+_TRAJ_STYLE_GLOBAL = "global"
+_TRAJ_STYLE_SEGMENT = "per_segment"
+_TRAJ_STYLE_MONO = "mono"
+
+_TRAJ_STYLES = (
+    (_TRAJ_STYLE_GLOBAL, "全轨迹渐变"),
+    (_TRAJ_STYLE_SEGMENT, "每段独立渐变"),
+    (_TRAJ_STYLE_MONO, "单向色阶"),
+)
+
+
+def _ramp_color(stops, t: float) -> QColor:
+    """在 stops 色标之间按 t（0..1）线性插值。"""
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    k = t * (len(stops) - 1)
+    i = min(int(k), len(stops) - 2)
+    f = k - i
+    a, b = stops[i], stops[i + 1]
+    return QColor(int(round(a[0] + (b[0] - a[0]) * f)),
+                  int(round(a[1] + (b[1] - a[1]) * f)),
+                  int(round(a[2] + (b[2] - a[2]) * f)))
+
+
+def _traj_ratios(renderer) -> list:
+    """每个轨迹点的播放进度（0..1），优先用渲染器的累计里程保证与播放口径一致。"""
+    pts = renderer.base_projected
+    n = len(pts)
+    if n <= 1:
+        return [0.0] * n
+    cd = getattr(renderer, "cum_dist", None)
+    if cd and len(cd) == n and cd[-1] > 0:
+        return [max(0.0, min(1.0, c / cd[-1])) for c in cd]
+    acc = [0.0]
+    for i in range(1, n):
+        acc.append(acc[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                        pts[i][1] - pts[i - 1][1]))
+    total = acc[-1] or 1.0
+    return [a / total for a in acc]
+
+
+class GradientTrajectoryItem(QGraphicsItem):
+    """按播放进度着色的轨迹折线（分段对话框预览用）。
+
+    颜色由「沿轨迹的进度」决定，而不是屏幕位置：两段贴在一起的轨迹
+    在同一屏幕位置仍会因进度不同（先走 / 回程）而呈现不同颜色。
+    """
+
+    def __init__(self, pts, ratios, style=_TRAJ_STYLE_GLOBAL, cuts=(), width=3.0):
+        super().__init__()
+        self._pts = list(pts)
+        self._ratios = list(ratios)
+        self._style = style
+        self._cuts = list(cuts)
+        self._w = float(width)
+        if self._pts:
+            xs = [p[0] for p in self._pts]
+            ys = [p[1] for p in self._pts]
+            rect = QRectF(min(xs), min(ys),
+                          max(xs) - min(xs), max(ys) - min(ys))
+        else:
+            rect = QRectF()
+        m = self._w + 12
+        self._rect = rect.adjusted(-m, -m, m, m)
+        self.setZValue(0)
+
+    def boundingRect(self):
+        return self._rect
+
+    def set_style(self, style: str):
+        if style != self._style:
+            self._style = style
+            self.update()
+
+    def set_cuts(self, cuts):
+        self._cuts = list(cuts)
+        self.update()
+
+    def _seg_progress(self, frac: float):
+        """按点索引归一化位置 frac 返回 (段号, 段内进度 0..1)。"""
+        prev = 0.0
+        for i, c in enumerate(self._cuts):
+            if frac < c:
+                return i, ((frac - prev) / (c - prev) if c > prev else 0.0)
+            prev = c
+        return len(self._cuts), ((frac - prev) / (1.0 - prev)
+                                 if prev < 1.0 else 0.0)
+
+    def _color_at(self, t_global: float, frac: float) -> QColor:
+        if self._style == _TRAJ_STYLE_SEGMENT:
+            idx, t_seg = self._seg_progress(frac)
+            base = _TRAJ_SEG_PALETTE[idx % len(_TRAJ_SEG_PALETTE)]
+            k = 0.45 + 0.55 * max(0.0, min(1.0, t_seg))
+            return QColor(int(base[0] * k), int(base[1] * k), int(base[2] * k))
+        if self._style == _TRAJ_STYLE_MONO:
+            return _ramp_color(_TRAJ_MONO_STOPS, t_global)
+        return _ramp_color(_TRAJ_GRAD_STOPS, t_global)
+
+    def paint(self, p: QPainter, opt, widget=None):
+        n = len(self._pts)
+        if n < 2:
+            return
+        p.setRenderHint(QPainter.Antialiasing, True)
+        # 分块：目标每块 2 屏幕像素；总量上限 ~800 块，避免长轨迹重绘过慢
+        m = p.worldTransform().m11() or 1.0
+        total = 0.0
+        for i in range(n - 1):
+            x0, y0 = self._pts[i]
+            x1, y1 = self._pts[i + 1]
+            total += math.hypot(x1 - x0, y1 - y0)
+        if total <= 0:
+            return
+        n_chunks = max(24, min(800, int(total * m / 2.0)))
+        chunk = total / n_chunks
+
+        pen = QPen()
+        pen.setWidthF(self._w)
+        pen.setCosmetic(True)      # 线宽恒定 3px，缩放不变粗
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+
+        for i in range(n - 1):
+            x0, y0 = self._pts[i]
+            x1, y1 = self._pts[i + 1]
+            dx, dy = x1 - x0, y1 - y0
+            seg_len = math.hypot(dx, dy)
+            if seg_len <= 0:
+                continue
+            steps = max(1, int(round(seg_len / chunk)))
+            t0, t1 = self._ratios[i], self._ratios[i + 1]
+            for s in range(steps):
+                a0 = s / steps
+                a1 = (s + 1) / steps
+                a_mid = (a0 + a1) / 2
+                pen.setColor(self._color_at(t0 + (t1 - t0) * a_mid,
+                                            (i + a_mid) / (n - 1)))
+                p.setPen(pen)
+                p.drawLine(QPointF(x0 + dx * a0, y0 + dy * a0),
+                           QPointF(x0 + dx * a1, y0 + dy * a1))
+        self._paint_arrows(p)
+
+    def _paint_arrows(self, p: QPainter):
+        """起点附近与终点各画一个小箭头，标明行进方向。"""
+        n = len(self._pts)
+        if n < 3:
+            return
+        m = p.worldTransform().m11() or 1.0
+        size = 9.0 / m          # 屏幕 9px
+        pen = QPen()
+        pen.setWidthF(self._w)
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        for idx in (max(1, int((n - 1) * 0.08)), n - 1):
+            x, y = self._pts[idx]
+            px, py = self._pts[idx - 1]
+            dx, dy = x - px, y - py
+            seg_len = math.hypot(dx, dy)
+            if seg_len <= 0:
+                continue
+            ux, uy = dx / seg_len, dy / seg_len
+            bx, by = x - ux * size, y - uy * size    # 箭头底边中点
+            hw = size * 0.45                         # 半宽
+            lx, ly = bx - uy * hw, by + ux * hw
+            rx, ry = bx + uy * hw, by - ux * hw
+            pen.setColor(self._color_at(self._ratios[idx], idx / (n - 1)))
+            p.setPen(pen)
+            p.drawLine(QPointF(x, y), QPointF(lx, ly))
+            p.drawLine(QPointF(x, y), QPointF(rx, ry))
+
+
+class _TrajLegend(QWidget):
+    """分段对话框的轨迹配色图例：色带（或分段色块），说明颜色代表进度。"""
+
+    def __init__(self, style, parent=None):
+        super().__init__(parent)
+        self._style = style
+        self.setFixedHeight(14)
+        self.setMinimumWidth(120)
+
+    def set_style(self, style: str):
+        self._style = style
+        self.update()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(0, 1, 0, -1)
+        if self._style == _TRAJ_STYLE_SEGMENT:
+            n = len(_TRAJ_SEG_PALETTE)
+            w = r.width() / n
+            for i in range(n):
+                p.fillRect(QRectF(r.left() + i * w, r.top(),
+                                  max(1.0, w - 2), r.height()),
+                           QColor(*_TRAJ_SEG_PALETTE[i]))
+        else:
+            stops = (_TRAJ_MONO_STOPS if self._style == _TRAJ_STYLE_MONO
+                     else _TRAJ_GRAD_STOPS)
+            g = QLinearGradient(r.left(), 0, r.right(), 0)
+            for k, c in enumerate(stops):
+                g.setColorAt(k / (len(stops) - 1), QColor(*c))
+            p.fillRect(r, QBrush(g))
+        p.end()
+
+
 class CutPointItem(QGraphicsEllipseItem):
     """轨迹上的分割点标记（橙色序号球）。"""
 
@@ -1267,7 +1481,8 @@ class SegmentDialog(QDialog):
     段内仍按真实节奏线性压缩；段与段拼接连续。
     """
 
-    def __init__(self, renderer: Renderer, default_duration: int, fps: int, parent=None):
+    def __init__(self, renderer: Renderer, default_duration: int, fps: int,
+                 traj_style: str = _TRAJ_STYLE_GLOBAL, parent=None):
         super().__init__(parent)
         self.setWindowTitle("分段视频设置")
         self.resize(1120, 760)
@@ -1275,6 +1490,9 @@ class SegmentDialog(QDialog):
         self.setWindowFlags(self.windowFlags() | Qt.Tool)   # 不抢主窗口焦点
         self.renderer = renderer
         self.fps = max(1, int(fps))   # 分段帧率（独立设置，非输出帧率）
+        # 轨迹配色样式（仅影响本对话框预览，不影响成片渲染）
+        self.traj_style = (traj_style if traj_style in
+                           [k for k, _ in _TRAJ_STYLES] else _TRAJ_STYLE_GLOBAL)
         # 数据模型：end_frames = 每段截止帧数（唯一编辑对象，各段独立）
         # durations_frames / cut_frames / total_frames 由 end_frames 推导。
         if renderer.segments:
@@ -1325,6 +1543,22 @@ class SegmentDialog(QDialog):
             "与主界面「时长 & 帧率」的输出视频帧率相互独立，互不影响")
         self.spin_fps.valueChanged.connect(self._on_fps_changed)
         row_top.addWidget(self.spin_fps)
+        row_top.addSpacing(24)
+        # 轨迹配色（仅预览显示；颜色随播放进度变化，便于分辨贴合的前后两段）
+        row_top.addWidget(QLabel("轨迹配色"))
+        self.combo_traj_style = QComboBox()
+        for key, label in _TRAJ_STYLES:
+            self.combo_traj_style.addItem(label, key)
+        _tsi = self.combo_traj_style.findData(self.traj_style)
+        self.combo_traj_style.setCurrentIndex(_tsi if _tsi >= 0 else 0)
+        self.combo_traj_style.setToolTip(
+            "轨迹预览的着色方式（只影响本对话框显示，不影响成片）\n"
+            "颜色随播放进度变化：贴合的两段轨迹会呈现不同颜色")
+        self.combo_traj_style.currentIndexChanged.connect(self._on_traj_style_changed)
+        row_top.addWidget(self.combo_traj_style)
+        self.legend = _TrajLegend(self.traj_style)
+        self.legend.setToolTip("左端 = 起点 · 右端 = 终点")
+        row_top.addWidget(self.legend)
         row_top.addSpacing(30)
         self.lbl_total_top = QLabel()
         self.lbl_total_top.setStyleSheet("font-weight: bold;")
@@ -1443,6 +1677,15 @@ class SegmentDialog(QDialog):
         self._refresh_time_cols()
         self._update_total()
 
+    def _on_traj_style_changed(self, _idx=None):
+        """切换轨迹配色样式：只刷新预览与图例，不改变任何分段数据。"""
+        key = self.combo_traj_style.currentData() or _TRAJ_STYLE_GLOBAL
+        self.traj_style = key
+        if getattr(self, "legend", None) is not None:
+            self.legend.set_style(key)
+        if getattr(self, "_traj_item", None) is not None:
+            self._traj_item.set_style(key)
+
     def accept(self):
         """保存前最终校验：非法时阻止关闭（双保险，正常已被禁用确定）。"""
         ok, bad = self._validate()
@@ -1459,18 +1702,10 @@ class SegmentDialog(QDialog):
     def _build_scene(self):
         r = self.renderer
         self.scene.setSceneRect(0, 0, r.width, r.height)
-        path = QPainterPath()
-        for i, (x, y) in enumerate(r.base_projected):
-            if i == 0:
-                path.moveTo(x, y)
-            else:
-                path.lineTo(x, y)
-        pi = QGraphicsPathItem(path)
-        uc = r.unvisited_color
-        pen = QPen(QColor(uc[0], uc[1], uc[2], 220), 3)
-        pen.setCosmetic(True)                    # 屏幕恒 3px，放大不变粗
-        pi.setPen(pen)
-        self.scene.addItem(pi)
+        # 轨迹：按播放进度渐变着色（同一屏幕位置的前后两段颜色不同，便于分辨）
+        self._traj_item = GradientTrajectoryItem(
+            r.base_projected, _traj_ratios(r), self.traj_style, self.cuts)
+        self.scene.addItem(self._traj_item)
         # 起终点
         self._end_items = []
         if len(r.base_projected) >= 2:
@@ -1636,6 +1871,9 @@ class SegmentDialog(QDialog):
             x, y = self.renderer.base_projected[idx]
             self._cut_items.append(CutPointItem(c, i + 1, x, y, self))
             self.scene.addItem(self._cut_items[-1])
+        # 「每段独立渐变」样式依赖分段边界，分段变化时同步给轨迹
+        if getattr(self, "_traj_item", None) is not None:
+            self._traj_item.set_cuts(self.cuts)
         self._update_marker_scale()
 
     # ── 分割点编辑 ──
@@ -2278,6 +2516,8 @@ class MainWindow(QMainWindow):
         self._project_dirty: bool = False
         # 分段帧率（分段编辑的时间网格，每秒多少帧；与输出视频帧率独立）
         self._seg_fps: int = 30
+        # 分段对话框的轨迹配色样式（仅预览用，随工程保存）
+        self._seg_traj_style: str = _TRAJ_STYLE_GLOBAL
         # 加载工程期间置 True：抑制 _sync/_mark_dirty 把"恢复布局"误判为用户改动
         self._loading: bool = False
         self.trajectory_item: DraggablePathItem | None = None
@@ -3039,7 +3279,7 @@ class MainWindow(QMainWindow):
             self._seg_dlg.activateWindow()
             return
         dlg = SegmentDialog(self.renderer, self.spin_duration.value(),
-                            self._seg_fps, self)
+                            self._seg_fps, self._seg_traj_style, self)
         dlg.finished.connect(self._on_seg_dlg_finished)
         self._seg_dlg = dlg           # 防止被 GC
         dlg.show()
@@ -3054,6 +3294,7 @@ class MainWindow(QMainWindow):
             # 分段帧率（dlg.fps）是独立的编辑网格设置，存回工程；
             # 与主界面输出帧率 self.spin_fps 无耦合
             self._seg_fps = dlg.fps
+            self._seg_traj_style = dlg.traj_style
             self.renderer.segments = dlg.result_segments()
             self._apply_segments_to_ui()
             self._save_current()   # 立即保存分段设置，防止崩溃丢失
@@ -3782,6 +4023,10 @@ class MainWindow(QMainWindow):
         self.spin_duration.setValue(_num(s, "duration", 20))
         self.spin_fps.setValue(_num(s, "fps", 2))
         self._seg_fps = max(1, int(_num(s, "seg_fps", 30)))
+        self._seg_traj_style = (s.get("seg_traj_style")
+                                if s.get("seg_traj_style") in
+                                [k for k, _ in _TRAJ_STYLES]
+                                else _TRAJ_STYLE_GLOBAL)
         self.spin_duration.blockSignals(False)
         self.spin_fps.blockSignals(False)
         # 输出倍率（超采样）
@@ -4516,6 +4761,7 @@ class MainWindow(QMainWindow):
             "duration": self.spin_duration.value(),
             "fps": self.spin_fps.value(),
             "seg_fps": self._seg_fps,
+            "seg_traj_style": self._seg_traj_style,
             "render_scale": (self.combo_render_scale.currentData() or 1),
             "panel_fields": self._checked_fields(),
             "panel_bg_w": (self.renderer.panel_bg_w
