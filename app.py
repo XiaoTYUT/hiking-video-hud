@@ -4302,8 +4302,10 @@ class MainWindow(QMainWindow):
             cuts, durs = segs[0], segs[1]
         if cuts and durs:
             try:
+                # durations 是浮点秒（帧数÷分段帧率），必须保留小数，
+                # 否则 int() 截断会丢失不足 1 秒的帧零头
                 self.renderer.segments = (
-                    [float(c) for c in cuts], [int(d) for d in durs])
+                    [float(c) for c in cuts], [float(d) for d in durs])
             except (TypeError, ValueError):
                 self.renderer.segments = None
         if s.get("use_segments") and self.renderer.segments:
