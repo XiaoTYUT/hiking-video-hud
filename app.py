@@ -50,7 +50,7 @@ from gauge_paint import paint_gauge
 _PROJECT_FIELDS = (
     "kml_path", "canvas", "line_width", "node_font_size", "node_color",
     "unvisited_color", "visited_color", "start_color", "end_color",
-    "duration", "fps", "panel_fields", "key_nodes",
+    "duration", "fps", "seg_fps", "panel_fields", "key_nodes",
     "use_segments", "segments",
     "trajectory", "panel", "map",
     "show_map", "map_zoom", "map_shape", "map_text_delta",
@@ -260,7 +260,13 @@ class DraggablePathItem(QGraphicsPathItem):
         self.setTransformOriginPoint(self._anchor)
 
     def wheelEvent(self, event):
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        # QGraphicsSceneWheelEvent（场景事件）用 delta()，
+        # QWheelEvent（直接收到）才用 angleDelta()；scene 触发的是前者
+        try:
+            dy = event.delta()
+        except AttributeError:
+            dy = event.angleDelta().y()
+        factor = 1.15 if dy > 0 else 1 / 1.15
         # Qt5 必须用 setScale（scale(sx,sy) 旧 API 已移除）
         self.setScale(self.scale() * factor)
         self._sync()
@@ -1189,7 +1195,7 @@ class TimeFrameEdit(QWidget):
 
         for sp in (self.sp_h, self.sp_m, self.sp_s, self.sp_f):
             sp.setKeyboardTracking(False)
-            sp.setFixedWidth(42)
+            sp.setFixedWidth(52)
             sp.setAlignment(Qt.AlignCenter)
 
         lay.addWidget(self.sp_h)
@@ -1254,7 +1260,10 @@ class SegmentDialog(QDialog):
       - 校验：截止帧数必须严格递增；若不满足（如前段 ≥ 后段），
         不自动修改任何值，仅标红并禁用「确定」，无法保存。
       - 轨迹进度（cuts）由轨迹预览点击决定，与时间独立。
-      - fps 可在对话框顶部修改；改 fps 时帧数不变，仅时分秒帧显示刷新。
+      - 顶部「分段帧率」= 分段编辑的时间网格（每秒分成多少帧），
+        与主界面「时长 & 帧率」里的输出视频帧率完全独立、互不影响；
+        改分段帧率时帧数不变，仅时分秒帧显示刷新；
+        保存时 秒数 = 帧数 ÷ 分段帧率。
     段内仍按真实节奏线性压缩；段与段拼接连续。
     """
 
@@ -1262,9 +1271,10 @@ class SegmentDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("分段视频设置")
         self.resize(1120, 760)
+        self.setModal(False)     # 非 modal：打开后主窗口仍可操作
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)   # 不抢主窗口焦点
         self.renderer = renderer
-        self.fps = max(1, int(fps))
-        self._orig_fps = self.fps   # 用于确定时判断是否需要同步回主界面
+        self.fps = max(1, int(fps))   # 分段帧率（独立设置，非输出帧率）
         # 数据模型：end_frames = 每段截止帧数（唯一编辑对象，各段独立）
         # durations_frames / cut_frames / total_frames 由 end_frames 推导。
         if renderer.segments:
@@ -1303,13 +1313,16 @@ class SegmentDialog(QDialog):
         tip.setWordWrap(True)
         lay.addWidget(tip)
 
-        # 顶部：帧率设置 + 视频总长
+        # 顶部：分段帧率设置 + 视频总长
         row_top = QHBoxLayout()
-        row_top.addWidget(QLabel("帧率"))
+        row_top.addWidget(QLabel("分段帧率"))
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(1, 120)
         self.spin_fps.setValue(self.fps)
         self.spin_fps.setSuffix(" fps")
+        self.spin_fps.setToolTip(
+            "分段编辑的时间网格：每秒分成多少帧\n"
+            "与主界面「时长 & 帧率」的输出视频帧率相互独立，互不影响")
         self.spin_fps.valueChanged.connect(self._on_fps_changed)
         row_top.addWidget(self.spin_fps)
         row_top.addSpacing(30)
@@ -1332,8 +1345,14 @@ class SegmentDialog(QDialog):
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
             ["段", "轨迹进度", "对应墙钟时间", "视频时间范围", "截止时间 (时:分:秒:帧)"])
+        # 列宽策略：
+        #   列 0「段」—— ResizeToContents，让段号（1、2…）自然窄
+        #   列 1-3   —— Stretch（均分剩余空间）
+        #   列 4「截止时间」—— StickyNarrow + 手动设最小宽，尽量宽
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.setColumnWidth(4, 240)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         lay.addWidget(self.table, 1)
@@ -1759,8 +1778,10 @@ class SegmentDialog(QDialog):
 
     def result_segments(self):
         """返回 (cuts, durations) 供 Renderer 使用；cuts 为空表示未分段。
-        durations 单位为秒（float，精度到帧 = 1/fps），renderer 端 round(dur*fps) 还原帧数。
-        仅在 accept() 校验通过后调用（end_frames 严格递增）。"""
+        durations 单位为秒（float），renderer 端 round(dur * fps_out) 还原输出帧数。
+        换算基准 = 当前「分段帧率」（self.fps）：秒数 = 帧数 ÷ 分段帧率，
+        与主界面输出帧率无关。
+        """
         if not self.cuts:
             return None
         durations = []
@@ -1769,10 +1790,6 @@ class SegmentDialog(QDialog):
             durations.append(max(1, t - prev) / self.fps)
             prev = t
         return (list(self.cuts), durations)
-
-    def fps_changed(self) -> bool:
-        """对话框内帧率是否被修改过（确定时需同步回主界面）。"""
-        return self.fps != self._orig_fps
 
 
 # ─────────────────────── 关键节点编辑对话框 ───────────────────────
@@ -2259,6 +2276,8 @@ class MainWindow(QMainWindow):
         self.current_project_path: Path | None = None
         # 工程是否有未保存的改动（拖拽/改参数/改节点/改分段等置 True）
         self._project_dirty: bool = False
+        # 分段帧率（分段编辑的时间网格，每秒多少帧；与输出视频帧率独立）
+        self._seg_fps: int = 30
         # 加载工程期间置 True：抑制 _sync/_mark_dirty 把"恢复布局"误判为用户改动
         self._loading: bool = False
         self.trajectory_item: DraggablePathItem | None = None
@@ -2887,6 +2906,9 @@ class MainWindow(QMainWindow):
         self.spin_fps = QSpinBox()
         self.spin_fps.setRange(1, 60); self.spin_fps.setValue(_num(self.settings, "fps", 2))
         self.spin_fps.setSuffix(" fps")
+        self.spin_fps.setToolTip(
+            "输出视频的帧率：最终渲染视频每秒多少帧\n"
+            "与「分段设置」里的分段帧率相互独立，互不影响")
         # 输出倍率（超采样）：画布像素 × 倍率，构图比例不变但文字/线条更清晰
         self.combo_render_scale = QComboBox()
         self.combo_render_scale.addItem("1×（原始尺寸）", 1)
@@ -3006,16 +3028,32 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     def _open_segment_dialog(self):
-        """打开分段设置对话框；确定后应用并立即持久化。"""
+        """打开分段设置对话框（非 modal，主窗口可继续操作）；
+        用户点击确定或关闭时通过 finished 信号应用结果。"""
         if self.renderer is None:
             QMessageBox.information(self, "提示", "请先加载 KML 轨迹")
             return
+        # 已有对话框在打开 → 激活它，不重复创建
+        if getattr(self, "_seg_dlg", None) is not None:
+            self._seg_dlg.raise_()
+            self._seg_dlg.activateWindow()
+            return
         dlg = SegmentDialog(self.renderer, self.spin_duration.value(),
-                            self.spin_fps.value(), self)
-        if dlg.exec_() == QDialog.Accepted:
-            # 若对话框内改了帧率，同步回主界面
-            if dlg.fps_changed():
-                self.spin_fps.setValue(dlg.fps)
+                            self._seg_fps, self)
+        dlg.finished.connect(self._on_seg_dlg_finished)
+        self._seg_dlg = dlg           # 防止被 GC
+        dlg.show()
+
+    def _on_seg_dlg_finished(self, result: int):
+        """分段对话框关闭后应用结果。"""
+        dlg = getattr(self, "_seg_dlg", None)
+        if dlg is None:
+            return
+        self._seg_dlg = None
+        if result == QDialog.Accepted:
+            # 分段帧率（dlg.fps）是独立的编辑网格设置，存回工程；
+            # 与主界面输出帧率 self.spin_fps 无耦合
+            self._seg_fps = dlg.fps
             self.renderer.segments = dlg.result_segments()
             self._apply_segments_to_ui()
             self._save_current()   # 立即保存分段设置，防止崩溃丢失
@@ -3738,11 +3776,12 @@ class MainWindow(QMainWindow):
             else:
                 self._traj_colors[key] = QColor(*default)
         self._refresh_traj_color_btns()
-        # 时长 / 帧率
+        # 时长 / 帧率 / 分段帧率（分段帧率是独立的编辑网格设置）
         self.spin_duration.blockSignals(True)
         self.spin_fps.blockSignals(True)
         self.spin_duration.setValue(_num(s, "duration", 20))
         self.spin_fps.setValue(_num(s, "fps", 2))
+        self._seg_fps = max(1, int(_num(s, "seg_fps", 30)))
         self.spin_duration.blockSignals(False)
         self.spin_fps.blockSignals(False)
         # 输出倍率（超采样）
@@ -4476,6 +4515,7 @@ class MainWindow(QMainWindow):
                           self._traj_colors["end"].blue()],
             "duration": self.spin_duration.value(),
             "fps": self.spin_fps.value(),
+            "seg_fps": self._seg_fps,
             "render_scale": (self.combo_render_scale.currentData() or 1),
             "panel_fields": self._checked_fields(),
             "panel_bg_w": (self.renderer.panel_bg_w
