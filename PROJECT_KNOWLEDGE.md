@@ -249,7 +249,11 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 - 波形 / 脉冲相位来自预计算累计拍数 `cum_beats += HR·Δt/60`（`ecg_wave(u)` = P波+QRS主峰+T波；心跳声呐用 `u = cum_beats mod 1` 驱动双圈脉冲与心形缩放），**逐帧独立、无跨帧状态** → 多进程渲染每帧确定性一致（已用 pickle 副本逐像素验证）。
 - 区间：阈值 60/70/80/90% HRmax；Z1 #4C8DFF 热身 / Z2 #35C46B 有氧 / Z3 #FFC93C 耐力 / Z4 #FF8A2B 阈值 / Z5 #FF4757 无氧。
 - 渲染：`_draw_heart_card` 分发 `_draw_heart_pulse` / `_draw_heart_ecg`；静态底图按 `(w,h,ss,style)` 缓存（`_hr_cache`，`__getstate__` 置 None），逐帧复制后叠加动态层再 alpha 合成；定位 `hr_card_pos` 内部 ×ss。
-- **心跳声呐抗锯齿**：PIL 的 `ImageDraw.arc/ellipse` 无 AA，1× 输出时圆环有锯齿断点；因此 pulse 样式内部按超采样绘制（ss=1→3×、ss=2→2×、ss≥3→1×，`aa` 因子），绘制完用 LANCZOS 降回 `out_w/out_h` 再合成（1× 实测约 14ms/帧）。
+- **心跳声呐抗锯齿**：PIL 的 `ImageDraw.arc/ellipse` 无 AA。现分两级处理：
+  1. 心形/文字：整卡内部超采样（ss=1→3×、ss=2→2×、ss≥3→1×，`aa` 因子），绘制完 LANCZOS 降回 `out_w/out_h`；
+  2. 两圈脉冲：改用 `_aa_ring()` 距离场（SDF）在**最终分辨率**逐像素解析覆盖率，1px 细环、低透明度也不会断成虚线（真正的解析抗锯齿，不依赖降采样）。
+  3. GUI 预览 `_preview_ss()` 最低 3×（最高 4×），画布放大时不会出现位图锯齿块。
+  1× 实测约 26ms/帧（含 3× 超采样）。
 - GUI：`HeartCardItem(QGraphicsRectItem)` 调 `_draw_heart_card` 生成位图（WYSIWYG），滚轮等比缩放 → 回写 `spin_hr_w/h`；与坡度仪共用 60ms 预览计时器；设置页样式下拉框切换 pulse/ecg。
 - 持久化：`show_heart_card`、`hr_card_style`、`hr_card_w/h`、`hr_card_pos`、`hr_age`、`hr_rest`、`hr_vo2max`、`hr_tau_up`、`hr_tau_down`、`hr_alt_k`；`__setstate__` 对旧快照兜底并 `hr_recompute()`。
 - 默认：显示开启、样式 pulse、年龄 35、静息 62、VO₂max 42、τ 40/100、海拔系数 0。

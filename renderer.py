@@ -1895,6 +1895,28 @@ class Renderer:
             pts.append((cx + x * s, cy - y * s))
         return pts
 
+    @staticmethod
+    def _aa_ring(layer: Image.Image, cx: float, cy: float, r: float,
+                 width: float, color: tuple, alpha: int) -> None:
+        """距离场（SDF）抗锯齿圆环：按最终像素解析计算覆盖率。
+
+        比「放大绘制再降采样」更可靠：1px 细环、低透明度时不会断成虚线。
+        """
+        half = max(0.5, width / 2.0)
+        x0 = max(0, int(math.floor(cx - r - half - 1.0)))
+        x1 = min(layer.width, int(math.ceil(cx + r + half + 1.0)))
+        y0 = max(0, int(math.floor(cy - r - half - 1.0)))
+        y1 = min(layer.height, int(math.ceil(cy + r + half + 1.0)))
+        if x1 <= x0 or y1 <= y0:
+            return
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        d = np.sqrt((xx + 0.5 - cx) ** 2 + (yy + 0.5 - cy) ** 2)
+        cov = np.clip(half + 0.5 - np.abs(d - r), 0.0, 1.0)
+        a = np.ascontiguousarray((cov * alpha).astype(np.uint8))
+        tile = Image.new("RGBA", (x1 - x0, y1 - y0), color + (0,))
+        tile.putalpha(Image.fromarray(a, "L"))
+        layer.alpha_composite(tile, (x0, y0))
+
     def _draw_heart_card(self, img: Image.Image, idx_f: float) -> None:
         """心率卡分发：pulse=心跳声呐（默认）/ ecg=心电波形。"""
         if getattr(self, "hr_card_style", "pulse") == "ecg":
@@ -2006,16 +2028,8 @@ class Renderer:
         ld = ImageDraw.Draw(layer)
         stroke = max(1, int(round(k)))
 
-        # 1) 两圈脉冲扩散（相位错开半拍，完全由累计拍数决定）+ 中心心形
+        # 1) 中心心形（高分辨率绘制，随后随整卡降采样）
         u = beats % 1.0
-        ring_w = max(1, int(round(1.5 * k)))
-        for off in (0.0, 0.5):
-            phs = (u + off) % 1.0
-            rr = (34.0 + 24.0 * phs) * k
-            alpha = int(150 * (1.0 - phs))
-            if alpha > 6:
-                ld.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
-                           outline=zc + (alpha,), width=ring_w)
         env = max(0.0, 1.0 - abs(u - 0.08) / 0.20)
         ld.polygon(self._heart_polygon(cx, cy, 0.80 * k * (1.0 + 0.09 * env)),
                    fill=zc + (255,))
@@ -2034,10 +2048,19 @@ class Renderer:
         ld.text((rx + tw + 5.0 * k, 86.0 * k), "bpm",
                 fill=(147, 160, 180, 235), font=unit_f, anchor="la")
 
-        # 6) 超采样层降采样回输出尺寸，再叠到画布（裁剪，允许拖出边界一部分）
+        # 6) 超采样层降采样回输出尺寸；圆环改用 SDF 在最终分辨率解析绘制
         if aa > 1:
             layer = layer.resize((out_w, out_h), Image.LANCZOS)
             pw, ph = out_w, out_h
+        kk = min(pw / 300.0, ph / 170.0)
+        ccx, ccy = 84.0 * kk, 86.0 * kk
+        ring_w = max(1.8, 1.8 * kk)
+        for off in (0.0, 0.5):
+            phs = (u + off) % 1.0
+            rr = (34.0 + 24.0 * phs) * kk
+            alpha = int(160 * (1.0 - phs))
+            if alpha > 6:
+                self._aa_ring(layer, ccx, ccy, rr, ring_w, zc, alpha)
         px = int(round(self.hr_card_pos[0] * ss))
         py = int(round(self.hr_card_pos[1] * ss))
         left, top = max(0, px), max(0, py)

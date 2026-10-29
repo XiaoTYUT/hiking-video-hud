@@ -999,13 +999,13 @@ class HeartCardItem(QGraphicsRectItem):
         self.refresh_preview()
 
     def _preview_ss(self) -> int:
-        """预览倍率：按屏幕像素比放大渲染，屏幕显示尺寸不变、文字更清晰。"""
+        """预览倍率：最低 3×，避免画布放大时位图边缘出现锯齿块。"""
         dpr = 1.0
         sc = self.scene()
         views = sc.views() if sc is not None else []
         if views:
             dpr = float(views[0].devicePixelRatioF())
-        return max(1, min(3, int(round(dpr))))
+        return max(3, min(4, int(round(dpr)) + 2))
 
     def refresh_preview(self):
         """用视频同一套 _draw_heart_card 渲染当前预览索引的一帧。"""
