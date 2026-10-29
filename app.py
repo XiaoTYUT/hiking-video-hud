@@ -60,6 +60,8 @@ _PROJECT_FIELDS = (
     "elev_profile_w", "elev_profile_h",
     "show_progress_ring", "progress_ring_style", "progress_ring_size",
     "progress_ring_pos", "ring_progress_color",
+    "show_heart_card", "hr_card_w", "hr_card_h", "hr_card_pos",
+    "hr_age", "hr_rest", "hr_vo2max", "hr_tau_up", "hr_tau_down", "hr_alt_k",
 )
 
 
@@ -969,6 +971,143 @@ class ProgressRingItem(QGraphicsRectItem):
             painter.drawRoundedRect(self.rect(), 12, 12)
             painter.setPen(QColor(200, 200, 220, 180))
             painter.drawText(self.rect(), Qt.AlignCenter, "进度环")
+
+
+# ─────────────────────── 模拟心电卡 Item ───────────────────────
+
+class HeartCardItem(QGraphicsRectItem):
+    """模拟心电卡的 GUI 预览：直接调用视频渲染端 _draw_heart_card 生成位图，
+    与成片像素级一致（WYSIWYG）。可拖拽定位 + 滚轮等比缩放。
+    心率数值由速度 + 坡度模型推导，卡片内不显示速度与坡度。"""
+
+    def __init__(self, renderer: Renderer):
+        w = float(renderer.hr_card_w)
+        h = float(renderer.hr_card_h)
+        super().__init__(0, 0, w, h)
+        self.renderer = renderer
+        self._hover = False
+        self._cache = None                   # 静态底图缓存（本 item 私有）
+        self.setPos(renderer.hr_card_pos[0], renderer.hr_card_pos[1])
+        self.setBrush(QBrush(Qt.NoBrush))
+        self.setPen(QPen(Qt.NoPen))
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setAcceptHoverEvents(True)
+        self._pix_item = QGraphicsPixmapItem(self)
+        self._pix_item.setAcceptedMouseButtons(Qt.NoButton)
+        self.refresh_preview()
+
+    def _preview_ss(self) -> int:
+        """预览倍率：按屏幕像素比放大渲染，屏幕显示尺寸不变、文字更清晰。"""
+        dpr = 1.0
+        sc = self.scene()
+        views = sc.views() if sc is not None else []
+        if views:
+            dpr = float(views[0].devicePixelRatioF())
+        return max(1, min(3, int(round(dpr))))
+
+    def refresh_preview(self):
+        """用视频同一套 _draw_heart_card 渲染当前预览索引的一帧。"""
+        base = self.renderer
+        if base is None or self.scene() is None or len(base.points) < 2:
+            return
+        ss = self._preview_ss()
+        w = max(150.0, float(base.hr_card_w))
+        h = max(85.0, float(base.hr_card_h))
+        pad = ss
+        img = Image.new(
+            "RGBA",
+            (int(round(w * ss)) + 2 * pad, int(round(h * ss)) + 2 * pad),
+            (0, 0, 0, 0))
+        # 浅拷贝承载临时改写：避免与渲染线程竞态
+        r = copy.copy(base)
+        r._ss = ss
+        r.show_heart_card = True
+        r.hr_card_pos = (1.0, 1.0)          # 绘制内部 ×ss → 1px 留白
+        r._hr_cache = self._cache           # 复用本 item 私有底图缓存
+        r._draw_heart_card(img, base.preview_index())
+        self._cache = r._hr_cache
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        pix = QPixmap()
+        pix.loadFromData(buf.getvalue(), "PNG")
+        if pix.isNull():
+            return
+        pix.setDevicePixelRatio(float(ss))
+        self._pix_item.setPixmap(pix)
+        self._pix_item.setPos(-1.0, -1.0)    # 抵消 1px 留白
+        self.update()
+
+    def sync_layout(self):
+        """按 renderer 的尺寸/位置重建 item（恢复工程布局时调用）。"""
+        r = self.renderer
+        self.prepareGeometryChange()
+        self.setRect(0, 0, float(r.hr_card_w), float(r.hr_card_h))
+        self.setPos(*r.hr_card_pos)
+        self.refresh_preview()
+        if self.scene() is not None:
+            self.scene().update()
+
+    def wheelEvent(self, event):
+        r = self.renderer
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        ratio = r.hr_card_h / max(1.0, r.hr_card_w)
+        w = max(150.0, min(800.0, r.hr_card_w * factor))
+        h = max(85.0, min(460.0, w * ratio))
+        r.hr_card_w = w
+        r.hr_card_h = h
+        self.prepareGeometryChange()
+        self.setRect(0, 0, w, h)
+        self.refresh_preview()
+        if self.scene() is not None:
+            self.scene().update()
+        _notify_main_dirty(self)
+        _notify_main_scale(self, "heart", w)
+
+    def mousePressEvent(self, event):
+        self._raise_to_top()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self._sync()
+
+    def _raise_to_top(self):
+        if self.scene() is not None:
+            max_z = max((it.zValue() for it in self.scene().items()), default=0)
+            self.setZValue(max_z + 1)
+
+    def _sync(self):
+        pos = self.pos()
+        self.renderer.hr_card_pos = (pos.x(), pos.y())
+        if self.scene() is not None:
+            self.scene().update()
+        _notify_main_dirty(self)
+
+    def hoverEnterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().hoverLeaveEvent(event)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        if self.isSelected() or self._hover:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(120, 200, 255, 160), 1, Qt.DashLine))
+            painter.drawRect(self.rect())
+            return
+        if self._pix_item.pixmap().isNull():
+            painter.setBrush(QBrush(QColor(14, 18, 26, 220)))
+            painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
+            painter.drawRoundedRect(self.rect(), 12, 12)
+            painter.setPen(QColor(200, 200, 220, 180))
+            painter.drawText(self.rect(), Qt.AlignCenter, "模拟心电")
 
 
 # ─────────────────────── CanvasView ───────────────────────
@@ -2526,6 +2665,7 @@ class MainWindow(QMainWindow):
         self.gauge_item: SlopeGaugeItem | None = None
         self.elev_item: ElevProfileItem | None = None
         self.ring_item: ProgressRingItem | None = None
+        self.heart_item: HeartCardItem | None = None
         self.worker: RenderWorker | None = None
 
         # 全局设置（仅窗口级状态：最近工程列表 / 视频输出目录 / 默认画布 / 上次工程路径）
@@ -2956,6 +3096,83 @@ class MainWindow(QMainWindow):
         self._refresh_ring_color_btn()
         self._page_panel_extra.addWidget(rg)
 
+        # 模拟心电卡（心率由速度 + 坡度模型推导；卡片内不显示速度/坡度）
+        hg = QGroupBox("模拟心电卡")
+        hf = QFormLayout(hg)
+        self.chk_heart_card = QCheckBox("显示模拟心电卡")
+        self.chk_heart_card.setChecked(
+            bool(self.settings.get("show_heart_card", True)))
+        self.chk_heart_card.setToolTip(
+            "实时模拟心电卡（ECG 波形 + 大号 bpm + 心率区间），\n"
+            "心率由运动速度与坡度推导，可单独拖动位置、滚轮等比缩放")
+        self.chk_heart_card.toggled.connect(self._on_heart_card_toggled)
+        hf.addRow(self.chk_heart_card)
+        self.chk_hr_preview = QCheckBox("画布预览播放（循环）")
+        self.chk_hr_preview.setChecked(False)
+        self.chk_hr_preview.setToolTip(
+            "让心电卡在画布上循环播放整段轨迹的心率变化，便于查看波形过渡（不影响视频输出）")
+        self.chk_hr_preview.toggled.connect(self._on_hr_preview_toggled)
+        hf.addRow(self.chk_hr_preview)
+        self.spin_hr_w = QSpinBox()
+        self.spin_hr_w.setRange(150, 800)
+        self.spin_hr_w.setValue(_num(self.settings, "hr_card_w", 300))
+        self.spin_hr_w.setSuffix(" px")
+        self.spin_hr_w.setToolTip("卡片宽度（也可在画布上滚轮等比缩放）")
+        self.spin_hr_w.valueChanged.connect(self._on_heart_params_changed)
+        hf.addRow("卡片宽度", self.spin_hr_w)
+        self.spin_hr_h = QSpinBox()
+        self.spin_hr_h.setRange(85, 460)
+        self.spin_hr_h.setValue(_num(self.settings, "hr_card_h", 170))
+        self.spin_hr_h.setSuffix(" px")
+        self.spin_hr_h.setToolTip("卡片高度（滚轮缩放时按宽高比同步变化）")
+        self.spin_hr_h.valueChanged.connect(self._on_heart_params_changed)
+        hf.addRow("卡片高度", self.spin_hr_h)
+        # 人体参数：决定 HRmax / 静息 / 有氧能力 / 心率惯性
+        self.spin_hr_age = QSpinBox()
+        self.spin_hr_age.setRange(10, 90)
+        self.spin_hr_age.setValue(_num(self.settings, "hr_age", 35))
+        self.spin_hr_age.setSuffix(" 岁")
+        self.spin_hr_age.setToolTip("年龄：用于估算最大心率 HRmax = 208 - 0.7×年龄")
+        self.spin_hr_age.valueChanged.connect(self._on_heart_params_changed)
+        hf.addRow("年龄", self.spin_hr_age)
+        self.spin_hr_rest = QSpinBox()
+        self.spin_hr_rest.setRange(40, 110)
+        self.spin_hr_rest.setValue(_num(self.settings, "hr_rest", 62))
+        self.spin_hr_rest.setSuffix(" bpm")
+        self.spin_hr_rest.setToolTip("静息心率：运动强度为零时的心率基线")
+        self.spin_hr_rest.valueChanged.connect(self._on_heart_params_changed)
+        hf.addRow("静息心率", self.spin_hr_rest)
+        self.spin_hr_vo2max = QSpinBox()
+        self.spin_hr_vo2max.setRange(20, 80)
+        self.spin_hr_vo2max.setValue(_num(self.settings, "hr_vo2max", 42))
+        self.spin_hr_vo2max.setSuffix(" ml/kg/min")
+        self.spin_hr_vo2max.setToolTip("最大摄氧量：越高同样速度/坡度下心率越低")
+        self.spin_hr_vo2max.valueChanged.connect(self._on_heart_params_changed)
+        hf.addRow("最大摄氧量", self.spin_hr_vo2max)
+        self.spin_hr_tau_up = QSpinBox()
+        self.spin_hr_tau_up.setRange(5, 300)
+        self.spin_hr_tau_up.setValue(_num(self.settings, "hr_tau_up", 40))
+        self.spin_hr_tau_up.setSuffix(" s")
+        self.spin_hr_tau_up.setToolTip("心率上升时间常数：越小爬升时心率跟得越快")
+        self.spin_hr_tau_up.valueChanged.connect(self._on_heart_params_changed)
+        hf.addRow("上升常数", self.spin_hr_tau_up)
+        self.spin_hr_tau_down = QSpinBox()
+        self.spin_hr_tau_down.setRange(10, 600)
+        self.spin_hr_tau_down.setValue(_num(self.settings, "hr_tau_down", 100))
+        self.spin_hr_tau_down.setSuffix(" s")
+        self.spin_hr_tau_down.setToolTip("心率下降时间常数：通常比上升慢（恢复更慢）")
+        self.spin_hr_tau_down.valueChanged.connect(self._on_heart_params_changed)
+        hf.addRow("下降常数", self.spin_hr_tau_down)
+        self.spin_hr_alt = QSpinBox()
+        self.spin_hr_alt.setRange(0, 20)
+        self.spin_hr_alt.setValue(int(round(_num(self.settings, "hr_alt_k", 0.0) * 100)))
+        self.spin_hr_alt.setSuffix(" %/1000m")
+        self.spin_hr_alt.setToolTip(
+            "海拔修正：海拔超过 1500m 后每升高 1000m 心率上浮的百分比（0 = 关闭）")
+        self.spin_hr_alt.valueChanged.connect(self._on_heart_params_changed)
+        hf.addRow("海拔系数", self.spin_hr_alt)
+        self._page_panel_extra.addWidget(hg)
+
         # 轨迹（设置窗口「轨迹与标注」页）
         tg = QGroupBox("轨迹")
         tf = QFormLayout(tg)
@@ -3337,6 +3554,16 @@ class MainWindow(QMainWindow):
                 spin.setValue(int(round(v)))
                 spin.blockSignals(False)
             return
+        if kind == "heart" and self.renderer is not None:
+            for name, v in (("spin_hr_w", self.renderer.hr_card_w),
+                            ("spin_hr_h", self.renderer.hr_card_h)):
+                spin = getattr(self, name, None)
+                if spin is None:
+                    continue
+                spin.blockSignals(True)
+                spin.setValue(int(round(v)))
+                spin.blockSignals(False)
+            return
         mapping = {"trajectory": ("spin_traj_scale", 100.0),
                    "panel": ("spin_panel_scale", 100.0),
                    "map": ("spin_map_scale", 100.0),
@@ -3618,6 +3845,66 @@ class MainWindow(QMainWindow):
             f"background-color: {c.name()}; color: {txt};"
             "border: 1px solid #666; padding: 3px 8px;")
 
+    # ── 模拟心电卡 ──
+
+    def _on_heart_card_toggled(self, on: bool):
+        """心电卡开关：同步 renderer + 创建/移除 GUI 预览。"""
+        if self.renderer is None:
+            return
+        self.renderer.show_heart_card = on
+        if on and self.heart_item is None:
+            self.heart_item = HeartCardItem(self.renderer)
+            self.scene.addItem(self.heart_item)
+            self.heart_item.refresh_preview()
+        elif not on and self.heart_item is not None:
+            self.scene.removeItem(self.heart_item)
+            self.heart_item = None
+        self.scene.update()
+        self._mark_dirty()
+
+    def _on_heart_params_changed(self, *_):
+        """卡片尺寸/人体参数变化 → 写回 renderer、重算心率并刷新预览。"""
+        if self.renderer is None:
+            return
+        r = self.renderer
+        r.hr_card_w = float(self.spin_hr_w.value())
+        r.hr_card_h = float(self.spin_hr_h.value())
+        r.hr_age = float(self.spin_hr_age.value())
+        r.hr_rest = float(self.spin_hr_rest.value())
+        r.hr_vo2max = float(self.spin_hr_vo2max.value())
+        r.hr_tau_up = float(self.spin_hr_tau_up.value())
+        r.hr_tau_down = float(self.spin_hr_tau_down.value())
+        r.hr_alt_k = self.spin_hr_alt.value() / 100.0
+        r.hr_recompute()
+        if self.heart_item is not None:
+            self.heart_item.sync_layout()
+        self.scene.update()
+        self._mark_dirty()
+
+    def _on_hr_preview_toggled(self, on: bool):
+        """心电卡预览播放开关：与坡度仪共用同一个循环计时器。"""
+        if not hasattr(self, "_preview_timer"):
+            self._preview_timer = QTimer(self)
+            self._preview_timer.setInterval(60)
+            self._preview_timer.timeout.connect(self._on_preview_tick)
+        if on and self.renderer is not None:
+            self._preview_pos = 0.0
+            self._preview_timer.start()
+        else:
+            if not self.chk_gauge_preview.isChecked():
+                self._preview_timer.stop()
+                if self.renderer is not None:
+                    self.renderer.preview_idx = -1.0
+            if self.gauge_item is not None:
+                self.gauge_item.update()
+            if self.elev_item is not None:
+                self.elev_item.refresh_preview()
+            if self.ring_item is not None:
+                self.ring_item.refresh_preview()
+            if self.heart_item is not None:
+                self.heart_item.refresh_preview()
+            self.scene.update()
+
     def _on_gauge_style_changed(self, *_):
         """坡度仪样式/大小/字号/透明度变化 → 同步 renderer + 刷新 GUI。"""
         if self.renderer is None:
@@ -3654,15 +3941,18 @@ class MainWindow(QMainWindow):
             self._preview_pos = 0.0
             self._preview_timer.start()
         else:
-            self._preview_timer.stop()
-            if self.renderer is not None:
-                self.renderer.preview_idx = -1.0
+            if not self.chk_hr_preview.isChecked():
+                self._preview_timer.stop()
+                if self.renderer is not None:
+                    self.renderer.preview_idx = -1.0
             if self.gauge_item is not None:
                 self.gauge_item.update()
             if self.elev_item is not None:
                 self.elev_item.refresh_preview()
             if self.ring_item is not None:
                 self.ring_item.refresh_preview()
+            if self.heart_item is not None:
+                self.heart_item.refresh_preview()
             self.scene.update()
 
     def _on_preview_tick(self):
@@ -3682,6 +3972,8 @@ class MainWindow(QMainWindow):
             self.elev_item.refresh_preview()
         if self.ring_item is not None:
             self.ring_item.refresh_preview()
+        if self.heart_item is not None:
+            self.heart_item.refresh_preview()
 
     def _on_pick_gauge_color(self, key: str):
         """坡度仪颜色按钮：调色板选择 → 写回 renderer。"""
@@ -4168,6 +4460,36 @@ class MainWindow(QMainWindow):
             self.renderer.ring_progress_color = (
                 self._ring_color.red(), self._ring_color.green(),
                 self._ring_color.blue())
+        # 模拟心电卡控件（显示开关 / 尺寸 / 人体参数）
+        self.chk_heart_card.blockSignals(True)
+        self.chk_heart_card.setChecked(bool(s.get("show_heart_card", True)))
+        self.chk_heart_card.blockSignals(False)
+        for _sp, _key, _default in (
+                (self.spin_hr_w, "hr_card_w", 300),
+                (self.spin_hr_h, "hr_card_h", 170),
+                (self.spin_hr_age, "hr_age", 35),
+                (self.spin_hr_rest, "hr_rest", 62),
+                (self.spin_hr_vo2max, "hr_vo2max", 42),
+                (self.spin_hr_tau_up, "hr_tau_up", 40),
+                (self.spin_hr_tau_down, "hr_tau_down", 100)):
+            _sp.blockSignals(True)
+            _sp.setValue(_num(s, _key, _default))
+            _sp.blockSignals(False)
+        self.spin_hr_alt.blockSignals(True)
+        self.spin_hr_alt.setValue(
+            int(round(_num(s, "hr_alt_k", 0.0) * 100)))
+        self.spin_hr_alt.blockSignals(False)
+        if self.renderer is not None:
+            self.renderer.show_heart_card = self.chk_heart_card.isChecked()
+            self.renderer.hr_card_w = float(self.spin_hr_w.value())
+            self.renderer.hr_card_h = float(self.spin_hr_h.value())
+            self.renderer.hr_age = float(self.spin_hr_age.value())
+            self.renderer.hr_rest = float(self.spin_hr_rest.value())
+            self.renderer.hr_vo2max = float(self.spin_hr_vo2max.value())
+            self.renderer.hr_tau_up = float(self.spin_hr_tau_up.value())
+            self.renderer.hr_tau_down = float(self.spin_hr_tau_down.value())
+            self.renderer.hr_alt_k = self.spin_hr_alt.value() / 100.0
+            self.renderer.hr_recompute()
         # 关键节点（无文本框，仅写回 renderer）
         nodes = s.get("key_nodes")
         if nodes is not None and self.renderer is not None:

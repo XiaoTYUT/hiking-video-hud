@@ -298,6 +298,29 @@ def _find_idx_float(cum_time: List[float], target: float) -> float:
     return i + (target - t0) / (t1 - t0)
 
 
+def interp_at(seq, idx_f: float):
+    """浮点索引线性插值（数据面板/进度环数值逐帧平滑用）。
+
+    两步路采样点常间隔数秒，按整数索引取值时 10fps 视频里数字会冻结
+    几十帧再整点跳变；按浮点索引插值后每帧连续变化。
+    None 值（如停顿点配速）向有效邻居退化；两端都无效时保持 None。
+    """
+    n = len(seq)
+    if n == 0:
+        return 0.0
+    jf = max(0.0, min(n - 1, float(idx_f)))
+    j = int(jf)
+    if j >= n - 1:
+        return seq[-1]
+    f = jf - j
+    a, b = seq[j], seq[j + 1]
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a + (b - a) * f
+
+
 # ─────────────────────── 坡度 / 配速 ───────────────────────
 
 SLOPE_LIMIT_PCT = 60.0        # 坡度物理合理裁剪区间（±60%，覆盖野路台阶）
@@ -378,6 +401,128 @@ def format_pace(sec_per_km: float | None) -> str:
         return "--'--\"/km"
     s = int(round(sec_per_km))
     return f"{s // 60}'{s % 60:02d}\"/km"
+
+
+# ─────────────── 心率模型（速度 + 坡度 → 模拟心率） ───────────────
+# 徒步能耗近似（ACSM）+ 一阶惯性 + 9 点滑动均值，最终裁剪到 96% HRmax。
+# 心电卡只显示心率波形/数值，不显示速度与坡度；但心率完全由二者推导。
+
+HR_ZONE_COLORS = ((76, 141, 255), (53, 196, 107), (255, 201, 60),
+                  (255, 138, 43), (255, 71, 87))
+HR_ZONE_NAMES = ("Z1 热身", "Z2 有氧", "Z3 耐力", "Z4 阈值", "Z5 无氧")
+HR_ZONE_THRESHOLDS = (0.60, 0.70, 0.80, 0.90)   # 占 HRmax 比例
+HR_WAVE_WINDOW_S = 4.0        # 心电波形窗口长度（秒）
+HR_INERTIA_TAU_UP = 40.0      # 心率上升时间常数（秒）
+HR_INERTIA_TAU_DOWN = 100.0   # 心率下降时间常数（秒）
+
+
+def hr_max_of(age: float) -> float:
+    """最大心率估算（Tanaka 公式）：208 - 0.7 × 年龄。"""
+    return max(120.0, 208.0 - 0.7 * float(age))
+
+
+def compute_speed_mps(points: List[Point], speeds: List[float],
+                      half: int = 3) -> List[float]:
+    """逐点运动速度（m/s）：优先 KML 瞬时速度窗口均值，无效时回退距离/时间。"""
+    n = len(points)
+    out = [0.0] * n
+    have_speeds = any(v > PACE_MIN_SPEED for v in speeds)
+    for i in range(n):
+        a = max(0, i - half)
+        b = min(n - 1, i + half)
+        v = 0.0
+        if have_speeds:
+            vals = [speeds[j] for j in range(a, b + 1)
+                    if speeds[j] > PACE_MIN_SPEED]
+            if vals:
+                v = sum(vals) / len(vals)
+        if v <= PACE_MIN_SPEED:
+            dt = points[b][3] - points[a][3]
+            if dt > 0:
+                dist = _haversine(points[a][0], points[a][1],
+                                  points[b][0], points[b][1])
+                v = dist / dt if dist >= SLOPE_MIN_DIST_M else 0.0
+        out[i] = v
+    return out
+
+
+def hr_zone_index(hr: float, hr_max: float) -> int:
+    """心率所在区间（0=Z1 … 4=Z5），阈值 60/70/80/90% HRmax。"""
+    r = float(hr) / float(hr_max) if hr_max > 0 else 0.0
+    for i, th in enumerate(HR_ZONE_THRESHOLDS):
+        if r < th:
+            return i
+    return 4
+
+
+def _ecg_g(u: float, c: float, w: float, a: float) -> float:
+    t = (u - c) / w
+    return a * math.exp(-t * t)
+
+
+def ecg_wave(u: float) -> float:
+    """归一化心电波形（u = 心跳相位 mod 1）：P 波 + QRS 主峰 + T 波。"""
+    u = float(u) % 1.0
+    return (_ecg_g(u, 0.20, 0.045, -0.10) + _ecg_g(u, 0.325, 0.016, -0.30)
+            + _ecg_g(u, 0.355, 0.017, 0.95) + _ecg_g(u, 0.385, 0.016, -0.28)
+            + _ecg_g(u, 0.66, 0.07, 0.16))
+
+
+def compute_heart_rate(points: List[Point], speeds: List[float],
+                       slopes: List[float], elevations: List[float] | None = None,
+                       age: float = 35.0, rest: float = 62.0,
+                       vo2max: float = 42.0, tau_up: float = HR_INERTIA_TAU_UP,
+                       tau_down: float = HR_INERTIA_TAU_DOWN,
+                       alt_k: float = 0.0):
+    """速度 + 坡度 → 模拟心率序列。
+
+    返回 (hr_bpm, cum_beats, hr_max)：
+    - hr_bpm      逐点心率（bpm），已做一阶惯性与 9 点滑动均值
+    - cum_beats   逐点累计心跳拍数（相位确定性，逐帧独立渲染可直接读取）
+    - hr_max      最大心率（bpm）
+
+    公式口径：
+      S = 速度(m/min)；G = clamp(坡度%/100, -0.15, 0.35)
+      VO₂ = 3.5 + 0.1S + 1.8S·G（下坡坡度项 ×0.6）
+      %VO₂R = clamp((VO₂-3.5)/(VO₂max-3.5), 0, 1) ^ 0.85
+      HR_ss = rest + %VO₂R × (HRmax - rest)
+      HR_i = HR_{i-1} + (HR_ss - HR_{i-1})(1 - e^(-Δt/τ))，τ 上升/下降分开
+      可选海拔项：HR_ss × (1 + alt_k × max(0, 海拔-1500)/1000)
+    """
+    n = len(points)
+    hrmax = hr_max_of(age)
+    if n == 0:
+        return [], [], hrmax
+    v = compute_speed_mps(points, speeds)
+    hr = [0.0] * n
+    cur = float(rest)
+    for i in range(n):
+        s_m_min = v[i] * 60.0
+        grade = max(-0.15, min(0.35, slopes[i] / 100.0))
+        vo2 = 3.5 + 0.1 * s_m_min + 1.8 * s_m_min * grade * (0.6 if grade < 0 else 1.0)
+        frac = max(0.0, min(1.0, (vo2 - 3.5) / max(1e-6, vo2max - 3.5))) ** 0.85
+        target = rest + frac * (hrmax - rest)
+        if alt_k > 0 and elevations:
+            target *= 1.0 + float(alt_k) * max(0.0, elevations[i] - 1500.0) / 1000.0
+        if i == 0:
+            cur = target          # 起步直接进入稳态，避免开头从静息缓慢爬升
+        else:
+            dt = max(0.0, points[i][3] - points[i - 1][3])
+            tau = tau_up if target > cur else tau_down
+            cur += (target - cur) * (1.0 - math.exp(-dt / max(1.0, tau)))
+        hr[i] = min(0.96 * hrmax, max(rest * 0.9, cur))
+
+    # 9 点滑动均值：抹平逐点抖动，观感接近真实心率带
+    if n >= 9:
+        half = 4
+        hr = [sum(hr[max(0, i - half):min(n, i + half + 1)])
+              / (min(n, i + half + 1) - max(0, i - half)) for i in range(n)]
+
+    beats = [0.0] * n
+    for i in range(1, n):
+        dt = max(0.0, points[i][3] - points[i - 1][3])
+        beats[i] = beats[i - 1] + hr[i - 1] * dt / 60.0
+    return hr, beats, hrmax
 
 
 # ─────────────── 坡度仪配色 / 布局（渲染端与 GUI 预览共用，保证 WYSIWYG） ───────────────
@@ -822,6 +967,23 @@ class Renderer:
             float(width - 384), float(height - 214))
         self._elev_cache = None              # 静态底图缓存（bg + 面积 + 曲线 + 刻度）
 
+        # 模拟心电卡：心率由速度 + 坡度模型推导（卡片本身不显示速度/坡度）
+        self.show_heart_card: bool = True
+        self.hr_card_w: float = 300.0
+        self.hr_card_h: float = 170.0
+        self.hr_card_pos: Tuple[float, float] = (float(width - 354), 350.0)
+        self.hr_age: float = 35.0            # 年龄（决定 HRmax）
+        self.hr_rest: float = 62.0           # 静息心率
+        self.hr_vo2max: float = 42.0         # 最大摄氧量（ml/kg/min）
+        self.hr_tau_up: float = HR_INERTIA_TAU_UP      # 心率上升时间常数（秒）
+        self.hr_tau_down: float = HR_INERTIA_TAU_DOWN  # 心率下降时间常数（秒）
+        self.hr_alt_k: float = 0.0           # 海拔修正系数（0 = 关闭）
+        self.hr_bpm: List[float] = []
+        self.hr_beats: List[float] = []
+        self.hr_max: float = hr_max_of(self.hr_age)
+        self._hr_cache = None                # 静态底图缓存（卡底 + 网格 + 标题 + 区间条）
+        self.hr_recompute()
+
         # 分段视频：None = 未设置分段；否则 (cut_points, durations)
         # cut_points = 轨迹进度分割点列表(0<c<1 升序)，durations = 各段视频秒数
         # 段数 = len(cut_points) + 1，总时长 = sum(durations)
@@ -847,6 +1009,15 @@ class Renderer:
         self.trajectory_center = ((min(xs) + max(xs)) / 2,
                                   (min(ys) + max(ys)) / 2)
 
+    def hr_recompute(self) -> None:
+        """按当前速度/坡度与人体参数重算心率序列（换轨迹或改参数后调用）。"""
+        self.hr_bpm, self.hr_beats, self.hr_max = compute_heart_rate(
+            self.points, list(self.meta.get("speeds", [])), self.slope_pct,
+            [p[2] for p in self.points_smoothed],
+            age=self.hr_age, rest=self.hr_rest, vo2max=self.hr_vo2max,
+            tau_up=self.hr_tau_up, tau_down=self.hr_tau_down,
+            alt_k=self.hr_alt_k)
+
     # ── 多进程 pickle 支持 ──
     # _project 是闭包（不可 pickle）、PIL 字体含 C 指针（不可 pickle）：
     # 快照时置 None，子进程反序列化后用同一输入参数重建（compute_projection 纯函数，毫秒级）。
@@ -858,6 +1029,7 @@ class Renderer:
         state["font_small"] = None
         state["font_title"] = None
         state["_elev_cache"] = None      # 静态底图缓存不随快照传输，子进程懒构建
+        state["_hr_cache"] = None        # 心电卡静态底图同样不入快照
         return state
 
     def __copy__(self):
@@ -896,6 +1068,20 @@ class Renderer:
             self.elev_profile_pos = (float(self.width - 384),
                                      float(self.height - 214))
         self._elev_cache = None
+        # 兼容旧快照：补齐模拟心电卡属性
+        self.show_heart_card = getattr(self, "show_heart_card", True)
+        self.hr_card_w = getattr(self, "hr_card_w", 300.0)
+        self.hr_card_h = getattr(self, "hr_card_h", 170.0)
+        if not hasattr(self, "hr_card_pos"):
+            self.hr_card_pos = (float(self.width - 354), 350.0)
+        for _k, _d in (("hr_age", 35.0), ("hr_rest", 62.0), ("hr_vo2max", 42.0),
+                       ("hr_tau_up", HR_INERTIA_TAU_UP),
+                       ("hr_tau_down", HR_INERTIA_TAU_DOWN),
+                       ("hr_alt_k", 0.0)):
+            setattr(self, _k, getattr(self, _k, _d))
+        self._hr_cache = None
+        if not getattr(self, "hr_bpm", None):
+            self.hr_recompute()
         # 兼容旧快照：补齐进度环属性
         self.show_progress_ring = getattr(self, "show_progress_ring", True)
         self.progress_ring_style = getattr(self, "progress_ring_style", "circle")
@@ -957,12 +1143,13 @@ class Renderer:
         - 分段模式：段端点严格命中 cut 物理位置（点索引归一化），
           段内通过 cum_time 真实时间在段范围内插值找 idx，保留真实节奏。
 
-        轨迹切片/标记/数据面板用 int(idx)（离散点折线，本就该跳）；
-        地图导航中心用浮点 idx 插值 lon/lat（连续墨卡托像素，平滑滑动）。
+        轨迹切片/标记用 int(idx)（离散点折线，本就该跳）；
+        数据面板数值、进度环、坡度仪、地图导航中心均用浮点 idx 插值
+        （每帧连续变化，不再整点跳变）。
         """
         n = len(self.points)
         idx_f = max(0.0, min(n - 1, float(idx)))
-        idx = int(idx_f)              # 整数索引用于切片/标记/数据面板
+        idx = int(idx_f)              # 整数索引用于轨迹切片/当前位置标记
         projected = self.get_projected()
         # 超采样因子（输出倍率）：画布与投影已按该倍率放大，
         # 这里只负责把「写死的像素尺寸」同步放大，保证构图比例不变、细节更多
@@ -1031,20 +1218,20 @@ class Renderer:
             d.ellipse([cx - 4 * ss, cy - 4 * ss, cx + 4 * ss, cy + 4 * ss],
                       fill=(255, 60, 60, 255))
 
-        # 3) 数据面板（带用户平移缩放）
-        ascent = self.cum_ascent[idx]
-        dist_km = self.cum_dist[idx] / 1000.0
-        elapsed = self.cum_time[idx]
-        elev = self.points_smoothed[idx][2]
-        slope = self.slope_pct[idx]
-        pace = self.pace_s[idx]
+        # 3) 数据面板（数值按浮点索引插值 → 帧间连续变化，不再整点跳变）
+        ascent = interp_at(self.cum_ascent, idx_f)
+        dist_km = interp_at(self.cum_dist, idx_f) / 1000.0
+        elapsed = interp_at(self.cum_time, idx_f)
+        elev = self._interp_elev(idx_f)
+        slope = interp_at(self.slope_pct, idx_f)
+        pace = interp_at(self.pace_s, idx_f)
         self._draw_panel(d, ascent, dist_km, elapsed, elev, slope, pace)
 
         # 3b) 动态坡度仪（独立于数据面板，可单独拖动/调大小）
-        self._draw_slope_gauge(img, idx)
+        self._draw_slope_gauge(img, idx_f)
 
         # 3c) 进度环（当前里程 / 全程里程，独立于数据面板）
-        self._draw_progress_ring(img, idx)
+        self._draw_progress_ring(img, idx_f)
 
         # 4) 地图导航面板（以当前位置为中心，始终北朝上）
         if self.show_map:
@@ -1054,7 +1241,21 @@ class Renderer:
         if getattr(self, "show_elev_profile", False):
             self._draw_elev_profile(img, d, idx_f)
 
+        # 6) 模拟心电卡（心率由速度/坡度推导；卡片内不显示速度与坡度）
+        if getattr(self, "show_heart_card", False):
+            self._draw_heart_card(img, idx_f)
+
         return img
+
+    def _interp_elev(self, idx_f: float) -> float:
+        """平滑后的海拔按浮点索引插值（避免逐帧重建海拔列表）。"""
+        pts = self.points_smoothed
+        n = len(pts)
+        jf = max(0.0, min(n - 1, float(idx_f)))
+        j = int(jf)
+        if j >= n - 1:
+            return pts[-1][2]
+        return pts[j][2] + (pts[j + 1][2] - pts[j][2]) * (jf - j)
 
     def _draw_panel(self, d: ImageDraw.ImageDraw, ascent: float,
                     dist_km: float, elapsed: float, elev: float,
@@ -1232,7 +1433,7 @@ class Renderer:
 
     # ── 进度环 ──
 
-    def _draw_progress_ring(self, img: Image.Image, idx: int) -> None:
+    def _draw_progress_ring(self, img: Image.Image, idx: float) -> None:
         """进度环：当前里程 / 全程里程。样式二选一：
         - "circle"  经典满环：360° 圆环 + 中心大号当前里程 + 下方全程
         - "capsule" 紧凑胶囊：深色胶囊底 + 左侧小环(含百分比) + 右侧里程数字
@@ -1247,7 +1448,7 @@ class Renderer:
         gy = int(round(self.progress_ring_pos[1] * ss))
         s = self.progress_ring_size * ss
         total_km = self.cum_dist[-1] / 1000.0
-        cur_km = self.cum_dist[idx] / 1000.0
+        cur_km = interp_at(self.cum_dist, idx) / 1000.0   # 浮点插值：逐帧连续
         frac = max(0.0, min(1.0, cur_km / total_km)) if total_km > 0 else 0.0
 
         fw, fh = ring_footprint(self.progress_ring_style, s)
@@ -1601,6 +1802,135 @@ class Renderer:
                 layer.crop((left - px, top - py, right - px, bottom - py)),
                 (left, top))
 
+    # ── 模拟心电卡 ──
+
+    def _hr_base(self, ss: int):
+        """构建 / 复用模拟心电卡的静态底图（卡底 + 网格 + 基线 + 标题 + 区间条）。
+
+        返回 (底图, 布局)；底图只与尺寸绑定，逐帧复制后叠加波形/数值/游标。
+        """
+        pw = max(1, int(round(self.hr_card_w * ss)))
+        ph = max(1, int(round(self.hr_card_h * ss)))
+        key = (pw, ph, ss)
+        cache = getattr(self, "_hr_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1], cache[2]
+
+        k = min(pw / 300.0, ph / 170.0)     # 与设计稿 300×170 的等比基准
+        x0, x1 = 14.0 * k, pw - 14.0 * k
+        L = {"w": pw, "h": ph, "k": k, "x0": x0, "x1": x1,
+             "y0": 28.0 * k, "y1": 140.0 * k, "base_y": 104.0 * k,
+             "grid": 20.0 * k}
+        stroke = max(1, int(round(k)))
+        layer = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rounded_rectangle([0, 0, pw - 1, ph - 1],
+                             radius=max(2, int(round(13.0 * k))),
+                             fill=(14, 18, 26, 222),
+                             outline=(255, 255, 255, 41), width=stroke)
+
+        # 心电网格（纵向 + 横向，每 20px 一条，极弱白）
+        grid_col = (255, 255, 255, 11)
+        xx = x0
+        while xx <= x1 + 0.5:
+            ld.line((xx, L["y0"], xx, L["y1"]), fill=grid_col, width=stroke)
+            xx += L["grid"]
+        yy = L["y0"]
+        while yy <= L["y1"] + 0.5:
+            ld.line((x0, yy, x1, yy), fill=grid_col, width=stroke)
+            yy += L["grid"]
+
+        # 基线（走纸中心线）
+        ld.line((x0, L["base_y"], x1, L["base_y"]),
+                fill=(255, 255, 255, 31), width=stroke)
+
+        # 标题
+        ld.text((14.0 * k, 11.0 * k), "模拟心电 · ECG",
+                fill=(147, 160, 180, 235),
+                font=load_font(max(8, int(round(9.0 * k)))))
+        # 底部五段区间色条（Z1..Z5，比例 60/10/10/10/10%，半透明）
+        bar_y = 147.0 * k
+        bar_h = 6.0 * k
+        bx = x0
+        for color, ratio in zip(HR_ZONE_COLORS, (0.60, 0.10, 0.10, 0.10, 0.10)):
+            seg_w = (x1 - x0) * ratio
+            ld.rectangle([bx, bar_y, bx + seg_w, bar_y + bar_h],
+                         fill=color + (140,))
+            bx += seg_w
+
+        self._hr_cache = (key, layer, L)
+        return layer, L
+
+    def _draw_heart_card(self, img: Image.Image, idx_f: float) -> None:
+        """模拟心电卡：逐帧绘制 ECG 波形 + 大号 bpm + 区间名 + 区间游标。
+
+        波形相位来自预计算的累计心跳拍数（cum_beats），逐帧独立、无跨帧状态，
+        多进程渲染结果一致。卡片内不显示速度与坡度。
+        """
+        n = len(self.points)
+        if n < 2 or not self.hr_bpm:
+            return
+        ss = int(getattr(self, "_ss", 1) or 1)
+        base, L = self._hr_base(ss)
+        pw, ph = base.size
+        idx = max(0.0, min(float(n - 1), float(idx_f)))
+        i = int(idx)
+        f = idx - i
+        hr = self.hr_bpm[i]
+        beats = self.hr_beats[i]
+        if i < n - 1 and f > 0.0:
+            hr += (self.hr_bpm[i + 1] - hr) * f
+            beats += (self.hr_beats[i + 1] - beats) * f
+
+        zone = hr_zone_index(hr, self.hr_max)
+        zc = HR_ZONE_COLORS[zone]
+        k = L["k"]
+        x0, x1, by = L["x0"], L["x1"], L["base_y"]
+        layer = base.copy()
+        ld = ImageDraw.Draw(layer)
+
+        # 1) ECG 波形：窗口 4s，相位由累计心跳拍数推导（确定性）
+        samples = 260
+        amp = 42.0 * k
+        pts = []
+        for j in range(samples + 1):
+            fr = j / samples
+            x = x0 + (x1 - x0) * fr
+            back = (1.0 - fr) * HR_WAVE_WINDOW_S
+            u = (beats - back * hr / 60.0) % 1.0
+            pts.append((x, by - amp * ecg_wave(u)))
+        ld.line(pts, fill=zc + (240,), width=max(1, int(round(1.7 * k))))
+
+        # 2) 右上数值区：大号 bpm（右对齐）+ 单位 + 当前区间名
+        stroke = max(1, int(round(k)))
+        bold_f = load_font(max(8, int(round(28.0 * k))), bold=True)
+        unit_f = load_font(max(8, int(round(9.5 * k))))
+        zone_f = load_font(max(8, int(round(10.0 * k))), bold=True)
+        ld.text((x1, 26.0 * k), f"{hr:.0f}", fill=zc + (255,), font=bold_f,
+                anchor="ra", stroke_width=stroke, stroke_fill=(0, 0, 0, 190))
+        ld.text((x1, 56.0 * k), "bpm", fill=(147, 160, 180, 235), font=unit_f,
+                anchor="ra")
+        ld.text((x1, 68.0 * k), HR_ZONE_NAMES[zone], fill=zc + (255,),
+                font=zone_f, anchor="ra",
+                stroke_width=stroke, stroke_fill=(0, 0, 0, 160))
+
+        # 3) 当前心率在区间条上的游标
+        cx = x0 + (hr / max(1.0, self.hr_max)) * (x1 - x0)
+        cx = max(x0, min(x1, cx))
+        ld.line((cx, 144.0 * k, cx, 156.0 * k), fill=zc + (255,),
+                width=max(1, int(round(2.0 * k))))
+
+        # 4) 叠到输出画布（裁剪到画布内，允许拖出边界一部分）
+        px = int(round(self.hr_card_pos[0] * ss))
+        py = int(round(self.hr_card_pos[1] * ss))
+        left, top = max(0, px), max(0, py)
+        right = min(img.width, px + pw)
+        bottom = min(img.height, py + ph)
+        if right > left and bottom > top:
+            img.alpha_composite(
+                layer.crop((left - px, top - py, right - px, bottom - py)),
+                (left, top))
+
     def _get_tile(self, z: int, x: int, y: int):
         """获取瓦片（带磁盘缓存；样式跟随 map_style），返回 PIL Image 或 None。"""
         style = 6 if getattr(self, "map_style", "standard") == "satellite" else 8
@@ -1754,22 +2084,25 @@ class Renderer:
                 if tile is not None:
                     composite.paste(tile, ((tx - tx0) * 256, (ty - ty0) * 256))
 
-        # 裁剪到显示范围（以当前位置为中心）；round 而非 floor 截断，
-        # 把亚像素位移误差限制在 ±0.5px，避免连续滑动时周期性 1px 抖动
-        ox = int(round(cx_g - tx0 * 256 - half))
-        oy = int(round(cy_g - ty0 * 256 - half))
-        crop_span = int(round(span * expand))
-        cropped = composite.crop((ox, oy, ox + crop_span, oy + crop_span))
+        # 裁剪到显示范围（以当前位置为中心）：裁切原点保留浮点，用仿射变换
+        # 做亚像素平移 + 缩放。旧实现把原点 round 到整数像素，高 zoom 下
+        # 每帧的亚像素位移被吃掉，表现为「每几帧才挪 1px」的一卡一卡
+        ox_f = cx_g - tx0 * 256 - half
+        oy_f = cy_g - ty0 * 256 - half
+        crop_span = span * expand
+        target = big if heading_up else panel
+        scale = crop_span / max(1.0, float(target))
+        cropped = composite.transform(
+            (target, target), Image.AFFINE,
+            (scale, 0.0, ox_f, 0.0, scale, oy_f),
+            resample=Image.BICUBIC,
+            fillcolor=(240, 240, 240, 255))   # 边缘采样外溢 = 瓦片底色
 
         if heading_up:
-            if cropped.size != (big, big):
-                cropped = cropped.resize((big, big), Image.LANCZOS)
             rotated = cropped.rotate(bearing, resample=Image.BICUBIC)
             # 从旋转后的外接正方形中心裁出面板大小
             bx = (big - panel) // 2
             cropped = rotated.crop((bx, bx, bx + panel, bx + panel))
-        elif cropped.size != (panel, panel):
-            cropped = cropped.resize((panel, panel), Image.LANCZOS)
 
         # 贴到视频帧上（圆形用 alpha 遮罩，保持圆外区域透明）
         circle = self.map_shape == "circle"
