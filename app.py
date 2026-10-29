@@ -702,8 +702,9 @@ class SlopeGaugeItem(QGraphicsRectItem):
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.rect())
 
-        # 预览无超采样：ss=1，尺寸用基准值（共享函数内部统一处理换算）
-        paint_gauge(painter, r, r.slope_gauge_size, pct, idx, 1.0)
+        # 预览无超采样：直接矢量绘制（缩放时保持清晰，见 gauge_paint）
+        paint_gauge(painter, r, r.slope_gauge_size, pct, idx, 1.0,
+                    supersample=False)
 
 
 # ─────────────────────── 海拔一览图 Item ───────────────────────

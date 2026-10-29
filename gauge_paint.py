@@ -60,7 +60,11 @@ def _font(px: float, bold: bool = False):
 
 def _outlined_text(painter, text, rect, color, font, o: int = 1,
                    outline=(0, 0, 0, 255)):
-    """黑边描边文字：Qt 无原生描边，用 8 方向偏移近似（o=描边半径 px）。"""
+    """黑边描边文字：Qt 无原生描边，用 8 方向偏移近似（o=描边半径 px）。
+
+    调用方 paint_gauge 已在外层做超采样（1× 输出 3×、2× 输出 2×），
+    这里按放大后的 o 偏移绘制，缩小后描边边缘会被平滑，不会出现明显阶梯。
+    """
     from PyQt5.QtCore import Qt
     from PyQt5.QtGui import QColor
     painter.setFont(font)
@@ -92,12 +96,42 @@ def _c(r, rgb, alpha=None):
 
 # ─────────────────────── 入口分发 ───────────────────────
 
-def paint_gauge(painter, r, s: float, pct: float, idx: float, ss: float = 1.0):
-    """按 r.gauge_style 分发给三种样式绘制函数。
+def paint_gauge(painter, r, s: float, pct: float, idx: float, ss: float = 1.0,
+                supersample: bool = True):
+    """按 r.gauge_style 分发给三种样式绘制函数（带超采样抗锯齿）。
 
-    painter 坐标原点 = 坡度仪占位框左上角；s = slope_gauge_size × ss。
-    整体亮度在三种样式的颜色构造处统一用 _c() 缩放（预览/成片一致）。
+    先用 QPainter 在 3×（1× 输出）/2×（2× 输出）离屏 QImage 上矢量绘制，
+    再平滑缩到目标尺寸后画到传入 painter 上：细弧、圆角、文字描边的硬边
+    会明显减少。GUI 预览传 supersample=False，直接矢量绘制以保持缩放清晰。
     """
+    from PyQt5.QtCore import QRectF, Qt
+    from PyQt5.QtGui import QImage, QPainter
+
+    fw, fh = gauge_footprint(r.gauge_style, s)
+    tw = max(2, int(round(fw)))
+    th = max(2, int(round(fh)))
+    aa = (3 if ss <= 1 else (2 if ss == 2 else 1)) if supersample else 1
+    if aa <= 1:
+        _paint_gauge_core(painter, r, s, pct, idx, ss)
+        return
+
+    qimg = QImage(tw * aa, th * aa, QImage.Format_ARGB32_Premultiplied)
+    qimg.fill(0)
+    p = QPainter(qimg)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setRenderHint(QPainter.TextAntialiasing, True)
+    _paint_gauge_core(p, r, s * aa, pct, idx, ss * aa)
+    p.end()
+
+    scaled = qimg.scaled(tw, th, Qt.IgnoreAspectRatio,
+                         Qt.SmoothTransformation)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    painter.drawImage(QRectF(0, 0, tw, th), scaled)
+
+
+def _paint_gauge_core(painter, r, s: float, pct: float, idx: float,
+                      ss: float = 1.0):
+    """三种样式的实际绘制入口（s 与 ss 均按传入倍率放大）。"""
     if r.gauge_style == "card":
         paint_gauge_card(painter, r, s, pct, ss)
     elif r.gauge_style == "profile":
