@@ -1995,9 +1995,10 @@ class Renderer:
                 (left, top))
 
     def _draw_heart_pulse(self, img: Image.Image, idx_f: float) -> None:
-        """心跳声呐卡：脉冲圈 + 心率弧 + 大号 bpm + 区间徽标 + 近 30 秒节拍。
+        """心跳声呐卡：脉冲圈 + 「实时心率」+ 大号数值。
 
-        脉冲相位与节拍刻度全部来自预计算序列，逐帧独立、多进程结果一致。
+        有 Qt 应用时走 QPainter 矢量绘制（等同 HTML 抗锯齿质量）；
+        无 Qt 的纯后端环境回退到下方 PIL/SDF 路径。
         """
         n = len(self.points)
         if n < 2 or not self.hr_bpm:
@@ -2006,10 +2007,6 @@ class Renderer:
         # PIL 的 arc/ellipse 无抗锯齿：卡片内部按超采样绘制，最后降采样合成，
         # 否则 1× 输出时圆环会出现明显锯齿与断点。
         aa = 3 if ss <= 1 else (2 if ss == 2 else 1)
-        base, L = self._hr_base(ss * aa)
-        out_w = max(1, int(round(self.hr_card_w * ss)))
-        out_h = max(1, int(round(self.hr_card_h * ss)))
-        pw, ph = base.size
         idx = max(0.0, min(float(n - 1), float(idx_f)))
         i = int(idx)
         f = idx - i
@@ -2021,6 +2018,15 @@ class Renderer:
 
         zone = hr_zone_index(hr, self.hr_max)
         zc = HR_ZONE_COLORS[zone]
+
+        if self._qt_ready():
+            self._draw_heart_pulse_qt(img, hr, zc, beats, ss)
+            return
+
+        base, L = self._hr_base(ss * aa)
+        out_w = max(1, int(round(self.hr_card_w * ss)))
+        out_h = max(1, int(round(self.hr_card_h * ss)))
+        pw, ph = base.size
         k = L["k"]
         cx, cy = L["cx"], L["cy"]
         x1 = L["x1"]
@@ -2070,6 +2076,114 @@ class Renderer:
             img.alpha_composite(
                 layer.crop((left - px, top - py, right - px, bottom - py)),
                 (left, top))
+
+    @staticmethod
+    def _qt_ready() -> bool:
+        """Qt 矢量绘制是否可用（GUI/视频渲染进程内有 QApplication 时可用）。"""
+        try:
+            from PyQt5.QtWidgets import QApplication
+            return QApplication.instance() is not None
+        except Exception:
+            return False
+
+    def _draw_heart_pulse_qt(self, img: Image.Image, hr: float, zc: tuple,
+                             beats: float, ss: int) -> None:
+        """用 Qt QPainter 矢量绘制心跳声呐卡（等同 HTML 的抗锯齿质量）。
+
+        仅在有 QApplication 时调用；无 Qt 环境回退到 PIL/SDF 路径。
+        渲染按 S=2~4 倍超采样后平滑缩小，保证 1× 输出也细腻。
+        """
+        from PyQt5.QtCore import QPointF, QRectF, Qt
+        from PyQt5.QtGui import (QColor, QFont, QImage, QPainter, QPen,
+                                 QPolygonF)
+
+        out_w = max(1, int(round(self.hr_card_w * ss)))
+        out_h = max(1, int(round(self.hr_card_h * ss)))
+        s = max(2, min(4, ss * 2))
+        w, h = self.hr_card_w * s, self.hr_card_h * s
+        k = min(w / 300.0, h / 170.0)
+
+        qimg = QImage(int(round(w)), int(round(h)), QImage.Format_RGBA8888)
+        qimg.fill(Qt.transparent)
+        p = QPainter(qimg)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+
+        # 卡底
+        p.setPen(QPen(QColor(255, 255, 255, 41), max(1.0, k)))
+        p.setBrush(QColor(14, 18, 26, 222))
+        p.drawRoundedRect(QRectF(0, 0, qimg.width() - 1,
+                                 qimg.height() - 1), 13.0 * k, 13.0 * k)
+
+        cx, cy = 84.0 * k, 86.0 * k
+        u = beats % 1.0
+        # 两圈脉冲（相位错开半拍）
+        p.setBrush(Qt.NoBrush)
+        for off in (0.0, 0.5):
+            phs = (u + off) % 1.0
+            rr = (34.0 + 24.0 * phs) * k
+            alpha = int(160 * (1.0 - phs))
+            if alpha > 6:
+                p.setPen(QPen(QColor(zc[0], zc[1], zc[2], alpha),
+                              max(1.0, 1.8 * k)))
+                p.drawEllipse(QPointF(cx, cy), rr, rr)
+
+        # 中心心形（每拍轻微放大）
+        env = max(0.0, 1.0 - abs(u - 0.08) / 0.20)
+        pts = self._heart_polygon(cx, cy, 0.80 * k * (1.0 + 0.09 * env))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(*zc))
+        p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
+
+        # 文案
+        rx = 152.0 * k
+        cap_f = QFont("Microsoft YaHei")
+        cap_f.setPixelSize(max(8, int(round(10.0 * k))))
+        bold_f = QFont("Arial")
+        bold_f.setPixelSize(max(8, int(round(28.0 * k))))
+        bold_f.setWeight(QFont.Bold)
+        unit_f = QFont("Arial")
+        unit_f.setPixelSize(max(8, int(round(9.5 * k))))
+        gray = QColor(147, 160, 180, 235)
+
+        p.setFont(cap_f)
+        p.setPen(gray)
+        p.drawText(QRectF(rx, 54.0 * k, 140.0 * k, 22.0 * k),
+                   Qt.AlignLeft | Qt.AlignTop, "实时心率")
+
+        txt = f"{hr:.0f}"
+        p.setFont(bold_f)
+        p.setPen(QColor(*zc))
+        p.drawText(QRectF(rx, 66.0 * k, 140.0 * k, 40.0 * k),
+                   Qt.AlignLeft | Qt.AlignTop, txt)
+        from PyQt5.QtGui import QFontMetricsF
+        tw = QFontMetricsF(bold_f).width(txt)
+        p.setFont(unit_f)
+        p.setPen(gray)
+        p.drawText(QRectF(rx + tw + 5.0 * k, 86.0 * k,
+                          40.0 * k, 18.0 * k),
+                   Qt.AlignLeft | Qt.AlignTop, "bpm")
+        p.end()
+
+        if (out_w, out_h) != (qimg.width(), qimg.height()):
+            qimg = qimg.scaled(out_w, out_h, Qt.IgnoreAspectRatio,
+                               Qt.SmoothTransformation)
+        buf = qimg.constBits()
+        buf.setsize(qimg.byteCount())
+        card = Image.frombuffer("RGBA", (out_w, out_h),
+                                buf.asstring(qimg.byteCount()),
+                                "raw", "RGBA", 0, 1)
+
+        # 叠到输出画布（裁剪，允许拖出边界一部分）
+        px = int(round(self.hr_card_pos[0] * ss))
+        py = int(round(self.hr_card_pos[1] * ss))
+        left, top = max(0, px), max(0, py)
+        right = min(img.width, px + out_w)
+        bottom = min(img.height, py + out_h)
+        if right > left and bottom > top:
+            img.alpha_composite(
+                card.crop((left - px, top - py,
+                           right - px, bottom - py)), (left, top))
 
     def _get_tile(self, z: int, x: int, y: int):
         """获取瓦片（带磁盘缓存；样式跟随 map_style），返回 PIL Image 或 None。"""
