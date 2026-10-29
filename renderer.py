@@ -1989,7 +1989,12 @@ class Renderer:
         if n < 2 or not self.hr_bpm:
             return
         ss = int(getattr(self, "_ss", 1) or 1)
-        base, L = self._hr_base(ss)
+        # PIL 的 arc/ellipse 无抗锯齿：卡片内部按超采样绘制，最后降采样合成，
+        # 否则 1× 输出时圆环会出现明显锯齿与断点。
+        aa = 3 if ss <= 1 else (2 if ss == 2 else 1)
+        base, L = self._hr_base(ss * aa)
+        out_w = max(1, int(round(self.hr_card_w * ss)))
+        out_h = max(1, int(round(self.hr_card_h * ss)))
         pw, ph = base.size
         idx = max(0.0, min(float(n - 1), float(idx_f)))
         i = int(idx)
@@ -2094,7 +2099,10 @@ class Renderer:
             ld.rectangle([bx, base_y - bh, bx + bar_w, base_y],
                          fill=zc + (alpha,))
 
-        # 6) 叠到输出画布（裁剪到画布内，允许拖出边界一部分）
+        # 6) 超采样层降采样回输出尺寸，再叠到画布（裁剪，允许拖出边界一部分）
+        if aa > 1:
+            layer = layer.resize((out_w, out_h), Image.LANCZOS)
+            pw, ph = out_w, out_h
         px = int(round(self.hr_card_pos[0] * ss))
         py = int(round(self.hr_card_pos[1] * ss))
         left, top = max(0, px), max(0, py)
