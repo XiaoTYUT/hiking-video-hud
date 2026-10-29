@@ -170,7 +170,7 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
   - 数据面板（二级 `QTabWidget` 分块，避免一页 30+ 行控件）：
     - 「面板与背景」→ `self._page_panel`：数据项显示（`fg`）+ 面板背景（`bg`）
     - 「坡度仪」→ `self._page_panel_gauge`：动态坡度仪（`gg`）
-    - 「海拔图 & 进度环」→ `self._page_panel_extra`：海拔一览图（`eg`）+ 进度环（`rg`）+ 模拟心电卡（`hg`）
+    - 「海拔图 & 进度环」→ `self._page_panel_extra`：海拔一览图（`eg`）+ 进度环（`rg`）+ 心率卡（`hg`）
   - 地图导航 → `self._page_map`：`mg`
   - 轨迹与标注 → `self._page_track`：轨迹（`tg`，轨迹粗细）+ 关键节点（`kg`）
 - 各页 layout 用 `setAlignment(Qt.AlignTop)`（**不要**用 addStretch，分组是后加的会被挤到 stretch 之后）
@@ -234,9 +234,11 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 - **平滑方案**：渲染前按帧密度重建点数滑动平均序列，`half = max(4, ceil(1.5 × step))`。GUI 预览用默认 half=4。
 - 持久化：工程文件含 `show_slope_gauge`、`slope_gauge_size`、`slope_gauge_pos`、`gauge_style` 及 gauge_* 样式键（含 `gauge_brightness_pct`）；__setstate__ 对旧快照 `getattr(..., 82.0)` 兜底。
 
-## 10b. 模拟心电卡（2026-10-29）
+## 10b. 心率卡（2026-10-29）
 
-- 独立可拖动组件（300×170 基准，`hr_card_w/h` 可调），显示 ECG 波形 + 大号 bpm + 心率区间名 + 底部 Z1~Z5 区间色条 + 当前心率游标。
+- 独立可拖动组件（300×170 基准，`hr_card_w/h` 可调），两种样式 `hr_card_style`：
+  - `pulse`（默认，心跳声呐）：左侧 260° 心率弧（当前 HR/HRmax）+ 两圈随拍扩散的脉冲 + 心形（每拍轻微放大）；右侧大号 bpm、区间徽标、%HRmax；底部「最近 30 秒」心率变化箭头 + 16 根节拍刻度。
+  - `ecg`：ECG 波形 + 大号 bpm + 区间名 + 底部 Z1~Z5 区间色条 + 当前心率游标。
 - **卡片内不显示速度与坡度**；但心率数值 100% 由运动速度 + 坡度模型推导（见 `心率图设计方案.html`）。
 - 公式（renderer.py `compute_heart_rate`）：
   - 速度 `compute_speed_mps`：KML 瞬时速度 ±3 点有效值均值；无有效值回退「窗口距离/窗口时间」（<0.3 m/s 视为停顿）。
@@ -244,12 +246,12 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
   - `%VO₂R = clamp((VO₂-3.5)/(VO₂max-3.5), 0, 1) ^ 0.85`；`HRmax = 208 - 0.7×age`（Tanaka）。
   - `HR_ss = rest + %VO₂R×(HRmax-rest)`；一阶惯性 `HR += (HR_ss-HR)(1-e^(-Δt/τ))`，上升 τ=40s / 下降 τ=100s，Δt 用 `<when>` 真实间隔。
   - 9 点滑动均值后裁剪到 96% HRmax；可选海拔项 `HR_ss×(1+alt_k×max(0,海拔-1500)/1000)`，默认 0 关闭。
-- 波形相位来自预计算累计拍数 `cum_beats += HR·Δt/60`（`ecg_wave(u)` = P波+QRS主峰+T波），**逐帧独立、无跨帧状态** → 多进程渲染每帧确定性一致（已用 pickle 副本逐像素验证）。
+- 波形 / 脉冲相位来自预计算累计拍数 `cum_beats += HR·Δt/60`（`ecg_wave(u)` = P波+QRS主峰+T波；心跳声呐用 `u = cum_beats mod 1` 驱动双圈脉冲与心形缩放），**逐帧独立、无跨帧状态** → 多进程渲染每帧确定性一致（已用 pickle 副本逐像素验证）。
 - 区间：阈值 60/70/80/90% HRmax；Z1 #4C8DFF 热身 / Z2 #35C46B 有氧 / Z3 #FFC93C 耐力 / Z4 #FF8A2B 阈值 / Z5 #FF4757 无氧。
-- 渲染：静态底图（卡底+网格+基线+标题+区间条）按 (w,h,ss) 缓存（`_hr_cache`，`__getstate__` 置 None），逐帧复制后叠加波形/数值/游标再 alpha 合成；定位 `hr_card_pos` 内部 ×ss。
-- GUI：`HeartCardItem(QGraphicsRectItem)` 调 `_draw_heart_card` 生成位图（WYSIWYG），滚轮等比缩放 → 回写 `spin_hr_w/h`；与坡度仪共用 60ms 预览计时器。
-- 持久化：`show_heart_card`、`hr_card_w/h`、`hr_card_pos`、`hr_age`、`hr_rest`、`hr_vo2max`、`hr_tau_up`、`hr_tau_down`、`hr_alt_k`；`__setstate__` 对旧快照兜底并 `hr_recompute()`。
-- 默认：显示开启、年龄 35、静息 62、VO₂max 42、τ 40/100、海拔系数 0。
+- 渲染：`_draw_heart_card` 分发 `_draw_heart_pulse` / `_draw_heart_ecg`；静态底图按 `(w,h,ss,style)` 缓存（`_hr_cache`，`__getstate__` 置 None），逐帧复制后叠加动态层再 alpha 合成；定位 `hr_card_pos` 内部 ×ss。声呐近 30 秒节拍刻度取该时段心率采样，高度按 HR/HRmax。
+- GUI：`HeartCardItem(QGraphicsRectItem)` 调 `_draw_heart_card` 生成位图（WYSIWYG），滚轮等比缩放 → 回写 `spin_hr_w/h`；与坡度仪共用 60ms 预览计时器；设置页样式下拉框切换 pulse/ecg。
+- 持久化：`show_heart_card`、`hr_card_style`、`hr_card_w/h`、`hr_card_pos`、`hr_age`、`hr_rest`、`hr_vo2max`、`hr_tau_up`、`hr_tau_down`、`hr_alt_k`；`__setstate__` 对旧快照兜底并 `hr_recompute()`。
+- 默认：显示开启、样式 pulse、年龄 35、静息 62、VO₂max 42、τ 40/100、海拔系数 0。
 
 ## 16. 当前状态与待办（2026-10-19）
 

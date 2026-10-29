@@ -967,8 +967,9 @@ class Renderer:
             float(width - 384), float(height - 214))
         self._elev_cache = None              # 静态底图缓存（bg + 面积 + 曲线 + 刻度）
 
-        # 模拟心电卡：心率由速度 + 坡度模型推导（卡片本身不显示速度/坡度）
+        # 心率卡：样式 pulse=心跳声呐 / ecg=心电波形；心率由速度 + 坡度模型推导
         self.show_heart_card: bool = True
+        self.hr_card_style: str = "pulse"
         self.hr_card_w: float = 300.0
         self.hr_card_h: float = 170.0
         self.hr_card_pos: Tuple[float, float] = (float(width - 354), 350.0)
@@ -1068,8 +1069,9 @@ class Renderer:
             self.elev_profile_pos = (float(self.width - 384),
                                      float(self.height - 214))
         self._elev_cache = None
-        # 兼容旧快照：补齐模拟心电卡属性
+        # 兼容旧快照：补齐心率卡属性
         self.show_heart_card = getattr(self, "show_heart_card", True)
+        self.hr_card_style = getattr(self, "hr_card_style", "pulse")
         self.hr_card_w = getattr(self, "hr_card_w", 300.0)
         self.hr_card_h = getattr(self, "hr_card_h", 170.0)
         if not hasattr(self, "hr_card_pos"):
@@ -1805,18 +1807,25 @@ class Renderer:
     # ── 模拟心电卡 ──
 
     def _hr_base(self, ss: int):
-        """构建 / 复用模拟心电卡的静态底图（卡底 + 网格 + 基线 + 标题 + 区间条）。
-
-        返回 (底图, 布局)；底图只与尺寸绑定，逐帧复制后叠加波形/数值/游标。
-        """
+        """按样式构建 / 复用心率卡静态底图（缓存键包含样式，切换样式自动重建）。"""
         pw = max(1, int(round(self.hr_card_w * ss)))
         ph = max(1, int(round(self.hr_card_h * ss)))
-        key = (pw, ph, ss)
+        style = getattr(self, "hr_card_style", "pulse")
+        key = (pw, ph, ss, style)
         cache = getattr(self, "_hr_cache", None)
         if cache is not None and cache[0] == key:
             return cache[1], cache[2]
 
         k = min(pw / 300.0, ph / 170.0)     # 与设计稿 300×170 的等比基准
+        if style == "ecg":
+            layer, L = self._hr_base_ecg(pw, ph, k)
+        else:
+            layer, L = self._hr_base_pulse(pw, ph, k)
+        self._hr_cache = (key, layer, L)
+        return layer, L
+
+    def _hr_base_ecg(self, pw: int, ph: int, k: float):
+        """心电样式底图：卡底 + 网格 + 基线 + 标题 + 底部区间条。"""
         x0, x1 = 14.0 * k, pw - 14.0 * k
         L = {"w": pw, "h": ph, "k": k, "x0": x0, "x1": x1,
              "y0": 28.0 * k, "y1": 140.0 * k, "base_y": 104.0 * k,
@@ -1858,10 +1867,50 @@ class Renderer:
                          fill=color + (140,))
             bx += seg_w
 
-        self._hr_cache = (key, layer, L)
         return layer, L
 
+    def _hr_base_pulse(self, pw: int, ph: int, k: float):
+        """心跳声呐样式底图：卡底 + 260° 心率弧轨道 + 标题。"""
+        cx, cy, r = 84.0 * k, 86.0 * k, 50.0 * k
+        L = {"w": pw, "h": ph, "k": k, "cx": cx, "cy": cy, "r": r,
+             "x1": pw - 14.0 * k}
+        stroke = max(1, int(round(2.6 * k)))
+        layer = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.rounded_rectangle([0, 0, pw - 1, ph - 1],
+                             radius=max(2, int(round(13.0 * k))),
+                             fill=(14, 18, 26, 222),
+                             outline=(255, 255, 255, 41),
+                             width=max(1, int(round(k))))
+        box = [cx - r, cy - r, cx + r, cy + r]
+        # 260° 轨道（底部留 100° 缺口），极弱白
+        ld.arc(box, 140, 360, fill=(255, 255, 255, 44), width=stroke)
+        ld.arc(box, 0, 40, fill=(255, 255, 255, 44), width=stroke)
+        ld.text((14.0 * k, 11.0 * k), "实时心率 · PULSE",
+                fill=(147, 160, 180, 235),
+                font=load_font(max(8, int(round(9.0 * k)))))
+        return layer, L
+
+    @staticmethod
+    def _heart_polygon(cx: float, cy: float, s: float):
+        """参数化心形（尖端朝下），s 为相对缩放。"""
+        pts = []
+        for deg in range(0, 360, 6):
+            t = math.radians(deg)
+            x = 16.0 * math.sin(t) ** 3
+            y = (13.0 * math.cos(t) - 5.0 * math.cos(2 * t)
+                 - 2.0 * math.cos(3 * t) - math.cos(4 * t))
+            pts.append((cx + x * s, cy - y * s))
+        return pts
+
     def _draw_heart_card(self, img: Image.Image, idx_f: float) -> None:
+        """心率卡分发：pulse=心跳声呐（默认）/ ecg=心电波形。"""
+        if getattr(self, "hr_card_style", "pulse") == "ecg":
+            self._draw_heart_ecg(img, idx_f)
+        else:
+            self._draw_heart_pulse(img, idx_f)
+
+    def _draw_heart_ecg(self, img: Image.Image, idx_f: float) -> None:
         """模拟心电卡：逐帧绘制 ECG 波形 + 大号 bpm + 区间名 + 区间游标。
 
         波形相位来自预计算的累计心跳拍数（cum_beats），逐帧独立、无跨帧状态，
@@ -1921,6 +1970,131 @@ class Renderer:
                 width=max(1, int(round(2.0 * k))))
 
         # 4) 叠到输出画布（裁剪到画布内，允许拖出边界一部分）
+        px = int(round(self.hr_card_pos[0] * ss))
+        py = int(round(self.hr_card_pos[1] * ss))
+        left, top = max(0, px), max(0, py)
+        right = min(img.width, px + pw)
+        bottom = min(img.height, py + ph)
+        if right > left and bottom > top:
+            img.alpha_composite(
+                layer.crop((left - px, top - py, right - px, bottom - py)),
+                (left, top))
+
+    def _draw_heart_pulse(self, img: Image.Image, idx_f: float) -> None:
+        """心跳声呐卡：脉冲圈 + 心率弧 + 大号 bpm + 区间徽标 + 近 30 秒节拍。
+
+        脉冲相位与节拍刻度全部来自预计算序列，逐帧独立、多进程结果一致。
+        """
+        n = len(self.points)
+        if n < 2 or not self.hr_bpm:
+            return
+        ss = int(getattr(self, "_ss", 1) or 1)
+        base, L = self._hr_base(ss)
+        pw, ph = base.size
+        idx = max(0.0, min(float(n - 1), float(idx_f)))
+        i = int(idx)
+        f = idx - i
+        hr = self.hr_bpm[i]
+        beats = self.hr_beats[i]
+        if i < n - 1 and f > 0.0:
+            hr += (self.hr_bpm[i + 1] - hr) * f
+            beats += (self.hr_beats[i + 1] - beats) * f
+
+        zone = hr_zone_index(hr, self.hr_max)
+        zc = HR_ZONE_COLORS[zone]
+        k = L["k"]
+        cx, cy, r = L["cx"], L["cy"], L["r"]
+        x1 = L["x1"]
+        layer = base.copy()
+        ld = ImageDraw.Draw(layer)
+        stroke = max(1, int(round(k)))
+
+        # 1) 心率弧：当前心率占 HRmax 的比例（0..1），沿 260° 轨道
+        frac = max(0.0, min(1.0, hr / max(1.0, self.hr_max)))
+        a_end = 140.0 + 260.0 * frac
+        arc_w = max(1, int(round(2.6 * k)))
+        box = [cx - r, cy - r, cx + r, cy + r]
+        if a_end <= 360.0:
+            ld.arc(box, 140.0, a_end, fill=zc + (255,), width=arc_w)
+        else:
+            ld.arc(box, 140.0, 360.0, fill=zc + (255,), width=arc_w)
+            ld.arc(box, 0.0, a_end - 360.0, fill=zc + (255,), width=arc_w)
+
+        # 2) 两圈脉冲扩散（相位错开半拍，完全由累计拍数决定）
+        u = beats % 1.0
+        ring_w = max(1, int(round(1.5 * k)))
+        for off in (0.0, 0.5):
+            phs = (u + off) % 1.0
+            rr = (34.0 + 24.0 * phs) * k
+            alpha = int(150 * (1.0 - phs))
+            if alpha > 6:
+                ld.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
+                           outline=zc + (alpha,), width=ring_w)
+
+        # 3) 心形：随每拍轻微放大（beat envelope）
+        env = max(0.0, 1.0 - abs(u - 0.08) / 0.20)
+        ld.polygon(self._heart_polygon(cx, cy, 0.80 * k * (1.0 + 0.09 * env)),
+                   fill=zc + (255,))
+
+        # 4) 右列：标题 / 大号 bpm / 区间徽标 / 比例
+        rx = x1 - 134.0 * k
+        cap_f = load_font(max(8, int(round(9.0 * k))))
+        bold_f = load_font(max(8, int(round(28.0 * k))), bold=True)
+        unit_f = load_font(max(8, int(round(9.5 * k))))
+        zone_f = load_font(max(8, int(round(10.0 * k))), bold=True)
+        ld.text((rx, 26.0 * k), "实时心率", fill=(147, 160, 180, 235),
+                font=cap_f)
+        txt = f"{hr:.0f}"
+        ld.text((rx, 40.0 * k), txt, fill=zc + (255,), font=bold_f,
+                anchor="la", stroke_width=stroke, stroke_fill=(0, 0, 0, 190))
+        tw = ld.textlength(txt, font=bold_f)
+        ld.text((rx + tw + 5.0 * k, 58.0 * k), "bpm",
+                fill=(147, 160, 180, 235), font=unit_f, anchor="la")
+
+        # 区间徽标（描边胶囊，填充透明，颜色即当前区间）
+        pill_w, pill_h = 64.0 * k, 21.0 * k
+        pill_y = 80.0 * k
+        ld.rounded_rectangle([rx, pill_y, rx + pill_w, pill_y + pill_h],
+                             radius=max(2, int(round(10.5 * k))),
+                             outline=zc + (255,), width=stroke)
+        ld.text((rx + pill_w / 2.0, pill_y + pill_h / 2.0),
+                HR_ZONE_NAMES[zone], fill=zc + (255,), font=zone_f,
+                anchor="mm")
+        ld.text((rx + 70.0 * k, 82.0 * k), f"{frac * 100.0:.0f}% HRmax",
+                fill=(147, 160, 180, 235), font=cap_f, anchor="la")
+
+        # 5) 近 30 秒：心率差值 + 16 根节拍刻度（高度随当时心率）
+        now_t = self.points[i][3]
+        j = i
+        while j > 0 and now_t - self.points[j - 1][3] <= 30.0:
+            j -= 1
+        delta = hr - self.hr_bpm[j]
+        if delta >= 1.0:
+            trend = f"↑ +{delta:.0f}"
+        elif delta <= -1.0:
+            trend = f"↓ {delta:.0f}"
+        else:
+            trend = "→ 0"
+        ld.text((rx, 120.0 * k), "最近 30 秒", fill=(147, 160, 180, 235),
+                font=cap_f)
+        ld.text((x1, 120.0 * k), trend, fill=zc + (255,), font=zone_f,
+                anchor="ra", stroke_width=stroke, stroke_fill=(0, 0, 0, 160))
+
+        count = 16
+        span = max(1, i - j)
+        bar_w = max(1.0, 3.0 * k)
+        base_y = 156.0 * k
+        step = (x1 - rx) / count
+        for s in range(count):
+            hv = self.hr_bpm[j + int(round(span * s / (count - 1)))]
+            bh = max(6.0 * k, min(24.0 * k,
+                                  hv / max(1.0, self.hr_max) * 24.0 * k))
+            bx = rx + step * s
+            alpha = 150 + int(90 * s / (count - 1))
+            ld.rectangle([bx, base_y - bh, bx + bar_w, base_y],
+                         fill=zc + (alpha,))
+
+        # 6) 叠到输出画布（裁剪到画布内，允许拖出边界一部分）
         px = int(round(self.hr_card_pos[0] * ss))
         py = int(round(self.hr_card_pos[1] * ss))
         left, top = max(0, px), max(0, py)

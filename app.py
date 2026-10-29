@@ -60,7 +60,7 @@ _PROJECT_FIELDS = (
     "elev_profile_w", "elev_profile_h",
     "show_progress_ring", "progress_ring_style", "progress_ring_size",
     "progress_ring_pos", "ring_progress_color",
-    "show_heart_card", "hr_card_w", "hr_card_h", "hr_card_pos",
+    "show_heart_card", "hr_card_style", "hr_card_w", "hr_card_h", "hr_card_pos",
     "hr_age", "hr_rest", "hr_vo2max", "hr_tau_up", "hr_tau_down", "hr_alt_k",
 )
 
@@ -1107,7 +1107,9 @@ class HeartCardItem(QGraphicsRectItem):
             painter.setPen(QPen(QColor(255, 255, 255, 60), 1))
             painter.drawRoundedRect(self.rect(), 12, 12)
             painter.setPen(QColor(200, 200, 220, 180))
-            painter.drawText(self.rect(), Qt.AlignCenter, "模拟心电")
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "心跳声呐" if getattr(self.renderer, "hr_card_style", "pulse") == "pulse"
+                             else "模拟心电")
 
 
 # ─────────────────────── CanvasView ───────────────────────
@@ -3096,21 +3098,31 @@ class MainWindow(QMainWindow):
         self._refresh_ring_color_btn()
         self._page_panel_extra.addWidget(rg)
 
-        # 模拟心电卡（心率由速度 + 坡度模型推导；卡片内不显示速度/坡度）
-        hg = QGroupBox("模拟心电卡")
+        # 心率卡（心率由速度 + 坡度模型推导；卡片内不显示速度/坡度）
+        hg = QGroupBox("心率卡")
         hf = QFormLayout(hg)
-        self.chk_heart_card = QCheckBox("显示模拟心电卡")
+        self.chk_heart_card = QCheckBox("显示心率卡")
         self.chk_heart_card.setChecked(
             bool(self.settings.get("show_heart_card", True)))
         self.chk_heart_card.setToolTip(
-            "实时模拟心电卡（ECG 波形 + 大号 bpm + 心率区间），\n"
+            "实时心率卡（心跳声呐 / 心电波形），\n"
             "心率由运动速度与坡度推导，可单独拖动位置、滚轮等比缩放")
         self.chk_heart_card.toggled.connect(self._on_heart_card_toggled)
         hf.addRow(self.chk_heart_card)
+        self.combo_hr_style = QComboBox()
+        self.combo_hr_style.addItem("心跳声呐（推荐）", "pulse")
+        self.combo_hr_style.addItem("心电波形（ECG）", "ecg")
+        _hs = self.settings.get("hr_card_style", "pulse")
+        _hs_idx = self.combo_hr_style.findData(_hs)
+        self.combo_hr_style.setCurrentIndex(max(0, _hs_idx))
+        self.combo_hr_style.setToolTip(
+            "心跳声呐：脉冲圈 + 心率弧 + 大号 bpm；心电波形：传统 ECG 走纸样式")
+        self.combo_hr_style.currentIndexChanged.connect(self._on_heart_params_changed)
+        hf.addRow("样式", self.combo_hr_style)
         self.chk_hr_preview = QCheckBox("画布预览播放（循环）")
         self.chk_hr_preview.setChecked(False)
         self.chk_hr_preview.setToolTip(
-            "让心电卡在画布上循环播放整段轨迹的心率变化，便于查看波形过渡（不影响视频输出）")
+            "让心率卡在画布上循环播放整段轨迹的心率变化，便于查看节奏过渡（不影响视频输出）")
         self.chk_hr_preview.toggled.connect(self._on_hr_preview_toggled)
         hf.addRow(self.chk_hr_preview)
         self.spin_hr_w = QSpinBox()
@@ -3848,7 +3860,7 @@ class MainWindow(QMainWindow):
     # ── 模拟心电卡 ──
 
     def _on_heart_card_toggled(self, on: bool):
-        """心电卡开关：同步 renderer + 创建/移除 GUI 预览。"""
+        """心率卡开关：同步 renderer + 创建/移除 GUI 预览。"""
         if self.renderer is None:
             return
         self.renderer.show_heart_card = on
@@ -3863,10 +3875,11 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     def _on_heart_params_changed(self, *_):
-        """卡片尺寸/人体参数变化 → 写回 renderer、重算心率并刷新预览。"""
+        """卡片尺寸/样式/人体参数变化 → 写回 renderer、重算心率并刷新预览。"""
         if self.renderer is None:
             return
         r = self.renderer
+        r.hr_card_style = self.combo_hr_style.currentData() or "pulse"
         r.hr_card_w = float(self.spin_hr_w.value())
         r.hr_card_h = float(self.spin_hr_h.value())
         r.hr_age = float(self.spin_hr_age.value())
@@ -3882,7 +3895,7 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     def _on_hr_preview_toggled(self, on: bool):
-        """心电卡预览播放开关：与坡度仪共用同一个循环计时器。"""
+        """心率卡预览播放开关：与坡度仪共用同一个循环计时器。"""
         if not hasattr(self, "_preview_timer"):
             self._preview_timer = QTimer(self)
             self._preview_timer.setInterval(60)
@@ -4460,10 +4473,14 @@ class MainWindow(QMainWindow):
             self.renderer.ring_progress_color = (
                 self._ring_color.red(), self._ring_color.green(),
                 self._ring_color.blue())
-        # 模拟心电卡控件（显示开关 / 尺寸 / 人体参数）
+        # 心率卡控件（显示开关 / 样式 / 尺寸 / 人体参数）
         self.chk_heart_card.blockSignals(True)
         self.chk_heart_card.setChecked(bool(s.get("show_heart_card", True)))
         self.chk_heart_card.blockSignals(False)
+        self.combo_hr_style.blockSignals(True)
+        self.combo_hr_style.setCurrentIndex(max(
+            0, self.combo_hr_style.findData(s.get("hr_card_style", "pulse"))))
+        self.combo_hr_style.blockSignals(False)
         for _sp, _key, _default in (
                 (self.spin_hr_w, "hr_card_w", 300),
                 (self.spin_hr_h, "hr_card_h", 170),
@@ -4481,6 +4498,7 @@ class MainWindow(QMainWindow):
         self.spin_hr_alt.blockSignals(False)
         if self.renderer is not None:
             self.renderer.show_heart_card = self.chk_heart_card.isChecked()
+            self.renderer.hr_card_style = self.combo_hr_style.currentData() or "pulse"
             self.renderer.hr_card_w = float(self.spin_hr_w.value())
             self.renderer.hr_card_h = float(self.spin_hr_h.value())
             self.renderer.hr_age = float(self.spin_hr_age.value())
@@ -4804,8 +4822,9 @@ class MainWindow(QMainWindow):
         _rc = self._ring_color
         self.renderer.ring_progress_color = (_rc.red(), _rc.green(),
                                              _rc.blue())
-        # 模拟心电卡设置（从 GUI 控件同步，心率依赖速度/坡度需重算）
+        # 心率卡设置（从 GUI 控件同步，心率依赖速度/坡度需重算）
         self.renderer.show_heart_card = self.chk_heart_card.isChecked()
+        self.renderer.hr_card_style = self.combo_hr_style.currentData() or "pulse"
         self.renderer.hr_card_w = float(self.spin_hr_w.value())
         self.renderer.hr_card_h = float(self.spin_hr_h.value())
         self.renderer.hr_age = float(self.spin_hr_age.value())
@@ -5197,6 +5216,8 @@ class MainWindow(QMainWindow):
                                     else list(RING_PROGRESS_DEFAULT)),
             "show_heart_card": (self.renderer.show_heart_card
                                 if self.renderer else True),
+            "hr_card_style": (self.renderer.hr_card_style
+                              if self.renderer else "pulse"),
             "hr_card_w": (self.renderer.hr_card_w
                           if self.renderer else 300.0),
             "hr_card_h": (self.renderer.hr_card_h
