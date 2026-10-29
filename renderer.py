@@ -407,6 +407,11 @@ def format_pace(sec_per_km: float | None) -> str:
 # 徒步能耗近似（ACSM）+ 一阶惯性 + 9 点滑动均值，最终裁剪到 96% HRmax。
 # 心电卡只显示心率波形/数值，不显示速度与坡度；但心率完全由二者推导。
 
+def _pct_alpha(pct: float) -> int:
+    """百分比不透明度（0..100）→ 0..255 alpha。"""
+    return max(0, min(255, int(round(float(pct) * 255.0 / 100.0))))
+
+
 HR_ZONE_COLORS = ((76, 141, 255), (53, 196, 107), (255, 201, 60),
                   (255, 138, 43), (255, 71, 87))
 HR_ZONE_NAMES = ("Z1 热身", "Z2 有氧", "Z3 耐力", "Z4 阈值", "Z5 无氧")
@@ -979,6 +984,20 @@ class Renderer:
         self.hr_tau_up: float = HR_INERTIA_TAU_UP      # 心率上升时间常数（秒）
         self.hr_tau_down: float = HR_INERTIA_TAU_DOWN  # 心率下降时间常数（秒）
         self.hr_alt_k: float = 0.0           # 海拔修正系数（0 = 关闭）
+        # 心率卡外观（心跳声呐卡；ECG 样式共用卡底/边框/圆角）
+        self.hr_card_bg_color: Tuple[int, int, int] = (14, 18, 26)
+        self.hr_card_bg_alpha: float = 87.0          # 卡底不透明度（%）
+        self.hr_card_border_color: Tuple[int, int, int] = (255, 255, 255)
+        self.hr_card_border_alpha: float = 16.0      # 边框不透明度（%）
+        self.hr_card_radius: float = 13.0            # 圆角半径（300×170 基准 px）
+        self.hr_pulse_scale: float = 100.0           # 脉冲圈尺寸（%）
+        self.hr_pulse_width: float = 1.8             # 脉冲圈线宽（基准 px）
+        self.hr_pulse_alpha: float = 63.0            # 脉冲圈峰值不透明度（%）
+        self.hr_heart_scale: float = 100.0           # 中心心形大小（%）
+        self.hr_label_size: float = 10.0             # 「实时心率」字号（基准 px）
+        self.hr_value_size: float = 28.0             # 心率数值字号（基准 px）
+        self.hr_unit_size: float = 9.5               # 「bpm」字号（基准 px）
+        self.hr_label_color: Tuple[int, int, int] = (147, 160, 180)
         self.hr_bpm: List[float] = []
         self.hr_beats: List[float] = []
         self.hr_max: float = hr_max_of(self.hr_age)
@@ -1080,6 +1099,21 @@ class Renderer:
                        ("hr_tau_up", HR_INERTIA_TAU_UP),
                        ("hr_tau_down", HR_INERTIA_TAU_DOWN),
                        ("hr_alt_k", 0.0)):
+            setattr(self, _k, getattr(self, _k, _d))
+        # 兼容旧快照：补齐心率卡外观属性
+        for _k, _d in (("hr_card_bg_color", (14, 18, 26)),
+                       ("hr_card_bg_alpha", 87.0),
+                       ("hr_card_border_color", (255, 255, 255)),
+                       ("hr_card_border_alpha", 16.0),
+                       ("hr_card_radius", 13.0),
+                       ("hr_pulse_scale", 100.0),
+                       ("hr_pulse_width", 1.8),
+                       ("hr_pulse_alpha", 63.0),
+                       ("hr_heart_scale", 100.0),
+                       ("hr_label_size", 10.0),
+                       ("hr_value_size", 28.0),
+                       ("hr_unit_size", 9.5),
+                       ("hr_label_color", (147, 160, 180))):
             setattr(self, _k, getattr(self, _k, _d))
         self._hr_cache = None
         if not getattr(self, "hr_bpm", None):
@@ -1806,12 +1840,34 @@ class Renderer:
 
     # ── 模拟心电卡 ──
 
+    def _hr_card_style_cfg(self):
+        """卡底外观配置（颜色/透明度/圆角），用于静态底图缓存键与绘制。"""
+        return (tuple(self.hr_card_bg_color),
+                round(float(self.hr_card_bg_alpha), 1),
+                tuple(self.hr_card_border_color),
+                round(float(self.hr_card_border_alpha), 1),
+                round(float(self.hr_card_radius), 1))
+
+    def _hr_card_fill(self):
+        """卡底填充色 + alpha（PIL 元组）。"""
+        return tuple(self.hr_card_bg_color) + (
+            _pct_alpha(self.hr_card_bg_alpha),)
+
+    def _hr_card_outline(self):
+        """卡底边框色 + alpha（PIL 元组）。"""
+        return tuple(self.hr_card_border_color) + (
+            _pct_alpha(self.hr_card_border_alpha),)
+
+    def _hr_card_radius_px(self, k: float) -> int:
+        """圆角半径像素（0 = 直角）。"""
+        return max(0, int(round(float(self.hr_card_radius) * k)))
+
     def _hr_base(self, ss: int):
         """按样式构建 / 复用心率卡静态底图（缓存键包含样式，切换样式自动重建）。"""
         pw = max(1, int(round(self.hr_card_w * ss)))
         ph = max(1, int(round(self.hr_card_h * ss)))
         style = getattr(self, "hr_card_style", "pulse")
-        key = (pw, ph, ss, style)
+        key = (pw, ph, ss, style, self._hr_card_style_cfg())
         cache = getattr(self, "_hr_cache", None)
         if cache is not None and cache[0] == key:
             return cache[1], cache[2]
@@ -1834,9 +1890,9 @@ class Renderer:
         layer = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
         ld = ImageDraw.Draw(layer)
         ld.rounded_rectangle([0, 0, pw - 1, ph - 1],
-                             radius=max(2, int(round(13.0 * k))),
-                             fill=(14, 18, 26, 222),
-                             outline=(255, 255, 255, 41), width=stroke)
+                             radius=self._hr_card_radius_px(k),
+                             fill=self._hr_card_fill(),
+                             outline=self._hr_card_outline(), width=stroke)
 
         # 心电网格（纵向 + 横向，每 20px 一条，极弱白）
         grid_col = (255, 255, 255, 11)
@@ -1877,9 +1933,9 @@ class Renderer:
         layer = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
         ld = ImageDraw.Draw(layer)
         ld.rounded_rectangle([0, 0, pw - 1, ph - 1],
-                             radius=max(2, int(round(13.0 * k))),
-                             fill=(14, 18, 26, 222),
-                             outline=(255, 255, 255, 41),
+                             radius=self._hr_card_radius_px(k),
+                             fill=self._hr_card_fill(),
+                             outline=self._hr_card_outline(),
                              width=max(1, int(round(k))))
         return layer, L
 
@@ -2037,22 +2093,30 @@ class Renderer:
         # 1) 中心心形（高分辨率绘制，随后随整卡降采样）
         u = beats % 1.0
         env = max(0.0, 1.0 - abs(u - 0.08) / 0.20)
-        ld.polygon(self._heart_polygon(cx, cy, 0.80 * k * (1.0 + 0.09 * env)),
-                   fill=zc + (255,))
+        heart_scale = float(self.hr_heart_scale) / 100.0
+        ld.polygon(self._heart_polygon(
+            cx, cy, 0.80 * k * heart_scale * (1.0 + 0.09 * env)),
+            fill=zc + (255,))
 
-        # 2) 右侧只保留「实时心率」标签 + 实时数值
+        # 2) 右侧只保留「实时心率」标签 + 实时数值（字号/颜色可配）
+        label_size = float(self.hr_label_size)
+        value_size = float(self.hr_value_size)
+        unit_size = float(self.hr_unit_size)
+        label_y = 54.0 * k
+        value_y = label_y + label_size * 1.2 * k
+        unit_y = value_y + value_size * 0.72 * k
+        label_col = tuple(self.hr_label_color) + (235,)
         rx = x1 - 134.0 * k
-        cap_f = load_font(max(8, int(round(10.0 * k))))
-        bold_f = load_font(max(8, int(round(28.0 * k))), bold=True)
-        unit_f = load_font(max(8, int(round(9.5 * k))))
-        ld.text((rx, 54.0 * k), "实时心率", fill=(147, 160, 180, 235),
-                font=cap_f)
+        cap_f = load_font(max(8, int(round(label_size * k))))
+        bold_f = load_font(max(8, int(round(value_size * k))), bold=True)
+        unit_f = load_font(max(8, int(round(unit_size * k))))
+        ld.text((rx, label_y), "实时心率", fill=label_col, font=cap_f)
         txt = f"{hr:.0f}"
-        ld.text((rx, 68.0 * k), txt, fill=zc + (255,), font=bold_f,
+        ld.text((rx, value_y), txt, fill=zc + (255,), font=bold_f,
                 anchor="la", stroke_width=stroke, stroke_fill=(0, 0, 0, 190))
         tw = ld.textlength(txt, font=bold_f)
-        ld.text((rx + tw + 5.0 * k, 86.0 * k), "bpm",
-                fill=(147, 160, 180, 235), font=unit_f, anchor="la")
+        ld.text((rx + tw + 5.0 * k, unit_y), "bpm",
+                fill=label_col, font=unit_f, anchor="la")
 
         # 6) 超采样层降采样回输出尺寸；圆环改用 SDF 在最终分辨率解析绘制
         if aa > 1:
@@ -2060,11 +2124,13 @@ class Renderer:
             pw, ph = out_w, out_h
         kk = min(pw / 300.0, ph / 170.0)
         ccx, ccy = 84.0 * kk, 86.0 * kk
-        ring_w = max(1.8, 1.8 * kk)
+        ring_scale = float(self.hr_pulse_scale) / 100.0
+        ring_w = max(1.0, float(self.hr_pulse_width) * kk)
+        peak = _pct_alpha(self.hr_pulse_alpha)
         for off in (0.0, 0.5):
             phs = (u + off) % 1.0
-            rr = (34.0 + 24.0 * phs) * kk
-            alpha = int(160 * (1.0 - phs))
+            rr = (34.0 + 24.0 * phs) * kk * ring_scale
+            alpha = int(peak * (1.0 - phs))
             if alpha > 6:
                 self._aa_ring(layer, ccx, ccy, rr, ring_w, zc, alpha)
         px = int(round(self.hr_card_pos[0] * ss))
@@ -2109,60 +2175,72 @@ class Renderer:
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setRenderHint(QPainter.TextAntialiasing, True)
 
-        # 卡底
-        p.setPen(QPen(QColor(255, 255, 255, 41), max(1.0, k)))
-        p.setBrush(QColor(14, 18, 26, 222))
+        # 卡底（颜色 / 不透明度 / 圆角可配）
+        bg_a = _pct_alpha(self.hr_card_bg_alpha)
+        border_a = _pct_alpha(self.hr_card_border_alpha)
+        radius = max(0.0, float(self.hr_card_radius) * k)
+        p.setPen(QPen(QColor(*self.hr_card_border_color, border_a), max(1.0, k)))
+        p.setBrush(QColor(*self.hr_card_bg_color, bg_a))
         p.drawRoundedRect(QRectF(0, 0, qimg.width() - 1,
-                                 qimg.height() - 1), 13.0 * k, 13.0 * k)
+                                 qimg.height() - 1), radius, radius)
 
         cx, cy = 84.0 * k, 86.0 * k
         u = beats % 1.0
-        # 两圈脉冲（相位错开半拍）
+        # 两圈脉冲（相位错开半拍；尺寸/线宽/不透明度可配）
         p.setBrush(Qt.NoBrush)
+        ring_scale = float(self.hr_pulse_scale) / 100.0
+        ring_w = max(1.0, float(self.hr_pulse_width) * k)
+        peak = _pct_alpha(self.hr_pulse_alpha)
         for off in (0.0, 0.5):
             phs = (u + off) % 1.0
-            rr = (34.0 + 24.0 * phs) * k
-            alpha = int(160 * (1.0 - phs))
+            rr = (34.0 + 24.0 * phs) * k * ring_scale
+            alpha = int(peak * (1.0 - phs))
             if alpha > 6:
-                p.setPen(QPen(QColor(zc[0], zc[1], zc[2], alpha),
-                              max(1.0, 1.8 * k)))
+                p.setPen(QPen(QColor(zc[0], zc[1], zc[2], alpha), ring_w))
                 p.drawEllipse(QPointF(cx, cy), rr, rr)
 
         # 中心心形（每拍轻微放大）
         env = max(0.0, 1.0 - abs(u - 0.08) / 0.20)
-        pts = self._heart_polygon(cx, cy, 0.80 * k * (1.0 + 0.09 * env))
+        heart_scale = float(self.hr_heart_scale) / 100.0
+        pts = self._heart_polygon(
+            cx, cy, 0.80 * k * heart_scale * (1.0 + 0.09 * env))
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(*zc))
         p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
 
-        # 文案
-        rx = 152.0 * k
+        # 文案（字号/颜色可配；位置随字号自动下移，右对齐到卡内边距）
+        from PyQt5.QtGui import QFontMetricsF
+        label_size = float(self.hr_label_size)
+        value_size = float(self.hr_value_size)
+        unit_size = float(self.hr_unit_size)
+        label_y = 54.0 * k
+        value_y = label_y + label_size * 1.2 * k
+        unit_y = value_y + value_size * 0.72 * k
+        label_col = QColor(*self.hr_label_color, 235)
+        rx = max(0.0, w - 148.0 * k)
+
         cap_f = QFont("Microsoft YaHei")
-        cap_f.setPixelSize(max(8, int(round(10.0 * k))))
+        cap_f.setPixelSize(max(8, int(round(label_size * k))))
         bold_f = QFont("Arial")
-        bold_f.setPixelSize(max(8, int(round(28.0 * k))))
+        bold_f.setPixelSize(max(8, int(round(value_size * k))))
         bold_f.setWeight(QFont.Bold)
         unit_f = QFont("Arial")
-        unit_f.setPixelSize(max(8, int(round(9.5 * k))))
-        gray = QColor(147, 160, 180, 235)
+        unit_f.setPixelSize(max(8, int(round(unit_size * k))))
 
         p.setFont(cap_f)
-        p.setPen(gray)
-        p.drawText(QRectF(rx, 54.0 * k, 140.0 * k, 22.0 * k),
-                   Qt.AlignLeft | Qt.AlignTop, "实时心率")
+        p.setPen(label_col)
+        p.drawText(QPointF(rx, label_y + QFontMetricsF(cap_f).ascent()),
+                   "实时心率")
 
         txt = f"{hr:.0f}"
         p.setFont(bold_f)
         p.setPen(QColor(*zc))
-        p.drawText(QRectF(rx, 66.0 * k, 140.0 * k, 40.0 * k),
-                   Qt.AlignLeft | Qt.AlignTop, txt)
-        from PyQt5.QtGui import QFontMetricsF
+        p.drawText(QPointF(rx, value_y + QFontMetricsF(bold_f).ascent()), txt)
         tw = QFontMetricsF(bold_f).width(txt)
         p.setFont(unit_f)
-        p.setPen(gray)
-        p.drawText(QRectF(rx + tw + 5.0 * k, 86.0 * k,
-                          40.0 * k, 18.0 * k),
-                   Qt.AlignLeft | Qt.AlignTop, "bpm")
+        p.setPen(label_col)
+        p.drawText(QPointF(rx + tw + 5.0 * k,
+                           unit_y + QFontMetricsF(unit_f).ascent()), "bpm")
         p.end()
 
         if (out_w, out_h) != (qimg.width(), qimg.height()):

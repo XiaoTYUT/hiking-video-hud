@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem, QGraphicsEllipseItem,
     QGraphicsTextItem, QGraphicsPolygonItem,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
+    QDoubleSpinBox,
     QFileDialog, QMessageBox, QGroupBox, QFormLayout, QTextEdit,
     QProgressBar, QDockWidget, QStatusBar, QFrame, QSizePolicy,
     QCheckBox, QGridLayout, QColorDialog, QDialog, QDialogButtonBox,
@@ -62,6 +63,10 @@ _PROJECT_FIELDS = (
     "progress_ring_pos", "ring_progress_color",
     "show_heart_card", "hr_card_style", "hr_card_w", "hr_card_h", "hr_card_pos",
     "hr_age", "hr_rest", "hr_vo2max", "hr_tau_up", "hr_tau_down", "hr_alt_k",
+    "hr_card_bg_color", "hr_card_bg_alpha",
+    "hr_card_border_color", "hr_card_border_alpha", "hr_card_radius",
+    "hr_pulse_scale", "hr_pulse_width", "hr_pulse_alpha", "hr_heart_scale",
+    "hr_label_size", "hr_value_size", "hr_unit_size", "hr_label_color",
 )
 
 
@@ -1007,6 +1012,10 @@ class HeartCardItem(QGraphicsRectItem):
         if views:
             dpr = float(views[0].devicePixelRatioF())
         return max(3, min(4, int(round(dpr)) + 2))
+
+    def invalidate_base_cache(self):
+        """外观配置变化后丢弃本 item 的静态底图缓存。"""
+        self._cache = None
 
     def refresh_preview(self):
         """用视频同一套 _draw_heart_card 渲染当前预览索引的一帧。"""
@@ -3186,6 +3195,122 @@ class MainWindow(QMainWindow):
         hf.addRow("海拔系数", self.spin_hr_alt)
         self._page_panel_extra.addWidget(hg)
 
+        # 心率卡外观（卡底 / 脉冲圈 / 文字，全部实时作用于画布预览与成片）
+        hg2 = QGroupBox("心率卡外观")
+        hf2 = QFormLayout(hg2)
+        self._hr_bg_color = QColor(14, 18, 26)
+        self._hr_border_color = QColor(255, 255, 255)
+        self._hr_label_color = QColor(147, 160, 180)
+        self.btn_hr_bg_color = QPushButton()
+        self.btn_hr_bg_color.setToolTip("卡片背景颜色（ECG 样式共用）")
+        self.btn_hr_bg_color.clicked.connect(
+            lambda: self._on_pick_hr_color("bg"))
+        hf2.addRow("背景颜色", self.btn_hr_bg_color)
+        self.spin_hr_bg_alpha = QSpinBox()
+        self.spin_hr_bg_alpha.setRange(0, 100)
+        self.spin_hr_bg_alpha.setValue(_num(self.settings, "hr_card_bg_alpha", 87))
+        self.spin_hr_bg_alpha.setSuffix(" %")
+        self.spin_hr_bg_alpha.setToolTip("背景不透明度（0 = 全透明，只留脉冲与文字）")
+        self.spin_hr_bg_alpha.valueChanged.connect(self._on_heart_appearance_changed)
+        hf2.addRow("背景透明度", self.spin_hr_bg_alpha)
+        self.btn_hr_border_color = QPushButton()
+        self.btn_hr_border_color.setToolTip("卡片边框颜色（ECG 样式共用）")
+        self.btn_hr_border_color.clicked.connect(
+            lambda: self._on_pick_hr_color("border"))
+        hf2.addRow("边框颜色", self.btn_hr_border_color)
+        self.spin_hr_border_alpha = QSpinBox()
+        self.spin_hr_border_alpha.setRange(0, 100)
+        self.spin_hr_border_alpha.setValue(
+            _num(self.settings, "hr_card_border_alpha", 16))
+        self.spin_hr_border_alpha.setSuffix(" %")
+        self.spin_hr_border_alpha.setToolTip("边框不透明度（0 = 无边框）")
+        self.spin_hr_border_alpha.valueChanged.connect(
+            self._on_heart_appearance_changed)
+        hf2.addRow("边框透明度", self.spin_hr_border_alpha)
+        self.spin_hr_radius = QSpinBox()
+        self.spin_hr_radius.setRange(0, 60)
+        self.spin_hr_radius.setValue(_num(self.settings, "hr_card_radius", 13))
+        self.spin_hr_radius.setSuffix(" px")
+        self.spin_hr_radius.setToolTip("卡片圆角半径（0 = 直角）")
+        self.spin_hr_radius.valueChanged.connect(self._on_heart_appearance_changed)
+        hf2.addRow("圆角半径", self.spin_hr_radius)
+        self.spin_hr_pulse_scale = QSpinBox()
+        self.spin_hr_pulse_scale.setRange(50, 140)
+        self.spin_hr_pulse_scale.setSingleStep(5)
+        self.spin_hr_pulse_scale.setValue(
+            _num(self.settings, "hr_pulse_scale", 100))
+        self.spin_hr_pulse_scale.setSuffix(" %")
+        self.spin_hr_pulse_scale.setToolTip("脉冲波动图案整体大小（相对设计稿基准）")
+        self.spin_hr_pulse_scale.valueChanged.connect(
+            self._on_heart_appearance_changed)
+        hf2.addRow("脉冲圈大小", self.spin_hr_pulse_scale)
+        self.spin_hr_pulse_width = QDoubleSpinBox()
+        self.spin_hr_pulse_width.setRange(0.5, 8.0)
+        self.spin_hr_pulse_width.setSingleStep(0.2)
+        self.spin_hr_pulse_width.setDecimals(1)
+        self.spin_hr_pulse_width.setValue(
+            _num(self.settings, "hr_pulse_width", 1.8))
+        self.spin_hr_pulse_width.setSuffix(" px")
+        self.spin_hr_pulse_width.setToolTip("脉冲圈线宽")
+        self.spin_hr_pulse_width.valueChanged.connect(
+            self._on_heart_appearance_changed)
+        hf2.addRow("脉冲圈线宽", self.spin_hr_pulse_width)
+        self.spin_hr_pulse_alpha = QSpinBox()
+        self.spin_hr_pulse_alpha.setRange(0, 100)
+        self.spin_hr_pulse_alpha.setValue(
+            _num(self.settings, "hr_pulse_alpha", 63))
+        self.spin_hr_pulse_alpha.setSuffix(" %")
+        self.spin_hr_pulse_alpha.setToolTip("脉冲圈峰值不透明度（越大越显眼）")
+        self.spin_hr_pulse_alpha.valueChanged.connect(
+            self._on_heart_appearance_changed)
+        hf2.addRow("脉冲圈透明度", self.spin_hr_pulse_alpha)
+        self.spin_hr_heart_scale = QSpinBox()
+        self.spin_hr_heart_scale.setRange(50, 200)
+        self.spin_hr_heart_scale.setSingleStep(5)
+        self.spin_hr_heart_scale.setValue(
+            _num(self.settings, "hr_heart_scale", 100))
+        self.spin_hr_heart_scale.setSuffix(" %")
+        self.spin_hr_heart_scale.setToolTip("中心心形大小（相对设计稿基准）")
+        self.spin_hr_heart_scale.valueChanged.connect(
+            self._on_heart_appearance_changed)
+        hf2.addRow("心形大小", self.spin_hr_heart_scale)
+        self.spin_hr_label_size = QSpinBox()
+        self.spin_hr_label_size.setRange(6, 26)
+        self.spin_hr_label_size.setValue(
+            _num(self.settings, "hr_label_size", 10))
+        self.spin_hr_label_size.setSuffix(" px")
+        self.spin_hr_label_size.setToolTip("「实时心率」文字大小")
+        self.spin_hr_label_size.valueChanged.connect(
+            self._on_heart_appearance_changed)
+        hf2.addRow("标签文字大小", self.spin_hr_label_size)
+        self.spin_hr_value_size = QSpinBox()
+        self.spin_hr_value_size.setRange(12, 64)
+        self.spin_hr_value_size.setValue(
+            _num(self.settings, "hr_value_size", 28))
+        self.spin_hr_value_size.setSuffix(" px")
+        self.spin_hr_value_size.setToolTip("实时心率数字大小")
+        self.spin_hr_value_size.valueChanged.connect(
+            self._on_heart_appearance_changed)
+        hf2.addRow("数字大小", self.spin_hr_value_size)
+        self.spin_hr_unit_size = QDoubleSpinBox()
+        self.spin_hr_unit_size.setRange(5.0, 20.0)
+        self.spin_hr_unit_size.setSingleStep(0.5)
+        self.spin_hr_unit_size.setDecimals(1)
+        self.spin_hr_unit_size.setValue(
+            _num(self.settings, "hr_unit_size", 9.5))
+        self.spin_hr_unit_size.setSuffix(" px")
+        self.spin_hr_unit_size.setToolTip("「bpm」单位文字大小")
+        self.spin_hr_unit_size.valueChanged.connect(
+            self._on_heart_appearance_changed)
+        hf2.addRow("单位文字大小", self.spin_hr_unit_size)
+        self.btn_hr_label_color = QPushButton()
+        self.btn_hr_label_color.setToolTip("「实时心率」与「bpm」文字颜色")
+        self.btn_hr_label_color.clicked.connect(
+            lambda: self._on_pick_hr_color("label"))
+        hf2.addRow("标签颜色", self.btn_hr_label_color)
+        self._page_panel_extra.addWidget(hg2)
+        self._refresh_hr_color_btns()
+
         # 轨迹（设置窗口「轨迹与标注」页）
         tg = QGroupBox("轨迹")
         tf = QFormLayout(tg)
@@ -3895,6 +4020,72 @@ class MainWindow(QMainWindow):
         self.scene.update()
         self._mark_dirty()
 
+    # ── 心率卡外观 ──
+
+    def _refresh_hr_color_btns(self):
+        """刷新「背景 / 边框 / 标签」三枚颜色按钮的显示色。"""
+        for attr, color in (("btn_hr_bg_color", self._hr_bg_color),
+                            ("btn_hr_border_color", self._hr_border_color),
+                            ("btn_hr_label_color", self._hr_label_color)):
+            btn = getattr(self, attr, None)
+            if btn is None:
+                continue
+            txt = "#000" if (color.red() + color.green()
+                             + color.blue()) > 420 else "#fff"
+            btn.setStyleSheet(
+                f"background-color: {color.name()}; color: {txt};"
+                "border: 1px solid #666; padding: 3px 8px;")
+
+    def _on_pick_hr_color(self, kind: str):
+        """选心率卡颜色：kind = bg / border / label。"""
+        cur = {"bg": self._hr_bg_color, "border": self._hr_border_color,
+               "label": self._hr_label_color}[kind]
+        title = {"bg": "选择心率卡背景颜色", "border": "选择心率卡边框颜色",
+                 "label": "选择心率卡标签颜色"}[kind]
+        c = QColorDialog.getColor(cur, self, title)
+        if not c.isValid():
+            return
+        setattr(self, f"_hr_{kind}_color", c)
+        self._refresh_hr_color_btns()
+        self._on_heart_appearance_changed()
+
+    def _sync_hr_appearance_to_renderer(self):
+        """把心率卡外观控件的当前值写回 renderer（不触发预览刷新）。"""
+        r = self.renderer
+        if r is None:
+            return
+        r.hr_card_bg_color = (self._hr_bg_color.red(),
+                              self._hr_bg_color.green(),
+                              self._hr_bg_color.blue())
+        r.hr_card_bg_alpha = float(self.spin_hr_bg_alpha.value())
+        r.hr_card_border_color = (self._hr_border_color.red(),
+                                  self._hr_border_color.green(),
+                                  self._hr_border_color.blue())
+        r.hr_card_border_alpha = float(self.spin_hr_border_alpha.value())
+        r.hr_card_radius = float(self.spin_hr_radius.value())
+        r.hr_pulse_scale = float(self.spin_hr_pulse_scale.value())
+        r.hr_pulse_width = float(self.spin_hr_pulse_width.value())
+        r.hr_pulse_alpha = float(self.spin_hr_pulse_alpha.value())
+        r.hr_heart_scale = float(self.spin_hr_heart_scale.value())
+        r.hr_label_size = float(self.spin_hr_label_size.value())
+        r.hr_value_size = float(self.spin_hr_value_size.value())
+        r.hr_unit_size = float(self.spin_hr_unit_size.value())
+        r.hr_label_color = (self._hr_label_color.red(),
+                            self._hr_label_color.green(),
+                            self._hr_label_color.blue())
+        r._hr_cache = None
+
+    def _on_heart_appearance_changed(self, *_):
+        """外观改动 → 写回 renderer、丢弃底图缓存并刷新预览（不重算心率）。"""
+        if self.renderer is None:
+            return
+        self._sync_hr_appearance_to_renderer()
+        if self.heart_item is not None:
+            self.heart_item.invalidate_base_cache()
+            self.heart_item.refresh_preview()
+        self.scene.update()
+        self._mark_dirty()
+
     def _on_hr_preview_toggled(self, on: bool):
         """心率卡预览播放开关：与坡度仪共用同一个循环计时器。"""
         if not hasattr(self, "_preview_timer"):
@@ -4497,6 +4688,32 @@ class MainWindow(QMainWindow):
         self.spin_hr_alt.setValue(
             int(round(_num(s, "hr_alt_k", 0.0) * 100)))
         self.spin_hr_alt.blockSignals(False)
+        # 心率卡外观（颜色 / 透明度 / 脉冲圈 / 字号）
+        for _key, _attr, _default in (
+                ("hr_card_bg_color", "_hr_bg_color", (14, 18, 26)),
+                ("hr_card_border_color", "_hr_border_color", (255, 255, 255)),
+                ("hr_label_color", "_hr_label_color", (147, 160, 180))):
+            _cv = s.get(_key) or _default
+            try:
+                _qcolor = QColor(int(_cv[0]), int(_cv[1]), int(_cv[2]))
+            except (TypeError, ValueError, IndexError):
+                _qcolor = QColor(*_default)
+            setattr(self, _attr, _qcolor)
+        self._refresh_hr_color_btns()
+        for _sp, _key, _default in (
+                (self.spin_hr_bg_alpha, "hr_card_bg_alpha", 87),
+                (self.spin_hr_border_alpha, "hr_card_border_alpha", 16),
+                (self.spin_hr_radius, "hr_card_radius", 13),
+                (self.spin_hr_pulse_scale, "hr_pulse_scale", 100),
+                (self.spin_hr_pulse_alpha, "hr_pulse_alpha", 63),
+                (self.spin_hr_heart_scale, "hr_heart_scale", 100),
+                (self.spin_hr_label_size, "hr_label_size", 10),
+                (self.spin_hr_value_size, "hr_value_size", 28),
+                (self.spin_hr_pulse_width, "hr_pulse_width", 1.8),
+                (self.spin_hr_unit_size, "hr_unit_size", 9.5)):
+            _sp.blockSignals(True)
+            _sp.setValue(_num(s, _key, _default))
+            _sp.blockSignals(False)
         if self.renderer is not None:
             self.renderer.show_heart_card = self.chk_heart_card.isChecked()
             self.renderer.hr_card_style = self.combo_hr_style.currentData() or "pulse"
@@ -4509,6 +4726,7 @@ class MainWindow(QMainWindow):
             self.renderer.hr_tau_down = float(self.spin_hr_tau_down.value())
             self.renderer.hr_alt_k = self.spin_hr_alt.value() / 100.0
             self.renderer.hr_recompute()
+            self._sync_hr_appearance_to_renderer()
         # 关键节点（无文本框，仅写回 renderer）
         nodes = s.get("key_nodes")
         if nodes is not None and self.renderer is not None:
@@ -4835,6 +5053,7 @@ class MainWindow(QMainWindow):
         self.renderer.hr_tau_down = float(self.spin_hr_tau_down.value())
         self.renderer.hr_alt_k = self.spin_hr_alt.value() / 100.0
         self.renderer.hr_recompute()
+        self._sync_hr_appearance_to_renderer()
         self.renderer.preview_idx = -1.0
         # 分段生成模式（从 GUI 单选按钮同步）
         self.renderer.use_segments = self.rb_segments.isChecked()
@@ -5232,6 +5451,32 @@ class MainWindow(QMainWindow):
             "hr_tau_down": (self.renderer.hr_tau_down
                             if self.renderer else 100.0),
             "hr_alt_k": (self.renderer.hr_alt_k if self.renderer else 0.0),
+            "hr_card_bg_color": (list(self.renderer.hr_card_bg_color)
+                                 if self.renderer else [14, 18, 26]),
+            "hr_card_bg_alpha": (self.renderer.hr_card_bg_alpha
+                                 if self.renderer else 87.0),
+            "hr_card_border_color": (list(self.renderer.hr_card_border_color)
+                                     if self.renderer else [255, 255, 255]),
+            "hr_card_border_alpha": (self.renderer.hr_card_border_alpha
+                                     if self.renderer else 16.0),
+            "hr_card_radius": (self.renderer.hr_card_radius
+                               if self.renderer else 13.0),
+            "hr_pulse_scale": (self.renderer.hr_pulse_scale
+                               if self.renderer else 100.0),
+            "hr_pulse_width": (self.renderer.hr_pulse_width
+                               if self.renderer else 1.8),
+            "hr_pulse_alpha": (self.renderer.hr_pulse_alpha
+                               if self.renderer else 63.0),
+            "hr_heart_scale": (self.renderer.hr_heart_scale
+                               if self.renderer else 100.0),
+            "hr_label_size": (self.renderer.hr_label_size
+                              if self.renderer else 10.0),
+            "hr_value_size": (self.renderer.hr_value_size
+                              if self.renderer else 28.0),
+            "hr_unit_size": (self.renderer.hr_unit_size
+                             if self.renderer else 9.5),
+            "hr_label_color": (list(self.renderer.hr_label_color)
+                               if self.renderer else [147, 160, 180]),
             "use_segments": (self.renderer.use_segments if self.renderer else False),
         }
         if self.trajectory_item is not None:

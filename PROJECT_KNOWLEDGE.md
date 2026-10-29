@@ -249,15 +249,16 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
   - 9 点滑动均值后裁剪到 96% HRmax；可选海拔项 `HR_ss×(1+alt_k×max(0,海拔-1500)/1000)`，默认 0 关闭。
 - 波形 / 脉冲相位来自预计算累计拍数 `cum_beats += HR·Δt/60`（`ecg_wave(u)` = P波+QRS主峰+T波；心跳声呐用 `u = cum_beats mod 1` 驱动双圈脉冲与心形缩放），**逐帧独立、无跨帧状态** → 多进程渲染每帧确定性一致（已用 pickle 副本逐像素验证）。
 - 区间：阈值 60/70/80/90% HRmax；Z1 #4C8DFF 热身 / Z2 #35C46B 有氧 / Z3 #FFC93C 耐力 / Z4 #FF8A2B 阈值 / Z5 #FF4757 无氧。
-- 渲染：`_draw_heart_card` 分发 `_draw_heart_pulse` / `_draw_heart_ecg`；静态底图按 `(w,h,ss,style)` 缓存（`_hr_cache`，`__getstate__` 置 None），逐帧复制后叠加动态层再 alpha 合成；定位 `hr_card_pos` 内部 ×ss。
+- 渲染：`_draw_heart_card` 分发 `_draw_heart_pulse` / `_draw_heart_ecg`；静态底图按 `(w,h,ss,style,卡底外观配置)` 缓存（`_hr_cache`，`__getstate__` 置 None），逐帧复制后叠加动态层再 alpha 合成；定位 `hr_card_pos` 内部 ×ss。
+- **外观配置（2026-10-29，设置页「心率卡外观」组）**：`hr_card_bg_color` / `hr_card_bg_alpha`（背景色与不透明度 %）、`hr_card_border_color` / `hr_card_border_alpha`、`hr_card_radius`（圆角 px，0=直角）、`hr_pulse_scale`（脉冲圈整体大小 %）、`hr_pulse_width`（线宽 px）、`hr_pulse_alpha`（峰值不透明度 %）、`hr_heart_scale`（心形大小 %）、`hr_label_size` / `hr_value_size` / `hr_unit_size`（「实时心率」/数字/「bpm」字号 px，基准 300×170）、`hr_label_color`。卡底/边框/圆角对 `ecg` 样式同样生效；脉冲圈与字号仅作用于 `pulse`。字号变化时数值基线按 `label_size×1.2` / `value_size×0.72` 自动下移，文字改为 `drawText(QPointF)` 避免矩形裁切；数值/单位水平位置右锚到卡内边距（`w - 148k`）。改外观只刷新底图与预览，不重算心率。
 - **心跳声呐渲染技术**（按优先级）：
   1. **Qt 矢量路径（主）**：存在 `QApplication` 时（GUI 与视频渲染线程均满足），`_draw_heart_pulse_qt()` 用 `QPainter` 在 `QImage` 上绘制卡底/双圈/心形/文字，开启 `Antialiasing + TextAntialiasing`，再按 2×~4× 超采样后 `SmoothTransformation` 缩到输出尺寸。等价 HTML/SVG 的矢量抗锯齿，1× 实测约 3.5ms/帧（预览 3× 约 16.5ms）。中文用 `Microsoft YaHei`，数字用 Arial Bold。
   2. **PIL/SDF 回退**：无 Qt 环境（纯后端/单测/多进程子进程）走原 PIL 路径——心形/文字 3× 超采样 + LANCZOS，两圈脉冲用 `_aa_ring()` 距离场按最终分辨率解析覆盖率，细环低透明度也不会断线。
   - 注意：QtSvg 不支持中文文本（实测渲染为色块），不可用于此卡；HTML 路径需 QtWebEngine，未安装且体积大，故不采用。
   - GUI 预览 `_preview_ss()` 最低 3×（最高 4×），画布放大查看也不会出现位图锯齿块。
 - GUI：`HeartCardItem(QGraphicsRectItem)` 调 `_draw_heart_card` 生成位图（WYSIWYG），滚轮等比缩放 → 回写 `spin_hr_w/h`；与坡度仪共用 60ms 预览计时器；设置页样式下拉框切换 pulse/ecg。
-- 持久化：`show_heart_card`、`hr_card_style`、`hr_card_w/h`、`hr_card_pos`、`hr_age`、`hr_rest`、`hr_vo2max`、`hr_tau_up`、`hr_tau_down`、`hr_alt_k`；`__setstate__` 对旧快照兜底并 `hr_recompute()`。
-- 默认：显示开启、样式 pulse、年龄 35、静息 62、VO₂max 42、τ 40/100、海拔系数 0。
+- 持久化：`show_heart_card`、`hr_card_style`、`hr_card_w/h`、`hr_card_pos`、`hr_age`、`hr_rest`、`hr_vo2max`、`hr_tau_up`、`hr_tau_down`、`hr_alt_k`，以及全部外观键（`hr_card_bg_color/alpha`、`hr_card_border_color/alpha`、`hr_card_radius`、`hr_pulse_scale/width/alpha`、`hr_heart_scale`、`hr_label_size`、`hr_value_size`、`hr_unit_size`、`hr_label_color`）；`__setstate__` 对旧快照兜底并 `hr_recompute()`。
+- 默认：显示开启、样式 pulse、年龄 35、静息 62、VO₂max 42、τ 40/100、海拔系数 0；背景 #0E121A / 87%、边框白 / 16%、圆角 13px、脉冲圈 100% / 1.8px / 63%、心形 100%、字号 10/28/9.5、标签色 #93A0B4。
 
 ## 16. 当前状态与待办（2026-10-19）
 
