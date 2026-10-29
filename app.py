@@ -4606,6 +4606,15 @@ class MainWindow(QMainWindow):
                 pass
         if self.ring_item is not None:
             self.ring_item.sync_layout()
+        # 模拟心电卡位置/尺寸恢复
+        hp = s.get("hr_card_pos")
+        if hp:
+            try:
+                self.renderer.hr_card_pos = (float(hp[0]), float(hp[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        if self.heart_item is not None:
+            self.heart_item.sync_layout()
         nodes = s.get("key_nodes") or []
         if nodes:
             try:
@@ -4795,6 +4804,17 @@ class MainWindow(QMainWindow):
         _rc = self._ring_color
         self.renderer.ring_progress_color = (_rc.red(), _rc.green(),
                                              _rc.blue())
+        # 模拟心电卡设置（从 GUI 控件同步，心率依赖速度/坡度需重算）
+        self.renderer.show_heart_card = self.chk_heart_card.isChecked()
+        self.renderer.hr_card_w = float(self.spin_hr_w.value())
+        self.renderer.hr_card_h = float(self.spin_hr_h.value())
+        self.renderer.hr_age = float(self.spin_hr_age.value())
+        self.renderer.hr_rest = float(self.spin_hr_rest.value())
+        self.renderer.hr_vo2max = float(self.spin_hr_vo2max.value())
+        self.renderer.hr_tau_up = float(self.spin_hr_tau_up.value())
+        self.renderer.hr_tau_down = float(self.spin_hr_tau_down.value())
+        self.renderer.hr_alt_k = self.spin_hr_alt.value() / 100.0
+        self.renderer.hr_recompute()
         self.renderer.preview_idx = -1.0
         # 分段生成模式（从 GUI 单选按钮同步）
         self.renderer.use_segments = self.rb_segments.isChecked()
@@ -4846,6 +4866,13 @@ class MainWindow(QMainWindow):
             self.ring_item = ProgressRingItem(self.renderer)
             self.scene.addItem(self.ring_item)
             self.ring_item.refresh_preview()
+
+        # 模拟心电卡（仅当用户勾选时显示）
+        self.heart_item = None
+        if self.renderer.show_heart_card:
+            self.heart_item = HeartCardItem(self.renderer)
+            self.scene.addItem(self.heart_item)
+            self.heart_item.refresh_preview()
 
         # 新建 item 的缩放值与设置项对齐（工程恢复时随后由 _apply_state_dict 覆盖）
         self._on_preview_scaled("trajectory", self.trajectory_item.scale())
@@ -5168,6 +5195,21 @@ class MainWindow(QMainWindow):
             "ring_progress_color": (list(self.renderer.ring_progress_color)
                                     if self.renderer
                                     else list(RING_PROGRESS_DEFAULT)),
+            "show_heart_card": (self.renderer.show_heart_card
+                                if self.renderer else True),
+            "hr_card_w": (self.renderer.hr_card_w
+                          if self.renderer else 300.0),
+            "hr_card_h": (self.renderer.hr_card_h
+                          if self.renderer else 170.0),
+            "hr_card_pos": (list(self.renderer.hr_card_pos)
+                            if self.renderer else [1566.0, 350.0]),
+            "hr_age": (self.renderer.hr_age if self.renderer else 35.0),
+            "hr_rest": (self.renderer.hr_rest if self.renderer else 62.0),
+            "hr_vo2max": (self.renderer.hr_vo2max if self.renderer else 42.0),
+            "hr_tau_up": (self.renderer.hr_tau_up if self.renderer else 40.0),
+            "hr_tau_down": (self.renderer.hr_tau_down
+                            if self.renderer else 100.0),
+            "hr_alt_k": (self.renderer.hr_alt_k if self.renderer else 0.0),
             "use_segments": (self.renderer.use_segments if self.renderer else False),
         }
         if self.trajectory_item is not None:
