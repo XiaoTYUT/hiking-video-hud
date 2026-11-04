@@ -253,6 +253,7 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 - **外观配置（2026-10-29，设置页「心率卡外观」组）**：`hr_card_bg_color` / `hr_card_bg_alpha`（背景色与不透明度 %）、`hr_card_border_color` / `hr_card_border_alpha`、`hr_card_radius`（圆角 px，0=直角）、`hr_pulse_scale`（脉冲圈整体大小 %）、`hr_pulse_width`（线宽 px）、`hr_pulse_alpha`（峰值不透明度 %）、`hr_heart_scale`（心形大小 %）、`hr_label_size` / `hr_value_size` / `hr_unit_size`（「实时心率」/数字/「bpm」字号 px，基准 300×170）、`hr_label_color`。卡底/边框/圆角对 `ecg` 样式同样生效；脉冲圈与字号仅作用于 `pulse`。字号变化时数值基线按 `label_size×1.2` / `value_size×0.72` 自动下移，文字改为 `drawText(QPointF)` 避免矩形裁切；数值/单位水平位置右锚到卡内边距（`w - 148k`）。改外观只刷新底图与预览，不重算心率。
 - **心跳声呐渲染技术**（按优先级）：
   1. **Qt 矢量路径（主）**：存在 `QApplication` 时（GUI 与视频渲染线程均满足），`_draw_heart_pulse_qt()` 用 `QPainter` 在 `QImage` 上绘制卡底/双圈/心形/文字，开启 `Antialiasing + TextAntialiasing`，再按 2×~4× 超采样后 `SmoothTransformation` 缩到输出尺寸。等价 HTML/SVG 的矢量抗锯齿，1× 实测约 3.5ms/帧（预览 3× 约 16.5ms）。中文用 `Microsoft YaHei`，数字用 Arial Bold。
+     - ⚠️ 坑：`QImage.scaled()` 返回的新图是 `Format_ARGB32_Premultiplied`（小端字节序 BGRA），而 `constBits()` 之后按 `"RGBA"` 读字节 → **红蓝通道互换**（蓝 #4C8DFF 变橙、橙变蓝，且只有走 Qt 路径才复现，PIL 回退正常）。缩图后必须 `convertToFormat(QImage.Format_RGBA8888)`；已修复（提交见「心率色修复」）。
   2. **PIL/SDF 回退**：无 Qt 环境（纯后端/单测/多进程子进程）走原 PIL 路径——心形/文字 3× 超采样 + LANCZOS，两圈脉冲用 `_aa_ring()` 距离场按最终分辨率解析覆盖率，细环低透明度也不会断线。
   - 注意：QtSvg 不支持中文文本（实测渲染为色块），不可用于此卡；HTML 路径需 QtWebEngine，未安装且体积大，故不采用。
   - GUI 预览 `_preview_ss()` 最低 3×（最高 4×），画布放大查看也不会出现位图锯齿块。

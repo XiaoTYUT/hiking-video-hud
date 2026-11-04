@@ -2245,6 +2245,9 @@ class Renderer:
         if (out_w, out_h) != (qimg.width(), qimg.height()):
             qimg = qimg.scaled(out_w, out_h, Qt.IgnoreAspectRatio,
                                Qt.SmoothTransformation)
+        # scaled() 返回的新图是 Format_ARGB32_Premultiplied（小端字节序 BGRA），
+        # 而下面按 RGBA 读字节；不显式转换会导致红蓝通道交换（蓝 ↔ 橙）。
+        qimg = qimg.convertToFormat(QImage.Format_RGBA8888)
         buf = qimg.constBits()
         buf.setsize(qimg.byteCount())
         card = Image.frombuffer("RGBA", (out_w, out_h),
