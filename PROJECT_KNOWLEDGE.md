@@ -248,7 +248,7 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
   - `HR_ss = rest + %VO₂R×(HRmax-rest)`；一阶惯性 `HR += (HR_ss-HR)(1-e^(-Δt/τ))`，上升 τ=40s / 下降 τ=100s，Δt 用 `<when>` 真实间隔。
   - 9 点滑动均值后裁剪到 96% HRmax；可选海拔项 `HR_ss×(1+alt_k×max(0,海拔-1500)/1000)`，默认 0 关闭。
 - 波形 / 脉冲相位来自预计算累计拍数 `cum_beats += HR·Δt/60`（`ecg_wave(u)` = P波+QRS主峰+T波；心跳声呐用 `u = cum_beats mod 1` 驱动双圈脉冲与心形缩放），**逐帧独立、无跨帧状态** → 多进程渲染每帧确定性一致（已用 pickle 副本逐像素验证）。
-- 区间：阈值 60/70/80/90% HRmax；Z1 #4C8DFF 热身 / Z2 #35C46B 有氧 / Z3 #FFC93C 耐力 / Z4 #FF8A2B 阈值 / Z5 #FF4757 无氧。
+- 区间：阈值 60/70/80/90% HRmax；Z1 #4C8DFF 热身 / Z2 #35C46B 有氧 / Z3 #FFC93C 耐力 / Z4 #FF8A2B 阈值 / Z5 #FF4757 无氧。**绘制用连续渐变色（2026-11-04）**：`hr_color_smooth(hr, hr_max)` 以 5 个区间色为锚点（0.60/0.70/0.80/0.90/1.00）逐段线性插值，<60% 纯蓝、≥100% 纯红，无离散跳变；`hr_zone_index` 仅保留给 ECG 样式的区间名标签。
 - 渲染：`_draw_heart_card` 分发 `_draw_heart_pulse` / `_draw_heart_ecg`；静态底图按 `(w,h,ss,style,卡底外观配置)` 缓存（`_hr_cache`，`__getstate__` 置 None），逐帧复制后叠加动态层再 alpha 合成；定位 `hr_card_pos` 内部 ×ss。
 - **外观配置（2026-10-29，设置页「心率卡外观」组）**：`hr_card_bg_color` / `hr_card_bg_alpha`（背景色与不透明度 %）、`hr_card_border_color` / `hr_card_border_alpha`、`hr_card_radius`（圆角 px，0=直角）、`hr_pulse_scale`（脉冲圈整体大小 %）、`hr_pulse_width`（线宽 px）、`hr_pulse_alpha`（峰值不透明度 %）、`hr_heart_scale`（心形大小 %）、`hr_label_size` / `hr_value_size` / `hr_unit_size`（「实时心率」/数字/「bpm」字号 px，基准 300×170）、`hr_label_color`。卡底/边框/圆角对 `ecg` 样式同样生效；脉冲圈与字号仅作用于 `pulse`。字号变化时数值基线按 `label_size×1.2` / `value_size×0.72` 自动下移，文字改为 `drawText(QPointF)` 避免矩形裁切；数值/单位水平位置右锚到卡内边距（`w - 148k`）。改外观只刷新底图与预览，不重算心率。
 - **心跳声呐渲染技术**（按优先级）：
