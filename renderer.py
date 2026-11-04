@@ -461,11 +461,12 @@ def hr_zone_index(hr: float, hr_max: float) -> int:
 
 
 def hr_color_smooth(hr: float, hr_max: float) -> Tuple[int, int, int]:
-    """连续渐变心率色：锚点为 5 个区间色，在 60/70/80/90/100% HRmax 之间
-    逐段线性插值，<60% 纯蓝、≥100% 纯红，无离散跳变。"""
-    anchors = ((0.60, HR_ZONE_COLORS[0]), (0.70, HR_ZONE_COLORS[1]),
-               (0.80, HR_ZONE_COLORS[2]), (0.90, HR_ZONE_COLORS[3]),
-               (1.00, HR_ZONE_COLORS[4]))
+    """连续渐变心率色：5 个区间色锚在各区间「中心」（55/65/75/85/95% HRmax），
+    相邻锚点间线性插值——每个区间中部的颜色与原离散区间色一致，
+    只在 60/70/80/90% 边界附近平滑过渡；<55% 纯蓝、≥95% 纯红。"""
+    anchors = ((0.55, HR_ZONE_COLORS[0]), (0.65, HR_ZONE_COLORS[1]),
+               (0.75, HR_ZONE_COLORS[2]), (0.85, HR_ZONE_COLORS[3]),
+               (0.95, HR_ZONE_COLORS[4]))
     r = float(hr) / float(hr_max) if hr_max > 0 else 0.0
     if r <= anchors[0][0]:
         return anchors[0][1]
