@@ -460,26 +460,6 @@ def hr_zone_index(hr: float, hr_max: float) -> int:
     return 4
 
 
-def hr_color_smooth(hr: float, hr_max: float) -> Tuple[int, int, int]:
-    """连续渐变心率色：5 个区间色锚在各区间「中心」（55/65/75/85/95% HRmax），
-    相邻锚点间线性插值——每个区间中部的颜色与原离散区间色一致，
-    只在 60/70/80/90% 边界附近平滑过渡；<55% 纯蓝、≥95% 纯红。"""
-    anchors = ((0.55, HR_ZONE_COLORS[0]), (0.65, HR_ZONE_COLORS[1]),
-               (0.75, HR_ZONE_COLORS[2]), (0.85, HR_ZONE_COLORS[3]),
-               (0.95, HR_ZONE_COLORS[4]))
-    r = float(hr) / float(hr_max) if hr_max > 0 else 0.0
-    if r <= anchors[0][0]:
-        return anchors[0][1]
-    if r >= anchors[-1][0]:
-        return anchors[-1][1]
-    for (r0, c0), (r1, c1) in zip(anchors, anchors[1:]):
-        if r0 <= r <= r1:
-            t = (r - r0) / (r1 - r0)
-            return tuple(int(round(c0[i] + (c1[i] - c0[i]) * t))
-                         for i in range(3))
-    return anchors[-1][1]
-
-
 def _ecg_g(u: float, c: float, w: float, a: float) -> float:
     t = (u - c) / w
     return a * math.exp(-t * t)
@@ -2022,7 +2002,7 @@ class Renderer:
             beats += (self.hr_beats[i + 1] - beats) * f
 
         zone = hr_zone_index(hr, self.hr_max)
-        zc = hr_color_smooth(hr, self.hr_max)
+        zc = HR_ZONE_COLORS[zone]
         k = L["k"]
         x0, x1, by = L["x0"], L["x1"], L["base_y"]
         layer = base.copy()
@@ -2092,7 +2072,7 @@ class Renderer:
             hr += (self.hr_bpm[i + 1] - hr) * f
             beats += (self.hr_beats[i + 1] - beats) * f
 
-        zc = hr_color_smooth(hr, self.hr_max)
+        zc = HR_ZONE_COLORS[hr_zone_index(hr, self.hr_max)]
 
         if self._qt_ready():
             self._draw_heart_pulse_qt(img, hr, zc, beats, ss)
