@@ -325,17 +325,26 @@ def plan_timeline(clips: Sequence[Clip],
 
 
 def dashboard_segments(timeline: Timeline, kml_start: datetime,
-                       kml_end: datetime) -> tuple[List[float], List[float]]:
+                       kml_end: datetime,
+                       cum_time: Optional[Sequence[float]] = None
+                       ) -> tuple[List[float], List[float]]:
     """把绝对时间轴换算成 Renderer 的分段参数 (cuts, durations)。
 
-    cuts = 每段结束时刻在 KML 时间跨度内的归一化位置；
-    durations = 每段在最终时间轴上的输出时长。
+    cuts 按 Renderer 的语义使用**点索引归一化**（不是时间归一化）；
+    传入 cum_time 时把绝对时刻换算成点索引，避免不等间隔采样造成边界偏移。
     """
+    import bisect
     span = max(1e-6, (kml_end - kml_start).total_seconds())
+    n_points = len(cum_time) if cum_time else 0
     cuts: List[float] = []
     durations: List[float] = []
     for s in timeline.segments[:-1]:
-        u = (s.real_end - kml_start).total_seconds() / span
+        offset = max(0.0, (s.real_end - kml_start).total_seconds())
+        u = offset / span
+        if cum_time and n_points > 1:
+            idx = bisect.bisect_right(cum_time, offset) - 1
+            idx = max(0, min(n_points - 1, idx))
+            u = idx / (n_points - 1)
         u = min(0.9999, max(0.0001, u))
         if cuts and u <= cuts[-1] + 1e-6:
             u = min(0.9999, cuts[-1] + 1e-6)
@@ -542,7 +551,8 @@ def render_track1_dashboard(renderer, timeline: Timeline,
                             progress_cb: Optional[Callable[[int, int], None]] = None,
                             cancel_cb: Optional[Callable[[], bool]] = None) -> Path:
     """渲染轨道一：用分段模式让仪表盘与轨道二逐段严格对齐。"""
-    cuts, durations = dashboard_segments(timeline, kml_start, kml_end)
+    cuts, durations = dashboard_segments(timeline, kml_start, kml_end,
+                                         cum_time=getattr(renderer, "cum_time", None))
     old_use, old_segments = renderer.use_segments, renderer.segments
     renderer.use_segments = bool(cuts)
     renderer.segments = (cuts, durations) if cuts else None
