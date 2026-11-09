@@ -12,7 +12,7 @@ import sys
 import traceback
 import math
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from PyQt5.QtCore import Qt, QPointF, QRectF, QThread, pyqtSignal, QStandardPaths, QTimer
 from PyQt5.QtGui import (QPen, QColor, QBrush, QPainterPath, QPainter, QFont,
@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QGridLayout, QColorDialog, QDialog, QDialogButtonBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QMenu, QToolButton,
     QRadioButton, QButtonGroup, QComboBox, QGraphicsPixmapItem,
-    QInputDialog, QScrollArea, QTabWidget,
+    QInputDialog, QScrollArea, QTabWidget, QLineEdit,
 )
 
 from renderer import (Renderer, format_duration, format_pace,
@@ -41,6 +41,102 @@ from renderer import (Renderer, format_duration, format_pace,
                       gauge_footprint,
                       ring_footprint, RING_PROGRESS_DEFAULT)
 from gauge_paint import paint_gauge
+import composer
+
+# ─────────────────────── 整体 UI 主题（深色 HUD 风）───────────────────────
+_APP_QSS = """
+* { font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; }
+QWidget { background: #14161b; color: #d7dde8; font-size: 12px; }
+QMainWindow, QDialog { background: #101217; }
+QLabel { background: transparent; }
+QToolBar {
+    background: #171a20; border: none; border-bottom: 1px solid #232833;
+    spacing: 6px; padding: 5px 8px;
+}
+QToolBar QToolButton {
+    background: #20242d; border: 1px solid #2a303c; border-radius: 6px;
+    padding: 5px 10px; color: #cfd6e3;
+}
+QToolBar QToolButton:hover { background: #2a3140; border-color: #3a4a63; }
+QDockWidget { color: #9aa6ba; font-weight: bold; }
+QDockWidget::title {
+    background: #171a20; padding: 7px 10px; border-bottom: 1px solid #232833;
+}
+QGroupBox {
+    background: #171a21; border: 1px solid #252b36; border-radius: 10px;
+    margin-top: 14px; padding: 10px 8px 8px 8px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin; subcontrol-position: top left;
+    left: 12px; padding: 0 5px; color: #8fa2c0; font-weight: bold;
+}
+QPushButton {
+    background: #232936; border: 1px solid #2f3747; border-radius: 6px;
+    padding: 5px 12px; color: #d7dde8;
+}
+QPushButton:hover { background: #2c3546; border-color: #3c4a63; }
+QPushButton:pressed { background: #1c2230; }
+QPushButton:disabled { background: #1a1e26; color: #5c6578; border-color: #232a35; }
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
+    background: #1b1f28; border: 1px solid #2b3240; border-radius: 6px;
+    padding: 3px 7px; selection-background-color: #2d7ef7;
+}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+    border-color: #2d7ef7;
+}
+QComboBox QAbstractItemView {
+    background: #1b1f28; border: 1px solid #2b3240;
+    selection-background-color: #2d7ef7; color: #d7dde8;
+}
+QCheckBox, QRadioButton { background: transparent; spacing: 6px; }
+QTableWidget {
+    background: #12151b; alternate-background-color: #161a21;
+    gridline-color: #232833; border: 1px solid #252b36; border-radius: 8px;
+}
+QHeaderView::section {
+    background: #1b1f28; color: #93a1b8; border: none;
+    border-right: 1px solid #232833; border-bottom: 1px solid #232833;
+    padding: 5px 8px;
+}
+QTableWidget::item:selected { background: #24354f; color: #ffffff; }
+QProgressBar {
+    background: #1b1f28; border: 1px solid #2b3240; border-radius: 6px;
+    text-align: center; color: #d7dde8; height: 18px;
+}
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #2d7ef7, stop:1 #35c46b); border-radius: 5px;
+}
+QTabWidget::pane { border: 1px solid #252b36; border-radius: 8px; top: -1px; }
+QTabBar::tab {
+    background: #1a1e26; color: #93a1b8; border: 1px solid #252b36;
+    border-bottom: none; padding: 6px 14px; border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+}
+QTabBar::tab:selected { background: #232936; color: #ffffff; }
+QScrollArea { border: none; background: transparent; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QScrollBar:vertical { background: #12151b; width: 10px; margin: 0; }
+QScrollBar::handle:vertical {
+    background: #2f3747; min-height: 24px; border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover { background: #3d485c; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: #12151b; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal {
+    background: #2f3747; min-width: 24px; border-radius: 5px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QStatusBar { background: #171a20; color: #8fa2c0; border-top: 1px solid #232833; }
+QMenu { background: #1b1f28; border: 1px solid #2b3240; padding: 4px; }
+QMenu::item { padding: 5px 18px; border-radius: 5px; }
+QMenu::item:selected { background: #2d7ef7; }
+QToolTip {
+    background: #1b1f28; color: #d7dde8; border: 1px solid #2b3240;
+    padding: 4px 6px;
+}
+"""
+
 
 # ─────────────────────── 工程文件 & 全局设置 持久化 ───────────────────────
 # 全局 settings.json 存放在系统用户配置目录（Windows: %APPDATA%\KmlPath），
@@ -1223,6 +1319,470 @@ class RenderWorker(QThread):
             self.cancelled.emit()
         except Exception as e:
             self.failed.emit(str(e))
+
+
+# ─────────────────────── 双轨批量合成 ───────────────────────
+
+def _fmt_hms(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def _kml_span(renderer) -> tuple[datetime | None, datetime | None]:
+    """KML 的绝对时间跨度（UTC）；无墙钟元数据时返回 (None, None)。"""
+    meta = getattr(renderer, "meta", {}) if renderer is not None else {}
+    begin_ms, end_ms = meta.get("begin_ms"), meta.get("end_ms")
+    if begin_ms and end_ms:
+        return (datetime.fromtimestamp(begin_ms / 1000, timezone.utc),
+                datetime.fromtimestamp(end_ms / 1000, timezone.utc))
+    return None, None
+
+
+class _ClipScanWorker(QThread):
+    """后台扫描素材目录（ffprobe + 音量抽样），避免阻塞界面。"""
+
+    progress = pyqtSignal(int, int, str)
+    finished_ok = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, folder: Path, silent_db: float):
+        super().__init__()
+        self.folder = Path(folder)
+        self.silent_db = silent_db
+
+    def run(self):
+        try:
+            clips = composer.scan_folder(
+                self.folder, silent_db=self.silent_db,
+                progress=lambda i, n, name: self.progress.emit(i, n, name))
+            self.finished_ok.emit(clips)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class ComposerWorker(QThread):
+    """生成轨道二 / 轨道一。"""
+
+    progress = pyqtSignal(int, str)
+    log = pyqtSignal(str)
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, renderer, timeline: composer.Timeline,
+                 kml_start, kml_end, out_dir: Path, opts: dict, tracks: set):
+        super().__init__()
+        self.renderer = renderer
+        self.timeline = timeline
+        self.kml_start = kml_start
+        self.kml_end = kml_end
+        self.out_dir = Path(out_dir)
+        self.opts = opts
+        self.tracks = tracks
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            made = []
+            if "track2" in self.tracks:
+                self.log.emit("▶ 轨道二：转码实拍素材 + 空白补片…")
+                p2 = composer.render_track2(
+                    self.timeline, self.out_dir,
+                    self.opts["width"], self.opts["height"],
+                    fps=self.opts["fps"], color=self.opts["color"],
+                    progress_cb=lambda p, label: self.progress.emit(
+                        int(p * 55), label),
+                    cancel_cb=lambda: self._cancel)
+                made.append(str(p2))
+                self.log.emit(f"✅ 轨道二完成：{p2}")
+            if "track1" in self.tracks:
+                if self.renderer is None:
+                    raise RuntimeError("尚未加载 KML 工程，无法生成仪表盘轨道")
+                if self.kml_start is None or self.kml_end is None:
+                    raise RuntimeError("当前 KML 缺少墙钟时间元数据，无法对齐时间轴")
+                self.progress.emit(56, "准备仪表盘时间轴…")
+                self.log.emit("▶ 轨道一：渲染仪表盘（与轨道二等长）…")
+                p1 = composer.render_track1_dashboard(
+                    self.renderer, self.timeline, self.kml_start, self.kml_end,
+                    self.out_dir / "track1_dashboard.mov",
+                    fps=self.opts["dash_fps"],
+                    render_scale=self.opts["render_scale"],
+                    progress_cb=lambda done, total: self.progress.emit(
+                        56 + int(done / max(1, total) * 44),
+                        f"仪表盘 {done}/{total} 帧"),
+                    cancel_cb=lambda: self._cancel)
+                made.append(str(p1))
+                self.log.emit(f"✅ 轨道一完成：{p1}")
+            self.progress.emit(100, "完成")
+            self.finished_ok.emit("\n".join(made))
+        except composer.ComposerCancelled:
+            self.cancelled.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class ComposerDialog(QDialog):
+    """双轨批量合成面板：扫描素材 → 时间轴 → 两条等长轨道。"""
+
+    COLS = ("使用", "文件", "开始时间", "时长", "音量 (dB)", "判定",
+            "倍速", "输出时长")
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self.setWindowTitle("双轨批量合成")
+        self.setModal(False)
+        self.resize(1080, 760)
+        self._clips: list[composer.Clip] = []
+        self._timeline: composer.Timeline | None = None
+        self._scan_worker = None
+        self._worker = None
+        self._build_ui()
+
+    # ── 界面 ──
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        # ① 素材
+        g1 = QGroupBox("① 素材目录与时间轴")
+        v1 = QVBoxLayout(g1)
+        h1 = QHBoxLayout()
+        self.edit_dir = QLineEdit()
+        self.edit_dir.setPlaceholderText("选择包含视频素材（及同名 KML）的目录")
+        self.edit_dir.setReadOnly(True)
+        btn_browse = QPushButton("📂 浏览…")
+        btn_browse.clicked.connect(self._browse_dir)
+        self.btn_scan = QPushButton("🔍 扫描素材")
+        self.btn_scan.clicked.connect(self._scan)
+        h1.addWidget(self.edit_dir, 1)
+        h1.addWidget(btn_browse)
+        h1.addWidget(self.btn_scan)
+        v1.addLayout(h1)
+
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        for c in (0, 2, 3, 4, 5, 6, 7):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table.itemChanged.connect(self._on_item_changed)
+        v1.addWidget(self.table, 1)
+        self.lbl_summary = QLabel("尚未扫描素材")
+        self.lbl_summary.setWordWrap(True)
+        v1.addWidget(self.lbl_summary)
+        root.addWidget(g1, 3)
+
+        # ② 输出设置
+        g2 = QGroupBox("② 输出设置")
+        f2 = QFormLayout(g2)
+        self.spin_max_min = QDoubleSpinBox()
+        self.spin_max_min.setRange(1, 180)
+        self.spin_max_min.setDecimals(1)
+        self.spin_max_min.setValue(30.0)
+        self.spin_max_min.setSuffix(" 分钟")
+        self.spin_max_min.valueChanged.connect(self._refresh_plan)
+        self.spin_gap_speed = QDoubleSpinBox()
+        self.spin_gap_speed.setRange(1, 100)
+        self.spin_gap_speed.setDecimals(1)
+        self.spin_gap_speed.setValue(composer.GAP_SPEED)
+        self.spin_gap_speed.setSuffix(" ×")
+        self.spin_gap_speed.setToolTip("空档（未录制时段）压缩倍数；总长超上限时会再等比压缩")
+        self.spin_gap_speed.valueChanged.connect(self._refresh_plan)
+
+        self.combo_res = QComboBox()
+        for text, w, h in (("1080p（1920×1080）", 1920, 1080),
+                           ("2K（2560×1440）", 2560, 1440),
+                           ("4K（3840×2160）", 3840, 2160)):
+            self.combo_res.addItem(text, (w, h))
+        self.combo_fps = QComboBox()
+        for v in (24, 25, 30, 60):
+            self.combo_fps.addItem(f"{v} fps", v)
+        self.combo_fps.setCurrentIndex(2)
+        self.combo_blank = QComboBox()
+        for text, c in (("黑色", "black"), ("白色", "white"),
+                        ("深灰", "0x1A1A1A")):
+            self.combo_blank.addItem(text, c)
+
+        self.spin_dash_fps = QSpinBox()
+        self.spin_dash_fps.setRange(1, 60)
+        self.spin_dash_fps.setValue(getattr(self.main, "spin_fps", None).value()
+                                    if hasattr(self.main, "spin_fps") else 10)
+        self.combo_dash_scale = QComboBox()
+        for v in (1, 2, 3, 4):
+            self.combo_dash_scale.addItem(f"{v}×", v)
+        if hasattr(self.main, "combo_render_scale"):
+            self.combo_dash_scale.setCurrentIndex(
+                max(0, self.combo_dash_scale.findData(
+                    self.main.combo_render_scale.currentData())))
+
+        row = QHBoxLayout()
+        row.addWidget(self.spin_max_min)
+        row.addWidget(QLabel("空档压缩"))
+        row.addWidget(self.spin_gap_speed)
+        row.addWidget(QLabel("分辨率"))
+        row.addWidget(self.combo_res)
+        row.addWidget(QLabel("帧率"))
+        row.addWidget(self.combo_fps)
+        row.addWidget(QLabel("空白"))
+        row.addWidget(self.combo_blank)
+        row.addStretch(1)
+        wrow = QWidget()
+        wrow.setLayout(row)
+        f2.addRow("总长 / 轨道二", wrow)
+
+        drow = QHBoxLayout()
+        drow.addWidget(QLabel("仪表盘帧率"))
+        drow.addWidget(self.spin_dash_fps)
+        drow.addWidget(QLabel("输出倍率"))
+        drow.addWidget(self.combo_dash_scale)
+        drow.addStretch(1)
+        dw = QWidget()
+        dw.setLayout(drow)
+        f2.addRow("轨道一", dw)
+
+        h3 = QHBoxLayout()
+        self.edit_out = QLineEdit()
+        self.edit_out.setReadOnly(True)
+        self.edit_out.setPlaceholderText("默认：素材目录/output")
+        btn_out = QPushButton("选择…")
+        btn_out.clicked.connect(self._browse_output)
+        h3.addWidget(self.edit_out, 1)
+        h3.addWidget(btn_out)
+        ow = QWidget()
+        ow.setLayout(h3)
+        f2.addRow("输出目录", ow)
+        root.addWidget(g2)
+
+        # ③ 进度与操作
+        g3 = QGroupBox("③ 生成")
+        v3 = QVBoxLayout(g3)
+        self.progress = QProgressBar()
+        self.progress.setValue(0)
+        v3.addWidget(self.progress)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFixedHeight(96)
+        v3.addWidget(self.log_view)
+        hb = QHBoxLayout()
+        self.btn_t2 = QPushButton("🎞 只生成轨道二")
+        self.btn_t1 = QPushButton("📊 只生成轨道一")
+        self.btn_both = QPushButton("✨ 一键生成两轨")
+        self.btn_cancel = QPushButton("⛔ 终止")
+        self.btn_cancel.setEnabled(False)
+        self.btn_t2.clicked.connect(lambda: self._start({"track2"}))
+        self.btn_t1.clicked.connect(lambda: self._start({"track1"}))
+        self.btn_both.clicked.connect(lambda: self._start({"track1", "track2"}))
+        self.btn_cancel.clicked.connect(self._cancel)
+        hb.addWidget(self.btn_t2)
+        hb.addWidget(self.btn_t1)
+        hb.addWidget(self.btn_both)
+        hb.addStretch(1)
+        hb.addWidget(self.btn_cancel)
+        v3.addLayout(hb)
+        root.addWidget(g3)
+
+    # ── 素材扫描 ──
+    def _browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择素材目录",
+                                             self.edit_dir.text() or str(Path.home()))
+        if d:
+            self.edit_dir.setText(d)
+            self.edit_out.setText(str(Path(d) / "output"))
+            self._scan()
+
+    def _browse_output(self):
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录",
+                                             self.edit_out.text() or str(Path.home()))
+        if d:
+            self.edit_out.setText(d)
+
+    def _scan(self):
+        folder = Path(self.edit_dir.text().strip())
+        if not folder.is_dir():
+            QMessageBox.warning(self, "提示", "请先选择有效的素材目录")
+            return
+        self.btn_scan.setEnabled(False)
+        self.log("正在扫描素材…")
+        self._scan_worker = _ClipScanWorker(folder, composer.SILENT_DB)
+        self._scan_worker.progress.connect(
+            lambda i, n, name: self.log(f"[{i+1}/{n}] {name}"))
+        self._scan_worker.finished_ok.connect(self._on_scan_done)
+        self._scan_worker.failed.connect(self._on_scan_failed)
+        self._scan_worker.start()
+
+    def _on_scan_done(self, clips):
+        self.btn_scan.setEnabled(True)
+        self._clips = clips
+        if not clips:
+            self.log("⚠ 目录中没有找到视频文件")
+            return
+        self.log(f"扫描完成：{len(clips)} 条素材")
+        self._fill_table()
+        self._refresh_plan()
+
+    def _on_scan_failed(self, err):
+        self.btn_scan.setEnabled(True)
+        self.log(f"❌ 扫描失败：{err}")
+        QMessageBox.critical(self, "扫描失败", err)
+
+    def _fill_table(self):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self._clips))
+        for r, c in enumerate(self._clips):
+            use = QTableWidgetItem()
+            use.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            use.setCheckState(Qt.Checked if not c.excluded else Qt.Unchecked)
+            self.table.setItem(r, 0, use)
+            name = QTableWidgetItem(c.path.name)
+            name.setToolTip(str(c.path))
+            self.table.setItem(r, 1, name)
+            self.table.setItem(r, 2, QTableWidgetItem(
+                c.start_local.strftime("%Y-%m-%d %H:%M:%S")))
+            self.table.setItem(r, 3, QTableWidgetItem(_fmt_hms(c.duration)))
+            db = "—" if c.mean_db is None else f"{c.mean_db:.1f}"
+            self.table.setItem(r, 4, QTableWidgetItem(db))
+            self.table.setItem(r, 5, QTableWidgetItem(
+                "无声音" if c.silent else "有声音"))
+            combo = QComboBox()
+            combo.addItem("2×", 2.0)
+            combo.addItem("10×", 10.0)
+            combo.setCurrentIndex(0 if c.speed <= 2.5 else 1)
+            combo.currentIndexChanged.connect(
+                lambda _i, row=r, cb=combo: self._on_speed_changed(row, cb))
+            self.table.setCellWidget(r, 6, combo)
+            self.table.setItem(r, 7, QTableWidgetItem(_fmt_hms(c.out_duration)))
+        self.table.blockSignals(False)
+
+    def _on_speed_changed(self, row: int, combo: QComboBox):
+        if 0 <= row < len(self._clips):
+            self._clips[row].speed = float(combo.currentData())
+            self._refresh_plan()
+
+    def _on_item_changed(self, item: QTableWidgetItem):
+        if item.column() != 0:
+            return
+        r = item.row()
+        if 0 <= r < len(self._clips):
+            self._clips[r].excluded = item.checkState() != Qt.Checked
+            self._refresh_plan()
+
+    # ── 时间轴预览 ──
+    def _refresh_plan(self):
+        if not self._clips:
+            return
+        kstart, kend = _kml_span(self.main.renderer)
+        self._timeline = composer.plan_timeline(
+            self._clips, kml_start=kstart, kml_end=kend,
+            gap_speed=self.spin_gap_speed.value(),
+            max_total_s=self.spin_max_min.value() * 60)
+        tl = self._timeline
+        for r, c in enumerate(self._clips):
+            item = self.table.item(r, 7)
+            if item is not None:
+                item.setText(_fmt_hms(c.out_duration))
+        clip_total = sum(s.duration for s in tl.clips)
+        gap_real = sum(s.real_s for s in tl.blanks)
+        gap_out = sum(s.duration for s in tl.blanks)
+        self.lbl_summary.setText(
+            f"素材 {len(tl.clips)} 段：处理后 {_fmt_hms(clip_total)} ｜ "
+            f"空档 {len(tl.blanks)} 段：原始 {_fmt_hms(gap_real)} → "
+            f"压缩后 {_fmt_hms(gap_out)} ｜ "
+            f"<b>两条轨道严格等长 = {_fmt_hms(tl.total_s)}</b>")
+
+    # ── 生成 ──
+    def _start(self, tracks: set):
+        if self._timeline is None or not self._timeline.segments:
+            QMessageBox.warning(self, "提示", "请先扫描素材")
+            return
+        if "track1" in tracks and self.main.renderer is None:
+            QMessageBox.warning(self, "提示", "请先在主窗口加载 KML 工程")
+            return
+        out_dir = Path(self.edit_out.text().strip() or
+                       (Path(self.edit_dir.text()) / "output"))
+        if "track1" in tracks:
+            kstart, kend = _kml_span(self.main.renderer)
+            if kstart is None or kend is None:
+                QMessageBox.warning(self, "提示",
+                                    "当前 KML 缺少墙钟时间，无法与素材对齐")
+                return
+        w, h = self.combo_res.currentData()
+        opts = {
+            "width": w, "height": h,
+            "fps": int(self.combo_fps.currentData()),
+            "color": self.combo_blank.currentData(),
+            "dash_fps": self.spin_dash_fps.value(),
+            "render_scale": int(self.combo_dash_scale.currentData() or 1),
+        }
+        kstart, kend = _kml_span(self.main.renderer)
+        self.progress.setValue(0)
+        self._set_running(True)
+        self._worker = ComposerWorker(self.main.renderer, self._timeline,
+                                      kstart, kend, out_dir, opts, tracks)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.log.connect(self.log)
+        self._worker.finished_ok.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
+        if "track1" in tracks and hasattr(self.main, "view"):
+            self.main.view.setEnabled(False)
+        self._worker.start()
+
+    def _set_running(self, running: bool):
+        for b in (self.btn_t1, self.btn_t2, self.btn_both, self.btn_scan):
+            b.setEnabled(not running)
+        self.btn_cancel.setEnabled(running)
+
+    def _on_progress(self, pct: int, msg: str):
+        self.progress.setValue(max(0, min(100, pct)))
+        if msg:
+            self.status_label(msg)
+
+    def status_label(self, msg: str):
+        self.progress.setFormat(f"{self.progress.value()}%  {msg}")
+
+    def log(self, msg: str):
+        self.log_view.append(msg)
+        self.log_view.verticalScrollBar().setValue(
+            self.log_view.verticalScrollBar().maximum())
+
+    def _cancel(self):
+        if self._worker is not None:
+            self.btn_cancel.setEnabled(False)
+            self.btn_cancel.setText("终止中…")
+            self._worker.cancel()
+
+    def _on_finished(self, paths: str):
+        self._set_running(False)
+        self.btn_cancel.setText("⛔ 终止")
+        self.progress.setValue(100)
+        if hasattr(self.main, "view"):
+            self.main.view.setEnabled(True)
+        self.log("✅ 全部完成")
+        QMessageBox.information(self, "完成", f"已生成：\n{paths}")
+
+    def _on_failed(self, err: str):
+        self._set_running(False)
+        self.btn_cancel.setText("⛔ 终止")
+        if hasattr(self.main, "view"):
+            self.main.view.setEnabled(True)
+        self.log(f"❌ {err}")
+        QMessageBox.critical(self, "合成失败", err)
+
+    def _on_cancelled(self):
+        self._set_running(False)
+        self.btn_cancel.setText("⛔ 终止")
+        if hasattr(self.main, "view"):
+            self.main.view.setEnabled(True)
+        self.progress.setValue(0)
+        self.log("⛔ 已终止")
 
 
 # ─────────────────────── 分段视频设置对话框 ───────────────────────
@@ -2748,6 +3308,19 @@ class MainWindow(QMainWindow):
         )
         self.btn_render.clicked.connect(self.on_render)
         tb.addWidget(self.btn_render)
+
+        self.btn_composer = QPushButton("🧩 双轨合成")
+        self.btn_composer.setToolTip("把实拍素材与仪表盘合成两条严格等长的视频轨道")
+        self.btn_composer.clicked.connect(self.on_open_composer)
+        tb.addWidget(self.btn_composer)
+
+    def on_open_composer(self):
+        """打开双轨批量合成面板（非模态，可边看主画布边操作）。"""
+        if getattr(self, "composer_dlg", None) is None:
+            self.composer_dlg = ComposerDialog(self)
+        self.composer_dlg.show()
+        self.composer_dlg.raise_()
+        self.composer_dlg.activateWindow()
 
     def _rebuild_recent_menu(self):
         """根据全局 settings 的 recent_projects 重建最近工程下拉菜单。"""
@@ -5548,6 +6121,7 @@ def main():
     _setup_crash_log()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setStyleSheet(_APP_QSS)
     win = MainWindow()
     win.show()
     # 启动时自动打开上次工程（若有）；否则保持空画布等用户操作
