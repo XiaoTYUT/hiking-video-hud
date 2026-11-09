@@ -1,7 +1,7 @@
 # KML 轨迹视频生成器 — 项目知识库
 
 > 本文件是项目的完整知识总结，供新会话快速恢复上下文。
-> 最后更新：2026-10-19
+> 最后更新：2026-11-10
 
 ---
 
@@ -277,3 +277,21 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 地图圆形 zoom 18、图例 delta −1、箭头 34、面板 scale 1.32 pos (8,511)、
 字段 [累计爬升/已行里程/当前配速/总耗时]、6 个关键节点（林海亭/九溪公交站/九溪烟树/龙井村/翁家山村/茶博馆）、
 18 个分割点 19 段时长（合计约 1328s）
+
+## 18. 双轨批量合成（2026-11-10）
+
+- 新模块 `composer.py`（纯后端，不依赖 GUI）：输入一个素材目录（DJI MP4 若干 + KML），输出两条**严格等长**的轨道：
+  - `track1_dashboard.mov`：原来的 KML 仪表盘（透明 PNG-RGBA）。
+  - `track2_footage.mp4`：实拍素材变速拼接 + 空档纯色补片。
+- 时间轴：`probe_clip` 读取 MP4 `creation_time`（UTC）+ 时长建立绝对时间；按开始时间排序；相邻素材之间插空档。`plan_timeline` 输出 `Segment(kind=clip/blank, real_start, real_end, duration)`。
+- 变速规则：音量抽样（3 个位置各 8s，`volumedetect`）平均音量 < -45 dB → 判定「无声音」→ **2×**；否则 **10×**（`atempo` 多级串联保音高，单级 ≤2.0）。GUI 表格可逐条改倍速/取消勾选。
+- 空档：默认按 `GAP_SPEED=10×` 压缩补空白 MOV；若总长超过 `max_total_s`（默认 1800s）则对所有空档**等比二次压缩**；压缩后 <1s 的空档直接丢弃（避免 0.1s 碎补片）。总长取整秒，末段吸收舍入误差。
+- 轨道一严格等长：`dashboard_segments()` 把每段 `real_end` 按 KML 时间跨度归一化成 cuts，`durations` 用最终输出时长，交给 Renderer 已有的**分段模式**（`use_segments/segments`），渲染前后保存/恢复原值。分段语义直接用时间归一化，无改点索引。
+- 轨道二渲染：每段独立转码 → `concat` demuxer `-c copy -t total_s`（强制总长与轨道一一致，实测差 < 10ms）。
+- 编码加速（关键）：优先 `h264_nvenc -preset p5 -rc vbr -cq 20` + `-hwaccel cuda -hwaccel_output_format cuda`，滤镜链 `hwdownload,format=p010le|nv12,setpts,fps,scale,format=yuv420p`；CUDA 失败自动回退软解 + 软编。实测 4K 10bit HEVC → 1080p：**NVENC+CUDA 约 5.7s / 20s 源**，libx264 软编约 4fps（25k 帧需 ~100 分钟）。
+  - 坑 1：`hwdownload` 必须显式 `format=p010le` 或 `nv12`（取决于源 pix_fmt），写成候选列表会在 configure 阶段报 `Invalid output format monow`。
+  - 坑 2：`subprocess.Popen(stderr=PIPE)` 且只读 stdout 会**死锁**（ffmpeg 写满 stderr 缓冲后卡住，文件大小与 CPU 时间双双冻结）。必须把 stderr 落到 `tempfile.TemporaryFile`。
+- GUI：工具栏新增「🧩 双轨合成」→ `ComposerDialog`（非模态）：选择目录 → 后台 `_ClipScanWorker` 扫描 → 表格（使用/文件/开始/时长/音量/判定/倍速/输出时长）→ 输出设置（总长上限、空档压缩、分辨率、帧率、空白颜色、仪表盘帧率/倍率、输出目录）→ `ComposerWorker` 生成轨道二后再生成轨道一。进度 0–55% 轨道二、56–100% 轨道一，可终止。
+- UI 主题：`app._APP_QSS`（Fusion 风格深色 HUD 主题，工具栏/分组框/表格/进度条/滚动条），在 `main()` 里 `app.setStyle("Fusion") + setStyleSheet`。既有控件的内联样式仍优先，不影响原功能。
+- 输出目录默认 `<素材目录>/output`，中间分段在 `output/_segments/`（PNG 帧临时目录仍走系统 temp）。
+

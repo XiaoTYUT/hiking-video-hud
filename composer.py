@@ -33,6 +33,32 @@ GAP_SPEED = 10.0           # 空档压缩倍数（空档也按 10× 压缩）
 MAX_TOTAL_S = 1800.0       # 两条轨道总时长上限（30 分钟）
 
 _PROGRESS_RE_TIME = re.compile(r"out_time_ms=(\d+)")
+_NVENC_CACHE: Optional[bool] = None
+
+
+def _nvenc_available() -> bool:
+    """检测 h264_nvenc 是否可用（只检测一次）。"""
+    global _NVENC_CACHE
+    if _NVENC_CACHE is None:
+        try:
+            res = subprocess.run([_ffmpeg(), "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace")
+            _NVENC_CACHE = "h264_nvenc" in (res.stdout or "")
+        except Exception:
+            _NVENC_CACHE = False
+    return bool(_NVENC_CACHE)
+
+
+def _pix_fmt(path: Path) -> str:
+    try:
+        info = _probe_json(path)
+        for s in info.get("streams", []):
+            if s.get("codec_type") == "video":
+                return s.get("pix_fmt") or "yuv420p"
+    except Exception:
+        pass
+    return "yuv420p"
 
 
 class ComposerCancelled(Exception):
@@ -279,6 +305,12 @@ def plan_timeline(clips: Sequence[Clip],
             if s.kind == "blank":
                 s.duration *= factor
 
+    # 压缩后不足 1 秒的空档直接丢弃（避免生成 0.1s 的碎补片）
+    segs = [s for s in segs if s.kind == "clip" or s.duration >= 1.0]
+    if not segs:
+        return Timeline(segments=[], total_s=0,
+                        gap_speed=gap_speed, max_total_s=max_total_s)
+
     # 总时长取整秒：轨道一按整数秒渲染，末段吸收误差保证严格等长
     total = sum(s.duration for s in segs)
     total_s = max(1, int(round(total)))
@@ -362,25 +394,50 @@ def _run_ffmpeg(cmd: List[str], expected_s: float,
         raise RuntimeError(f"ffmpeg 失败（{proc.returncode}）\n{err[-800:]}")
 
 
+def _video_encode_args(crf: int = 20) -> List[str]:
+    """优先 NVENC（1080p 软编太慢），不可用时回退 libx264。"""
+    if _nvenc_available():
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr",
+                "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+            "-pix_fmt", "yuv420p"]
+
+
 def render_clip_segment(clip: Clip, out_path: Path, width: int, height: int,
                         fps: int, crf: int = 20,
                         progress_cb: Optional[Callable[[float], None]] = None,
                         cancel_cb: Optional[Callable[[], bool]] = None) -> Path:
     """变速转码单个实拍片段（统一分辨率/帧率/编码，供 concat 拼接）。"""
     speed = max(1.0, clip.speed)
-    vf = f"setpts=PTS/{speed:.6f},fps={fps},scale={width}:{height}:flags=lanczos"
-    cmd = [_ffmpeg(), "-y", "-hide_banner", "-nostats", "-progress", "pipe:1",
-           "-i", str(clip.path), "-map", "0:v:0"]
-    if clip.has_audio:
-        cmd += ["-map", "0:a:0", "-af", _atempo_chain(speed)]
-    cmd += ["-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
-            "-crf", str(crf), "-pix_fmt", "yuv420p", "-r", str(fps)]
-    if clip.has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
-    else:
-        cmd += ["-an"]
-    cmd += [str(out_path)]
-    _run_ffmpeg(cmd, clip.out_duration, progress_cb, cancel_cb)
+    base_vf = (f"setpts=PTS/{speed:.6f},fps={fps},"
+               f"scale={width}:{height}:flags=lanczos,format=yuv420p")
+
+    def _encode(use_hw: bool) -> None:
+        in_args: List[str] = []
+        vf = base_vf
+        if use_hw:
+            pix = _pix_fmt(clip.path)
+            hw_fmt = "p010le" if ("10" in pix or pix.startswith("p010")) else "nv12"
+            in_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            vf = f"hwdownload,format={hw_fmt},{base_vf}"
+        cmd = [_ffmpeg(), "-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]
+        cmd += in_args + ["-i", str(clip.path), "-map", "0:v:0"]
+        if clip.has_audio:
+            cmd += ["-map", "0:a:0", "-af", _atempo_chain(speed)]
+        cmd += ["-vf", vf] + _video_encode_args(crf) + ["-r", str(fps)]
+        if clip.has_audio:
+            cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+        else:
+            cmd += ["-an"]
+        cmd.append(str(out_path))
+        _run_ffmpeg(cmd, clip.out_duration, progress_cb, cancel_cb)
+
+    try:
+        _encode(_nvenc_available())
+    except RuntimeError:
+        if not _nvenc_available():
+            raise
+        _encode(False)          # CUDA 解码失败 → 软件解码重试
     return out_path
 
 
@@ -393,11 +450,10 @@ def render_blank_segment(out_path: Path, duration: float, width: int, height: in
     cmd = [_ffmpeg(), "-y", "-hide_banner", "-nostats", "-progress", "pipe:1",
            "-f", "lavfi", "-i", f"color=c={color}:s={width}x{height}:r={fps}",
            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-           "-t", f"{dur:.3f}",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-           "-pix_fmt", "yuv420p", "-r", str(fps),
-           "-c:a", "aac", "-b:a", "128k",
-           str(out_path)]
+           "-t", f"{dur:.3f}"]
+    cmd += _video_encode_args(20) + ["-r", str(fps),
+                                     "-c:a", "aac", "-b:a", "128k",
+                                     str(out_path)]
     _run_ffmpeg(cmd, dur, progress_cb, cancel_cb)
     return out_path
 
