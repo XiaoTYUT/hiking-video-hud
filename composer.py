@@ -430,7 +430,9 @@ def render_clip_segment(clip: Clip, out_path: Path, width: int, height: int,
             in_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
             vf = f"hwdownload,format={hw_fmt},{base_vf}"
         cmd = [_ffmpeg(), "-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]
-        cmd += in_args + ["-i", str(clip.path), "-map", "0:v:0"]
+        # USB 移动硬盘上 ffmpeg 默认 32KB 读块会退化成 2MB/s；加大读块到 16MB
+        cmd += in_args + ["-blocksize", "16777216", "-i", str(clip.path),
+                          "-map", "0:v:0"]
         if clip.has_audio:
             cmd += ["-map", "0:a:0", "-af", _atempo_chain(speed)]
         cmd += ["-vf", vf] + _video_encode_args(crf) + ["-r", str(fps)]

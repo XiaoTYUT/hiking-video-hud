@@ -291,6 +291,7 @@ IPC 每帧 raw 10.7MB / PNG 约 2MB，主进程单线程解包也是瓶颈。
 - 编码加速（关键）：优先 `h264_nvenc -preset p5 -rc vbr -cq 20` + `-hwaccel cuda -hwaccel_output_format cuda`，滤镜链 `hwdownload,format=p010le|nv12,setpts,fps,scale,format=yuv420p`；CUDA 失败自动回退软解 + 软编。实测 4K 10bit HEVC → 1080p：**NVENC+CUDA 约 5.7s / 20s 源**，libx264 软编约 4fps（25k 帧需 ~100 分钟）。
   - 坑 1：`hwdownload` 必须显式 `format=p010le` 或 `nv12`（取决于源 pix_fmt），写成候选列表会在 configure 阶段报 `Invalid output format monow`。
   - 坑 2：`subprocess.Popen(stderr=PIPE)` 且只读 stdout 会**死锁**（ffmpeg 写满 stderr 缓冲后卡住，文件大小与 CPU 时间双双冻结）。必须把 stderr 落到 `tempfile.TemporaryFile`。
+  - 坑 3：素材放在 USB 移动硬盘时，ffmpeg 默认 32KB 读块会退化成 **~2MB/s**（冷读实测 5.7fps），加 `-blocksize 16777216`（16MB，必须在 `-i` 前）后恢复到 ~45fps。输出目录也应放在本地盘，最后再拷回移动硬盘。
 - GUI：工具栏新增「🧩 双轨合成」→ `ComposerDialog`（非模态）：选择目录 → 后台 `_ClipScanWorker` 扫描 → 表格（使用/文件/开始/时长/音量/判定/倍速/输出时长）→ 输出设置（总长上限、空档压缩、分辨率、帧率、空白颜色、仪表盘帧率/倍率、输出目录）→ `ComposerWorker` 生成轨道二后再生成轨道一。进度 0–55% 轨道二、56–100% 轨道一，可终止。
 - UI 主题：`app._APP_QSS`（Fusion 风格深色 HUD 主题，工具栏/分组框/表格/进度条/滚动条），在 `main()` 里 `app.setStyle("Fusion") + setStyleSheet`。既有控件的内联样式仍优先，不影响原功能。
 - 输出目录默认 `<素材目录>/output`，中间分段在 `output/_segments/`（PNG 帧临时目录仍走系统 temp）。
