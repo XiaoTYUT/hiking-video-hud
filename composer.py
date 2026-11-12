@@ -106,6 +106,23 @@ def _time_from_name(path: Path) -> Optional[datetime]:
 
 
 @dataclass
+class SubSegment:
+    """素材内部的一个子段：有声或无声，各自有独立倍速。"""
+    start: float                    # 素材内起点（秒）
+    end: float                      # 素材内终点（秒）
+    silent: bool                    # True=无声 2×，False=有声 10×
+    speed: float = AUDIO_SPEED
+
+    @property
+    def real_s(self) -> float:
+        return max(0.0, self.end - self.start)
+
+    @property
+    def out_s(self) -> float:
+        return self.real_s / max(0.01, self.speed)
+
+
+@dataclass
 class Clip:
     path: Path
     start: datetime                 # UTC
@@ -114,7 +131,9 @@ class Clip:
     mean_db: Optional[float] = None
     max_db: Optional[float] = None
     silent: bool = False
-    speed: float = AUDIO_SPEED
+    speed: float = AUDIO_SPEED      # 有声段子段倍速（用户可调）
+    silent_speed: float = SILENT_SPEED  # 无声段子段倍速
+    sub_segments: List[SubSegment] = field(default_factory=list)
     excluded: bool = False
 
     @property
@@ -123,7 +142,22 @@ class Clip:
 
     @property
     def out_duration(self) -> float:
+        """所有子段输出时长之和（无子段时回退到整段倍速）。"""
+        if self.sub_segments:
+            return sum(s.out_s for s in self.sub_segments)
         return self.duration / max(0.01, self.speed)
+
+    @property
+    def audio_real_s(self) -> float:
+        if not self.sub_segments:
+            return 0.0 if self.silent else self.duration
+        return sum(s.real_s for s in self.sub_segments if not s.silent)
+
+    @property
+    def silent_real_s(self) -> float:
+        if not self.sub_segments:
+            return self.duration if self.silent else 0.0
+        return sum(s.real_s for s in self.sub_segments if s.silent)
 
     @property
     def start_local(self) -> datetime:
@@ -132,13 +166,16 @@ class Clip:
 
 @dataclass
 class Segment:
-    """最终时间轴上的一段：实拍片段或空白补片。"""
+    """最终时间轴上的一段：实拍片段（可能是素材的一个子段）或空白补片。"""
     kind: str                       # "clip" / "blank"
     real_start: datetime
     real_end: datetime
     duration: float = 0.0           # 输出时长（秒，变速/压缩后）
     real_s: float = 0.0             # 原始时长（秒）
     clip: Optional[Clip] = None
+    in_s: float = 0.0               # 素材内起点（秒），clip 段有效
+    out_s: float = 0.0              # 素材内终点（秒），clip 段有效
+    speed: float = 1.0              # 该段使用的倍速
     actual_duration: Optional[float] = None   # 编码后实测时长
 
     @property
@@ -189,8 +226,8 @@ def measure_audio_db(path: Path, positions: Sequence[float] = (0.2, 0.5, 0.8),
     for p in positions:
         ss = max(0.0, dur * p) if dur > 0 else 0.0
         cmd = [_ffmpeg(), "-hide_banner", "-nostats", "-ss", f"{ss:.3f}",
-               "-t", f"{window:.3f}", "-i", str(path), "-map", "0:a:0",
-               "-vn", "-af", "volumedetect", "-f", "null", "-"]
+               "-t", f"{window:.3f}", "-blocksize", "16777216", "-i", str(path),
+               "-map", "0:a:0", "-vn", "-af", "volumedetect", "-f", "null", "-"]
         res = subprocess.run(cmd, capture_output=True, text=True,
                              encoding="utf-8", errors="replace")
         m1 = re.search(r"mean_volume:\s*(-?[\d.]+)", res.stderr)
@@ -204,8 +241,106 @@ def measure_audio_db(path: Path, positions: Sequence[float] = (0.2, 0.5, 0.8),
     return sum(means) / len(means), max(maxes) if maxes else None
 
 
+def detect_silence(path: Path, noise_db: float = -45.0,
+                   min_dur: float = 0.5) -> List[tuple[float, float]]:
+    """用 ffmpeg silencedetect 检测静音区间，返回 [(start, end), ...]（秒）。
+
+    noise_db：低于该音量视为静音；min_dur：最短静音时长（秒）。
+    """
+    _, intervals = analyze_audio_silence(path, noise_db=noise_db, min_dur=min_dur)
+    return intervals
+
+
+def analyze_audio_silence(path: Path, noise_db: float = -45.0,
+                          min_dur: float = 0.5
+                          ) -> tuple[tuple[Optional[float], Optional[float]],
+                                     List[tuple[float, float]]]:
+    """一次 ffmpeg 调用同时得到 mean/max 音量和静音区间。
+
+    音频滤镜串联：volumedetect,silencedetect=...
+    返回 ((mean_db, max_db), [(silence_start, silence_end), ...])。
+    没有音轨时返回 ((None, None), [])。
+    """
+    info = _probe_json(path)
+    if not any(s.get("codec_type") == "audio" for s in info.get("streams", [])):
+        return (None, None), []
+    dur = float(info.get("format", {}).get("duration") or 0.0)
+    cmd = [_ffmpeg(), "-hide_banner", "-nostats",
+           "-blocksize", "16777216", "-i", str(path),
+           "-map", "0:a:0", "-vn",
+           "-af", f"volumedetect,silencedetect=noise={noise_db}dB:d={min_dur}",
+           "-f", "null", "-"]
+    res = subprocess.run(cmd, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace")
+    mean_db = max_db = None
+    m = re.search(r"mean_volume:\s*(-?[\d.]+)", res.stderr)
+    if m:
+        mean_db = float(m.group(1))
+    m = re.search(r"max_volume:\s*(-?[\d.]+)", res.stderr)
+    if m:
+        max_db = float(m.group(1))
+    intervals: List[tuple[float, float]] = []
+    cur_start: Optional[float] = None
+    for line in res.stderr.splitlines():
+        m = re.search(r"silence_start:\s*([\d.]+)", line)
+        if m:
+            cur_start = float(m.group(1))
+            continue
+        m = re.search(r"silence_end:\s*([\d.]+)", line)
+        if m and cur_start is not None:
+            intervals.append((cur_start, float(m.group(1))))
+            cur_start = None
+    if cur_start is not None:
+        intervals.append((cur_start, dur))
+    return (mean_db, max_db), intervals
+
+
+def build_sub_segments(duration: float,
+                       silence: Sequence[tuple[float, float]],
+                       audio_speed: float = AUDIO_SPEED,
+                       silent_speed: float = SILENT_SPEED,
+                       min_seg_s: float = 0.3) -> List[SubSegment]:
+    """把静音区间换算成「有声/无声」交替的子段列表。
+
+    min_seg_s：短于此值的子段会被合并到相邻段（避免产生大量碎段）。
+    """
+    if duration <= 0:
+        return []
+    # 过滤掉超出时长范围的区间，并按起点排序
+    sil = sorted((max(0.0, s), min(duration, e))
+                 for s, e in silence if e > 0 and s < duration)
+    raw: List[SubSegment] = []
+    cursor = 0.0
+    for s_start, s_end in sil:
+        if s_start > cursor + 1e-6:
+            raw.append(SubSegment(cursor, s_start, False, audio_speed))
+        if s_end > s_start + 1e-6:
+            raw.append(SubSegment(s_start, s_end, True, silent_speed))
+        cursor = max(cursor, s_end)
+    if cursor < duration - 1e-6:
+        raw.append(SubSegment(cursor, duration, False, audio_speed))
+
+    # 合并过短的子段：无声段并入相邻有声段（有声段时长不变，速度取平均加权）
+    if not raw:
+        return [SubSegment(0.0, duration, False, audio_speed)]
+    merged: List[SubSegment] = []
+    for seg in raw:
+        if seg.real_s < min_seg_s and merged:
+            prev = merged[-1]
+            # 把短段时长并入前一段，速度按加权平均
+            total = prev.real_s + seg.real_s
+            avg_speed = ((prev.speed * prev.real_s + seg.speed * seg.real_s)
+                         / total) if total > 0 else prev.speed
+            prev.end = seg.end
+            prev.speed = avg_speed
+        else:
+            merged.append(SubSegment(seg.start, seg.end, seg.silent, seg.speed))
+    return merged
+
+
 def probe_clip(path: Path, analyze_audio: bool = True,
-               silent_db: float = SILENT_DB) -> Clip:
+               silent_db: float = SILENT_DB,
+               min_silence_dur: float = 0.5) -> Clip:
     info = _probe_json(path)
     fmt = info.get("format", {})
     streams = info.get("streams", [])
@@ -231,23 +366,39 @@ def probe_clip(path: Path, analyze_audio: bool = True,
 
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
     mean_db = max_db = None
-    if analyze_audio and has_audio:
-        mean_db, max_db = measure_audio_db(path)
+    sub_segments: List[SubSegment] = []
+    if analyze_audio and has_audio and duration > 0:
+        try:
+            (mean_db, max_db), silence = analyze_audio_silence(
+                path, noise_db=silent_db, min_dur=min_silence_dur)
+            sub_segments = build_sub_segments(duration, silence)
+        except Exception as exc:
+            print(f"[音频分析失败] {path.name}: {exc}", file=sys.stderr)
+    elif has_audio and duration > 0:
+        # 不分析音频时，整段按有声处理
+        sub_segments = [SubSegment(0.0, duration, False, AUDIO_SPEED)]
+    else:
+        # 没有音轨 → 整段无声
+        sub_segments = [SubSegment(0.0, max(duration, 0.0), True, SILENT_SPEED)]
 
     silent = (not has_audio) or (mean_db is not None and mean_db < silent_db)
     return Clip(path=path, start=start, duration=max(0.0, duration),
                 has_audio=has_audio, mean_db=mean_db, max_db=max_db,
-                silent=silent, speed=SILENT_SPEED if silent else AUDIO_SPEED)
+                silent=silent, speed=AUDIO_SPEED, silent_speed=SILENT_SPEED,
+                sub_segments=sub_segments)
 
 
 def scan_folder(folder: Path, analyze_audio: bool = True,
                 silent_db: float = SILENT_DB,
-                progress: Optional[Callable[[int, int, str], None]] = None
+                progress: Optional[Callable[[int, int, str], None]] = None,
+                cancel_cb: Optional[Callable[[], bool]] = None
                 ) -> List[Clip]:
     files = sorted([p for p in Path(folder).iterdir()
                     if p.is_file() and p.suffix.lower() in DEFAULT_VIDEO_EXTS])
     clips: List[Clip] = []
     for i, p in enumerate(files):
+        if cancel_cb and cancel_cb():
+            break                       # 取消时返回已扫描到的部分结果
         if progress:
             progress(i, len(files), p.name)
         try:
@@ -283,17 +434,27 @@ def plan_timeline(clips: Sequence[Clip],
     for c in usable:
         if c.start > cursor:
             segs.append(Segment("blank", cursor, c.start,
-                                real_s=(c.start - cursor).total_seconds()))
-        segs.append(Segment("clip", c.start, c.end,
-                            real_s=c.duration, clip=c))
+                                real_s=(c.start - cursor).total_seconds(),
+                                speed=gap_speed))
+        # 把素材按有声/无声子段拆开，每段独立倍速
+        subs = c.sub_segments or [SubSegment(0.0, c.duration, c.silent,
+                                             SILENT_SPEED if c.silent else c.speed)]
+        for sub in subs:
+            if sub.real_s <= 0:
+                continue
+            rs = c.start + timedelta(seconds=sub.start)
+            re = c.start + timedelta(seconds=sub.end)
+            segs.append(Segment("clip", rs, re, real_s=sub.real_s, clip=c,
+                                in_s=sub.start, out_s=sub.end, speed=sub.speed))
         cursor = max(cursor, c.end)
     if t_end > cursor:
         segs.append(Segment("blank", cursor, t_end,
-                            real_s=(t_end - cursor).total_seconds()))
+                            real_s=(t_end - cursor).total_seconds(),
+                            speed=gap_speed))
 
     gap_speed = max(1.0, float(gap_speed))
     for s in segs:
-        s.duration = (s.clip.out_duration if s.kind == "clip"
+        s.duration = (s.real_s / max(0.01, s.speed) if s.kind == "clip"
                       else s.real_s / gap_speed)
 
     clip_total = sum(s.duration for s in segs if s.kind == "clip")
@@ -414,10 +575,18 @@ def _video_encode_args(crf: int = 20) -> List[str]:
 
 def render_clip_segment(clip: Clip, out_path: Path, width: int, height: int,
                         fps: int, crf: int = 20,
+                        in_s: float = 0.0, out_s: float = 0.0,
+                        speed: Optional[float] = None,
                         progress_cb: Optional[Callable[[float], None]] = None,
                         cancel_cb: Optional[Callable[[], bool]] = None) -> Path:
-    """变速转码单个实拍片段（统一分辨率/帧率/编码，供 concat 拼接）。"""
-    speed = max(1.0, clip.speed)
+    """变速转码素材的一个子段（in_s~out_s），统一分辨率/帧率/编码供 concat 拼接。
+
+    in_s/out_s：素材内的入点/出点（秒）；out_s<=0 表示到素材末尾。
+    speed：该子段倍速，默认取 clip.speed。
+    """
+    speed = max(1.0, speed if speed is not None else clip.speed)
+    real_dur = max(0.0, (out_s if out_s > 0 else clip.duration) - in_s)
+    out_dur = real_dur / speed
     base_vf = (f"setpts=PTS/{speed:.6f},fps={fps},"
                f"scale={width}:{height}:flags=lanczos,format=yuv420p")
 
@@ -430,6 +599,11 @@ def render_clip_segment(clip: Clip, out_path: Path, width: int, height: int,
             in_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
             vf = f"hwdownload,format={hw_fmt},{base_vf}"
         cmd = [_ffmpeg(), "-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]
+        # 入点/出点作为输入选项（快速 seek 到关键帧附近，重编码保证边界）
+        if in_s > 0:
+            cmd += ["-ss", f"{in_s:.3f}"]
+        if out_s > 0:
+            cmd += ["-to", f"{out_s:.3f}"]
         # USB 移动硬盘上 ffmpeg 默认 32KB 读块会退化成 2MB/s；加大读块到 16MB
         cmd += in_args + ["-blocksize", "16777216", "-i", str(clip.path),
                           "-map", "0:v:0"]
@@ -441,7 +615,7 @@ def render_clip_segment(clip: Clip, out_path: Path, width: int, height: int,
         else:
             cmd += ["-an"]
         cmd.append(str(out_path))
-        _run_ffmpeg(cmd, clip.out_duration, progress_cb, cancel_cb)
+        _run_ffmpeg(cmd, out_dur, progress_cb, cancel_cb)
 
     try:
         _encode(_nvenc_available())
@@ -519,13 +693,19 @@ def render_track2(timeline: Timeline, out_dir: Path, width: int, height: int,
         def _seg_cb(p: float, _seg=seg, _base=done_plan):
             if progress_cb:
                 overall = (_base + _seg.duration * p) / total_plan
-                label = (_seg.clip.path.name if _seg.kind == "clip"
-                         else f"空白补片 {_seg.duration:.0f}s")
+                if _seg.kind == "clip":
+                    tag = "🔇" if _seg.speed <= 2.5 else "🔊"
+                    label = (f"{tag} {_seg.clip.path.name} "
+                             f"{_seg.in_s:g}~{_seg.out_s:g}s ×{_seg.speed:g}")
+                else:
+                    label = f"空白补片 {_seg.duration:.0f}s"
                 progress_cb(min(0.99, overall), label)
 
         if seg.kind == "clip":
             out = seg_dir / f"seg_{i:03d}_clip.mp4"
             render_clip_segment(seg.clip, out, width, height, fps,
+                                in_s=seg.in_s, out_s=seg.out_s,
+                                speed=seg.speed,
                                 progress_cb=_seg_cb, cancel_cb=cancel_cb)
         else:
             out = seg_dir / f"seg_{i:03d}_blank.mov"
@@ -578,17 +758,27 @@ def render_track1_dashboard(renderer, timeline: Timeline,
 def _cli_scan(folder: Path) -> None:
     clips = scan_folder(folder, progress=lambda i, n, name: print(f"[{i+1}/{n}] {name}"))
     for c in clips:
+        n_sub = len(c.sub_segments)
+        n_silent = sum(1 for s in c.sub_segments if s.silent)
         print(f"{c.path.name}  start={c.start_local:%Y-%m-%d %H:%M:%S}  "
               f"dur={c.duration:7.1f}s  audio={c.has_audio}  "
-              f"mean={c.mean_db}  silent={c.silent}  speed={c.speed:g}x  "
+              f"mean={c.mean_db}  子段={n_sub}(无声{n_silent})  "
+              f"有声{c.audio_real_s:6.1f}s/无声{c.silent_real_s:6.1f}s  "
               f"out={c.out_duration:7.1f}s")
+        for s in c.sub_segments:
+            tag = "🔇" if s.silent else "🔊"
+            print(f"    {tag} {s.start:7.1f}~{s.end:7.1f}s  "
+                  f"原始{s.real_s:6.1f}s → 输出{s.out_s:6.1f}s  ×{s.speed:g}")
     tl = plan_timeline(clips)
     print(f"\n片段 {len(tl.clips)} 段，空档 {len(tl.blanks)} 段，"
           f"总时长 {tl.total_s/60:.2f} 分钟")
     for s in tl.segments:
-        tag = s.clip.path.name if s.clip else "空白补片"
+        if s.clip:
+            tag = f"{'🔇' if s.speed<=2.5 else '🔊'} {s.clip.path.name}"
+        else:
+            tag = "空白补片"
         print(f"  {s.kind:5s} {s.real_start:%H:%M:%S}→{s.real_end:%H:%M:%S} "
-              f"原始{s.real_s:7.1f}s → 输出{s.duration:7.1f}s  {tag}")
+              f"原始{s.real_s:7.1f}s → 输出{s.duration:7.1f}s  ×{s.speed:g}  {tag}")
 
 
 if __name__ == "__main__":

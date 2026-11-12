@@ -1339,23 +1339,34 @@ def _kml_span(renderer) -> tuple[datetime | None, datetime | None]:
 
 
 class _ClipScanWorker(QThread):
-    """后台扫描素材目录（ffprobe + 音量抽样），避免阻塞界面。"""
+    """后台扫描素材目录（ffprobe + 静音检测），避免阻塞界面。"""
 
     progress = pyqtSignal(int, int, str)
     finished_ok = pyqtSignal(list)
     failed = pyqtSignal(str)
+    cancelled = pyqtSignal(list)     # 取消时返回已扫描到的部分结果
 
     def __init__(self, folder: Path, silent_db: float):
         super().__init__()
         self.folder = Path(folder)
         self.silent_db = silent_db
+        self._cancel = False
+        self._was_cancelled = False
+
+    def cancel(self):
+        self._cancel = True
+        self._was_cancelled = True
 
     def run(self):
         try:
             clips = composer.scan_folder(
                 self.folder, silent_db=self.silent_db,
-                progress=lambda i, n, name: self.progress.emit(i, n, name))
-            self.finished_ok.emit(clips)
+                progress=lambda i, n, name: self.progress.emit(i, n, name),
+                cancel_cb=lambda: self._cancel)
+            if self._was_cancelled:
+                self.cancelled.emit(clips)   # 返回已扫描到的部分结果
+            else:
+                self.finished_ok.emit(clips)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -1459,10 +1470,27 @@ class ComposerDialog(QDialog):
         btn_browse.clicked.connect(self._browse_dir)
         self.btn_scan = QPushButton("🔍 扫描素材")
         self.btn_scan.clicked.connect(self._scan)
+        self.btn_cancel_scan = QPushButton("⛔ 取消扫描")
+        self.btn_cancel_scan.clicked.connect(self._cancel_scan)
+        self.btn_cancel_scan.setEnabled(False)
         h1.addWidget(self.edit_dir, 1)
         h1.addWidget(btn_browse)
         h1.addWidget(self.btn_scan)
+        h1.addWidget(self.btn_cancel_scan)
         v1.addLayout(h1)
+
+        # 表格工具栏：删除行 / 清空
+        ht = QHBoxLayout()
+        btn_delete = QPushButton("🗑 删除选中行")
+        btn_delete.setToolTip("删除表格中高亮的一行或多行")
+        btn_delete.clicked.connect(self._delete_selected_rows)
+        btn_clear = QPushButton("🧹 清空表格")
+        btn_clear.setToolTip("移除所有已导入的素材")
+        btn_clear.clicked.connect(self._clear_clips)
+        ht.addStretch(1)
+        ht.addWidget(btn_delete)
+        ht.addWidget(btn_clear)
+        v1.addLayout(ht)
 
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
@@ -1610,28 +1638,76 @@ class ComposerDialog(QDialog):
             QMessageBox.warning(self, "提示", "请先选择有效的素材目录")
             return
         self.btn_scan.setEnabled(False)
-        self.log("正在扫描素材…")
+        self.btn_cancel_scan.setEnabled(True)
+        self.log("正在扫描素材…（每个文件需完整分析音轨中的有声/无声区间）")
         self._scan_worker = _ClipScanWorker(folder, composer.SILENT_DB)
         self._scan_worker.progress.connect(
             lambda i, n, name: self.log(f"[{i+1}/{n}] {name}"))
         self._scan_worker.finished_ok.connect(self._on_scan_done)
+        self._scan_worker.cancelled.connect(self._on_scan_cancelled)
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.start()
 
+    def _cancel_scan(self):
+        if self._scan_worker and self._scan_worker.isRunning():
+            self.log("⛔ 正在取消扫描…（当前文件会继续分析完再停止）")
+            self._scan_worker.cancel()
+
     def _on_scan_done(self, clips):
         self.btn_scan.setEnabled(True)
+        self.btn_cancel_scan.setEnabled(False)
         self._clips = clips
         if not clips:
             self.log("⚠ 目录中没有找到视频文件")
             return
-        self.log(f"扫描完成：{len(clips)} 条素材")
+        self.log(f"✅ 扫描完成：{len(clips)} 条素材")
         self._fill_table()
         self._refresh_plan()
 
+    def _on_scan_cancelled(self, clips):
+        self.btn_scan.setEnabled(True)
+        self.btn_cancel_scan.setEnabled(False)
+        self._clips = clips
+        if clips:
+            self.log(f"⛔ 扫描已取消，保留 {len(clips)} 条已扫描素材")
+            self._fill_table()
+            self._refresh_plan()
+        else:
+            self.log("⛔ 扫描已取消（还没扫到任何文件）")
+
     def _on_scan_failed(self, err):
         self.btn_scan.setEnabled(True)
+        self.btn_cancel_scan.setEnabled(False)
         self.log(f"❌ 扫描失败：{err}")
         QMessageBox.critical(self, "扫描失败", err)
+
+    def _delete_selected_rows(self):
+        rows = sorted(set(self.table.selectionModel().selectedRows()),
+                      key=lambda i: i.row(), reverse=True)
+        if not rows:
+            QMessageBox.information(self, "提示", "请先在表格里选中要删除的行（点击行号或单元格）")
+            return
+        for idx in rows:
+            r = idx.row()
+            if 0 <= r < len(self._clips):
+                self._clips.pop(r)
+            self.table.removeRow(r)
+        self.log(f"🗑 删除了 {len(rows)} 行，剩余 {len(self._clips)} 条素材")
+        self._refresh_plan()
+
+    def _clear_clips(self):
+        if not self._clips:
+            return
+        if QMessageBox.question(
+                self, "清空表格",
+                f"确认清空 {len(self._clips)} 条已导入的素材？",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._clips = []
+        self.table.setRowCount(0)
+        self.lbl_summary.setText("尚未扫描素材")
+        self.log("🧹 已清空素材列表")
+        self._timeline = None
 
     def _fill_table(self):
         self.table.blockSignals(True)
@@ -1649,12 +1725,26 @@ class ComposerDialog(QDialog):
             self.table.setItem(r, 3, QTableWidgetItem(_fmt_hms(c.duration)))
             db = "—" if c.mean_db is None else f"{c.mean_db:.1f}"
             self.table.setItem(r, 4, QTableWidgetItem(db))
-            self.table.setItem(r, 5, QTableWidgetItem(
-                "无声音" if c.silent else "有声音"))
+            # 判定列：展示有声/无声时长分布（基于静音检测的子段）
+            if c.sub_segments:
+                n_sub = len(c.sub_segments)
+                n_silent = sum(1 for s in c.sub_segments if s.silent)
+                judge = QTableWidgetItem(
+                    f"🔊 {c.audio_real_s:.0f}s / 🔇 {c.silent_real_s:.0f}s"
+                    f"  ({n_sub}段, 无声{n_silent})")
+                judge.setToolTip(
+                    "\n".join(
+                        f"{'🔇' if s.silent else '🔊'} {s.start:.1f}~{s.end:.1f}s "
+                        f"原始{s.real_s:.1f}s → 输出{s.out_s:.1f}s ×{s.speed:g}"
+                        for s in c.sub_segments))
+            else:
+                judge = QTableWidgetItem("无声音" if c.silent else "有声音")
+            self.table.setItem(r, 5, judge)
             combo = QComboBox()
             combo.addItem("2×", 2.0)
             combo.addItem("10×", 10.0)
             combo.setCurrentIndex(0 if c.speed <= 2.5 else 1)
+            combo.setToolTip("有声段倍速（无声段固定 2×）")
             combo.currentIndexChanged.connect(
                 lambda _i, row=r, cb=combo: self._on_speed_changed(row, cb))
             self.table.setCellWidget(r, 6, combo)
@@ -1663,7 +1753,12 @@ class ComposerDialog(QDialog):
 
     def _on_speed_changed(self, row: int, combo: QComboBox):
         if 0 <= row < len(self._clips):
-            self._clips[row].speed = float(combo.currentData())
+            c = self._clips[row]
+            c.speed = float(combo.currentData())
+            # 同步更新所有有声子段的倍速（无声段固定 2×）
+            for s in c.sub_segments:
+                if not s.silent:
+                    s.speed = c.speed
             self._refresh_plan()
 
     def _on_item_changed(self, item: QTableWidgetItem):
